@@ -260,6 +260,7 @@ function writeStepParams(tokenId, pos) {
 async function generate(promptIds, maxNew, onText) {
   const { device, cfg, B } = G;
   const q = device.queue;
+  const t0 = performance.now(); // same metric as the CLI: includes prefill
 
   // CPU-driven prefill for all but the last prompt token
   for (let pos = 0; pos < promptIds.length - 1; pos++) {
@@ -280,7 +281,6 @@ async function generate(promptIds, maxNew, onText) {
   const budget = Math.min(maxNew, MAX_SEQ - startPos);
   const genIds = [];
   let produced = 0;
-  const t0 = performance.now();
 
   while (produced < budget) {
     const k = Math.min(CHUNK, budget - produced);

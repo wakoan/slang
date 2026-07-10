@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Gemma 3 · WebGPU · py_shader_lang_wgpu</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    font: 15px/1.5 -apple-system, system-ui, sans-serif;
+    background: #111; color: #ddd;
+    max-width: 760px; margin: 3rem auto; padding: 0 1rem;
+  }
+  h1 { font-size: 1.2rem; font-weight: 600; }
+  h1 small { color: #888; font-weight: 400; }
+  #barwrap { background: #222; border-radius: 4px; height: 6px; margin: .6rem 0; }
+  #bar { background: #4a9eff; border-radius: 4px; height: 6px; width: 0; transition: width .15s; }
+  #status { color: #999; font-size: .85rem; min-height: 1.3em; }
+  textarea {
+    width: 100%; box-sizing: border-box; background: #1a1a1a; color: #eee;
+    border: 1px solid #333; border-radius: 8px; padding: .7rem; font: inherit;
+    resize: vertical; min-height: 4.5em;
+  }
+  button {
+    background: #4a9eff; color: #fff; border: 0; border-radius: 8px;
+    padding: .55rem 1.4rem; font: inherit; font-weight: 600; cursor: pointer;
+    margin-top: .5rem;
+  }
+  button:disabled { background: #333; color: #777; cursor: default; }
+  #output {
+    white-space: pre-wrap; background: #1a1a1a; border: 1px solid #333;
+    border-radius: 8px; padding: .9rem; margin-top: 1rem; min-height: 6em;
+  }
+  #stats { color: #6fbf73; font-size: .85rem; margin-top: .4rem; }
+</style>
+</head>
+<body>
+  <h1>Gemma 3 270M <small>— every shader compiled from Python by py_shader_lang_wgpu,
+  running in your browser's WebGPU</small></h1>
+  <div id="barwrap"><div id="bar"></div></div>
+  <div id="status">initializing…</div>
+  <textarea id="prompt">Why is the sky blue? Answer in one sentence.</textarea>
+  <br>
+  <button id="go" disabled>Generate</button>
+  <div id="output"></div>
+  <div id="stats"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

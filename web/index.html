@@ -31,6 +31,13 @@
     border-radius: 8px; padding: .9rem; margin-top: 1rem; min-height: 6em;
   }
   #stats { color: #6fbf73; font-size: .85rem; margin-top: .4rem; }
+  #cacheinfo { color: #999; font-size: .8rem; margin: .3rem 0 .6rem; min-height: 1.2em; }
+  #clearcache {
+    background: none; border: 1px solid #444; color: #aaa; border-radius: 6px;
+    padding: .1rem .6rem; font-size: .78rem; font-weight: 400; margin: 0 0 0 .5rem;
+    cursor: pointer;
+  }
+  #clearcache:hover { border-color: #888; color: #ddd; }
 </style>
 </head>
 <body>
@@ -38,6 +45,7 @@
   running in your browser's WebGPU</small></h1>
   <div id="barwrap"><div id="bar"></div></div>
   <div id="status">initializing…</div>
+  <div id="cacheinfo"><span id="cachemsg"></span><button id="clearcache" hidden>clear cached weights</button></div>
   <textarea id="prompt">Why is the sky blue? Answer in one sentence.</textarea>
   <br>
   <button id="go" disabled>Generate</button>

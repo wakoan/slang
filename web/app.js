@@ -8,6 +8,8 @@ const ui = {
   output: document.getElementById("output"),
   button: document.getElementById("go"),
   stats: document.getElementById("stats"),
+  cacheMsg: document.getElementById("cachemsg"),
+  clearCache: document.getElementById("clearcache"),
 };
 
 const N_ARGMAX_WGS = 128;
@@ -51,12 +53,14 @@ async function init() {
   let cache = null;
   try { cache = await caches.open("gemma-weights"); } catch { /* unavailable */ }
   let blob = null;
+  let fromCache = false;
   if (cache) {
     const hit = await cache.match(cacheKey);
     if (hit) {
       status("loading weights from browser cache…");
       blob = new Uint8Array(await hit.arrayBuffer());
       ui.bar.style.width = "100%";
+      fromCache = true;
     }
   }
   if (!blob) {
@@ -84,11 +88,30 @@ async function init() {
           headers: { "Content-Type": "application/octet-stream" },
         }));
         navigator.storage?.persist?.();
-        status("weights cached for next visit…");
       } catch (e) {
         console.warn("weight caching failed (quota?):", e);
+        cache = null; // don't advertise a cache we couldn't write
       }
     }
+  }
+  const mb = (blob.length / 1e6).toFixed(0);
+  if (fromCache) {
+    ui.cacheMsg.textContent = `weights: ${mb} MB loaded from browser cache ✓`;
+  } else if (cache) {
+    ui.cacheMsg.textContent =
+      `weights: ${mb} MB downloaded — cached, next load will be instant`;
+  } else {
+    ui.cacheMsg.textContent =
+      `weights: ${mb} MB downloaded (browser cache unavailable)`;
+  }
+  if (cache) {
+    ui.clearCache.hidden = false;
+    ui.clearCache.onclick = async () => {
+      await caches.delete("gemma-weights");
+      ui.cacheMsg.textContent =
+        "cache cleared — the next page load will re-download weights";
+      ui.clearCache.hidden = true;
+    };
   }
 
   status("uploading to GPU…");

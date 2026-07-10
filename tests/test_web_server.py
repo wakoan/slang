@@ -108,7 +108,11 @@ class TestEndpoints:
 
     def test_manifest_endpoint(self, base_url):
         body, _ = get(base_url + "/manifest.json")
-        assert json.loads(body)["config"]["hidden_size"] == 640
+        manifest = json.loads(body)
+        assert manifest["config"]["hidden_size"] == 640
+        # served manifest carries a cache-busting version (size-mtime)
+        size = (MODEL_DIR / "web" / "weights.bin").stat().st_size
+        assert manifest["weightsVersion"].startswith(f"{size}-")
 
     def test_weights_head(self, base_url):
         req = urllib.request.Request(base_url + "/weights.bin", method="HEAD")

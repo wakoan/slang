@@ -65,8 +65,16 @@ class GemmaWebHandler(BaseHTTPRequestHandler):
         elif self.path == "/kernels.json":
             self._send_bytes(self.kernels_json.encode(), "application/json")
         elif self.path == "/manifest.json":
-            self._send_file(self.model_dir / "web" / "manifest.json",
-                            "application/json")
+            # inject a weights version so the browser cache invalidates
+            # when weights.bin is re-exported
+            mpath = self.model_dir / "web" / "manifest.json"
+            if not mpath.exists():
+                self.send_error(404)
+                return
+            manifest = json.loads(mpath.read_text())
+            st = (self.model_dir / "web" / "weights.bin").stat()
+            manifest["weightsVersion"] = f"{st.st_size}-{int(st.st_mtime)}"
+            self._send_bytes(json.dumps(manifest).encode(), "application/json")
         elif self.path == "/weights.bin":
             self._send_file(self.model_dir / "web" / "weights.bin",
                             "application/octet-stream")

@@ -46,20 +46,49 @@ async function init() {
     },
   });
 
-  // --- weights: one fetch with progress, slice into buffers ---
-  status("downloading weights…");
-  const resp = await fetch("/weights.bin");
-  const total = Number(resp.headers.get("Content-Length")) || manifest.totalBytes;
-  const blob = new Uint8Array(total);
-  let got = 0;
-  const reader = resp.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    blob.set(value, got);
-    got += value.length;
-    ui.bar.style.width = `${(100 * got / total).toFixed(1)}%`;
-    status(`downloading weights… ${(got / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB`);
+  // --- weights: Cache Storage first, network once ---
+  const cacheKey = `/weights.bin?v=${manifest.weightsVersion ?? "0"}`;
+  let cache = null;
+  try { cache = await caches.open("gemma-weights"); } catch { /* unavailable */ }
+  let blob = null;
+  if (cache) {
+    const hit = await cache.match(cacheKey);
+    if (hit) {
+      status("loading weights from browser cache…");
+      blob = new Uint8Array(await hit.arrayBuffer());
+      ui.bar.style.width = "100%";
+    }
+  }
+  if (!blob) {
+    status("downloading weights…");
+    const resp = await fetch("/weights.bin");
+    const total = Number(resp.headers.get("Content-Length")) || manifest.totalBytes;
+    blob = new Uint8Array(total);
+    let got = 0;
+    const reader = resp.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      blob.set(value, got);
+      got += value.length;
+      ui.bar.style.width = `${(100 * got / total).toFixed(1)}%`;
+      status(`downloading weights… ${(got / 1e6).toFixed(0)} / ${(total / 1e6).toFixed(0)} MB`);
+    }
+    if (cache) {
+      try {
+        // drop stale versions, then store this one; ask for persistence
+        for (const k of await cache.keys()) {
+          if (new URL(k.url).pathname === "/weights.bin") await cache.delete(k);
+        }
+        await cache.put(cacheKey, new Response(blob.slice().buffer, {
+          headers: { "Content-Type": "application/octet-stream" },
+        }));
+        navigator.storage?.persist?.();
+        status("weights cached for next visit…");
+      } catch (e) {
+        console.warn("weight caching failed (quota?):", e);
+      }
+    }
   }
 
   status("uploading to GPU…");

@@ -13,14 +13,17 @@ from .types import (
 )
 
 # Python-level intrinsics renamed to their WGSL equivalents
-_INTRINSIC_RENAMES = {"barrier": "workgroupBarrier"}
+_INTRINSIC_RENAMES = {
+    "barrier": "workgroupBarrier",
+    "subgroup_barrier": "subgroupBarrier",
+}
 
 # Calls that require `enable subgroups;`
 _SUBGROUP_FNS = {
     "subgroupAdd", "subgroupMax", "subgroupMin", "subgroupMul",
     "subgroupAnd", "subgroupOr", "subgroupXor",
     "subgroupBroadcast", "subgroupBroadcastFirst", "subgroupShuffle",
-    "subgroupElect", "subgroupBallot",
+    "subgroupElect", "subgroupBallot", "subgroupBarrier",
 }
 
 
@@ -97,6 +100,10 @@ class _WGSLTranslator:
     def _emit(self, line: str = "") -> None:
         self._lines.append(("  " * self._indent + line) if line else "")
 
+    def _ident(self, name: str) -> str:
+        """Emission-time identifier spelling (backends rename reserved words)."""
+        return name
+
     def _visible(self, name: str) -> bool:
         return any(name in scope for scope in self._scopes)
 
@@ -140,7 +147,7 @@ class _WGSLTranslator:
     # Function-level                                                       #
     # ------------------------------------------------------------------ #
 
-    def _translate_fn(self, node: ast.FunctionDef) -> None:
+    def _classify_params(self, node: ast.FunctionDef):
         bindings: list[tuple[int, int, str, StorageBufferType]] = []
         uniforms: list[tuple[int, int, str, UniformType]] = []
         builtins: list[tuple[str, BuiltinValue]] = []
@@ -168,6 +175,10 @@ class _WGSLTranslator:
                     "Use StorageBuffer, Uniform, WorkgroupArray, or a Builtin value."
                 )
             self._scopes[0].add(name)
+        return bindings, uniforms, builtins, wg_arrays
+
+    def _translate_fn(self, node: ast.FunctionDef) -> None:
+        bindings, uniforms, builtins, wg_arrays = self._classify_params(node)
 
         # f16 anywhere in the interface requires the enable directive
         if any("f16" in t.wgsl_name for _, _, _, t in bindings) or \
@@ -181,7 +192,7 @@ class _WGSLTranslator:
             bv.builtin_name.startswith("subgroup") for _, bv in builtins
         ) or any(
             isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
-            and n.func.id in _SUBGROUP_FNS
+            and _INTRINSIC_RENAMES.get(n.func.id, n.func.id) in _SUBGROUP_FNS
             for n in ast.walk(node)
         )
         if uses_subgroups:
@@ -265,7 +276,7 @@ class _WGSLTranslator:
             if isinstance(target, ast.Name):
                 name = target.id
                 if self._visible(name):
-                    self._emit(f"{name} = {value};")
+                    self._emit(f"{self._ident(name)} = {value};")
                 elif name in self._ever_declared:
                     raise TranslationError(
                         f"Variable '{name}' was declared in a nested block and is "
@@ -274,8 +285,8 @@ class _WGSLTranslator:
                     )
                 else:
                     self._declare(name)
-                    kw = "var" if name in self._mutable else "let"
-                    self._emit(f"{kw} {name} = {value};")
+                    self._emit(self._decl_infer(
+                        self._ident(name), value, name in self._mutable))
             else:
                 self._emit(f"{self._expr(target)} = {value};")
 
@@ -289,9 +300,9 @@ class _WGSLTranslator:
                 )
             self._declare(node.target.id)
         if node.value is not None:
-            self._emit(f"var {target}: {wgsl_type} = {self._expr(node.value)};")
+            self._emit(self._decl_typed(target, wgsl_type, self._expr(node.value)))
         else:
-            self._emit(f"var {target}: {wgsl_type};")
+            self._emit(self._decl_typed(target, wgsl_type, None))
 
     def _s_aug_assign(self, node: ast.AugAssign) -> None:
         if isinstance(node.op, ast.FloorDiv):
@@ -348,15 +359,16 @@ class _WGSLTranslator:
         loop_ty = "i32" if signed else "u32"
         cmp = ">" if descending else "<"
 
+        mvar = self._ident(var)
         if step_val == 1:
-            incr = f"{var}++"
+            incr = f"{mvar}++"
         elif descending:
-            incr = f"{var} -= {-step_val}"
+            incr = f"{mvar} -= {-step_val}"
         else:
-            incr = f"{var} += {self._expr(step_node)}"
+            incr = f"{mvar} += {self._expr(step_node)}"
 
         stop_s = self._expr(stop_node)
-        self._emit(f"for (var {var}: {loop_ty} = {start_s}; {var} {cmp} {stop_s}; {incr}) {{")
+        self._emit(self._for_header(mvar, loop_ty, start_s, cmp, stop_s, incr))
         self._body(node.body, scope={var})
         self._emit("}")
 
@@ -408,7 +420,7 @@ class _WGSLTranslator:
                     "declared; declare it before the block with a type annotation "
                     f"(e.g. \"{node.id}: f32 = 0.0\")"
                 )
-            return node.id
+            return self._ident(node.id)
         if isinstance(node, ast.Constant):
             return self._literal(node.value)
         if isinstance(node, ast.Attribute):
@@ -432,9 +444,8 @@ class _WGSLTranslator:
             return self._boolop(node, prec)
         if isinstance(node, ast.Call):
             fn = self._expr(node.func, _P_ATOM)
-            fn = _INTRINSIC_RENAMES.get(fn, fn)
-            args = ", ".join(self._expr(a) for a in node.args)
-            return f"{fn}({args})"
+            args = [self._expr(a) for a in node.args]
+            return self._render_call(fn, args)
         if isinstance(node, ast.IfExp):
             # Python ternary → WGSL select(false_val, true_val, cond)
             return (
@@ -496,6 +507,25 @@ class _WGSLTranslator:
         s = f" {sym} ".join(rendered)
         return f"({s})" if myprec < prec else s
 
+    # ---- backend hooks (WGSL defaults; overridden by other emitters) ---- #
+
+    def _decl_infer(self, name: str, value: str, mutable: bool) -> str:
+        kw = "var" if mutable else "let"
+        return f"{kw} {name} = {value};"
+
+    def _decl_typed(self, target: str, type_str: str, value: str | None) -> str:
+        if value is None:
+            return f"var {target}: {type_str};"
+        return f"var {target}: {type_str} = {value};"
+
+    def _for_header(self, var: str, loop_ty: str, start: str, cmp: str,
+                    stop: str, incr: str) -> str:
+        return f"for (var {var}: {loop_ty} = {start}; {var} {cmp} {stop}; {incr}) {{"
+
+    def _render_call(self, fn: str, args: list[str]) -> str:
+        fn = _INTRINSIC_RENAMES.get(fn, fn)
+        return f"{fn}({', '.join(args)})"
+
     def _literal(self, value: object) -> str:
         if isinstance(value, bool):
             return "true" if value else "false"
@@ -522,7 +552,8 @@ class _WGSLTranslator:
         raise TranslationError(f"Unsupported annotation: {ast.dump(node)}")
 
 
-def translate(func: Callable, workgroup_size: tuple[int, ...] = (1,)) -> str:
+def translate(func: Callable, workgroup_size: tuple[int, ...] = (1,),
+              target: str = "wgsl") -> str:
     """Translate a Python function to a WGSL compute shader string.
 
     Parameters
@@ -559,7 +590,14 @@ def translate(func: Callable, workgroup_size: tuple[int, ...] = (1,)) -> str:
             for k, v in func.__annotations__.items()
             if k != "return"
         }
-    return _WGSLTranslator(func, annotations, workgroup_size).run()
+    if target == "wgsl":
+        cls = _WGSLTranslator
+    elif target == "msl":
+        from .msl import _MSLTranslator
+        cls = _MSLTranslator
+    else:
+        raise TranslationError(f"Unknown target {target!r}; use 'wgsl' or 'msl'")
+    return cls(func, annotations, workgroup_size).run()
 
 
 def kernel(
@@ -584,6 +622,8 @@ def kernel(
     """
     def _wrap(f: Callable) -> Callable:
         f.wgsl = translate(f, workgroup_size)
+        f.msl = translate(f, workgroup_size, target="msl")
+        f.workgroup_size = workgroup_size
         return f
 
     if func is not None:

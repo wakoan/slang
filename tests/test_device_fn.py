@@ -176,3 +176,72 @@ class TestGPUExecution:
         device.queue.submit([enc.finish()])
         got = np.frombuffer(device.queue.read_buffer(bufs[1]), dtype=np.float32)
         np.testing.assert_allclose(got, x**3 + x**2, rtol=1e-5, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Decorator-free helpers: plain functions resolve lexically
+# ---------------------------------------------------------------------------
+
+def plain_double(x: f32) -> f32:   # note: no @device_fn
+    return x * 2.0
+
+
+class TestDecoratorOptional:
+    def test_plain_module_function_resolves(self):
+        def fn(gid: Builtin.global_invocation_id,
+               out: StorageBuffer[f32, "read_write"]):
+            out[gid.x] = plain_double(3.0)
+        src = translate(fn)
+        assert "fn plain_double(x: f32) -> f32 {" in src
+        assert "plain_double(3.0)" in src
+
+    def test_closure_local_helper_resolves(self):
+        def local_triple(x: f32) -> f32:
+            return x * 3.0
+
+        def fn(gid: Builtin.global_invocation_id,
+               out: StorageBuffer[f32, "read_write"]):
+            out[gid.x] = local_triple(2.0)
+        src = translate(fn)
+        assert "fn local_triple(x: f32) -> f32 {" in src
+
+    def test_plain_helper_calling_plain_helper(self):
+        def quad(x: f32) -> f32:
+            return plain_double(plain_double(x))
+
+        def fn(gid: Builtin.global_invocation_id,
+               out: StorageBuffer[f32, "read_write"]):
+            out[gid.x] = quad(1.0)
+        src = translate(fn)
+        assert src.index("fn plain_double") < src.index("fn quad")
+
+    def test_same_name_helpers_do_not_collide(self):
+        # two kernels, each seeing its OWN local `scale` helper — a global
+        # name registry would have let the last definition win for both
+        def make_kernel(version):
+            if version == 2:
+                def scale(x: f32) -> f32:
+                    return x * 2.0
+            else:
+                def scale(x: f32) -> f32:
+                    return x * 5.0
+
+            def fn(gid: Builtin.global_invocation_id,
+                   out: StorageBuffer[f32, "read_write"]):
+                out[gid.x] = scale(1.0)
+            return fn
+
+        fn2, fn5 = make_kernel(2), make_kernel(5)
+        assert "return x * 2.0;" in translate(fn2)
+        assert "return x * 5.0;" in translate(fn5)
+        # and translating one must not poison the other
+        assert "return x * 2.0;" in translate(fn2)
+
+    def test_builtin_shadowing_prefers_builtin(self):
+        # a module-global named like a WGSL builtin must not be captured
+        def fn(gid: Builtin.global_invocation_id,
+               out: StorageBuffer[f32, "read_write"]):
+            out[gid.x] = sqrt(4.0)
+        src = translate(fn)
+        assert "sqrt(4.0)" in src
+        assert "fn sqrt" not in src

@@ -59,13 +59,18 @@ class DeviceFunction:
         self.node = node
 
 
-_DEVICE_FNS: dict[str, DeviceFunction] = {}
+_DEV_CACHE: dict[Callable, DeviceFunction] = {}
 
 
 def device_fn(func: Callable) -> Callable:
-    """Register a helper callable from kernels; its definition is emitted
-    into any shader that (transitively) calls it."""
-    _DEVICE_FNS[func.__name__] = DeviceFunction(func)
+    """Optional marker for shader helper functions.
+
+    Not required: any plain annotated function visible from a kernel
+    (module global or enclosing scope) is resolved automatically when
+    called. The decorator adds eager validation at definition time and
+    documents intent.
+    """
+    _DEV_CACHE[func] = DeviceFunction(func)  # validate now, cache for later
     return func
 
 
@@ -76,26 +81,52 @@ def _called_names(node: ast.AST) -> set[str]:
     }
 
 
-def _collect_device_fns(entry: ast.AST) -> list[DeviceFunction]:
-    """Transitive device-fn dependencies, callees before callers."""
+def _resolve_helper(func: Callable, name: str):
+    """Resolve `name` the way Python would from inside `func`:
+    closure cells first, then module globals. Returns a function or None."""
+    code = func.__code__
+    if func.__closure__ and name in code.co_freevars:
+        try:
+            val = func.__closure__[code.co_freevars.index(name)].cell_contents
+        except ValueError:  # empty cell
+            val = None
+    else:
+        val = func.__globals__.get(name)
+    return val if inspect.isfunction(val) else None
+
+
+def _collect_device_fns(func: Callable, entry: ast.AST) -> list[DeviceFunction]:
+    """Transitive helper dependencies of a kernel, callees before callers.
+
+    Names are resolved lexically per function (its closure, then its
+    module globals) — same-named helpers in different modules never
+    collide. WGSL builtins take precedence and are never resolved."""
     ordered: list[DeviceFunction] = []
-    done: set[str] = set()
-    visiting: set[str] = set()
+    done: set[Callable] = set()
+    visiting: set[Callable] = set()
 
-    def visit(names: set[str]) -> None:
-        for nm in sorted(names):
-            if nm not in _DEVICE_FNS or nm in done:
+    def visit(owner: Callable, node: ast.AST) -> None:
+        for nm in sorted(_called_names(node)):
+            if nm in _KNOWN_BUILTINS or nm in _INTRINSIC_RENAMES:
                 continue
-            if nm in visiting:
+            helper = _resolve_helper(owner, nm)
+            if helper is None:
+                continue  # _render_call reports unknown names with context
+            if helper in done:
+                continue
+            if helper in visiting:
                 raise TranslationError(
-                    f"Recursive device_fn '{nm}' — WGSL/MSL forbid recursion")
-            visiting.add(nm)
-            visit(_called_names(_DEVICE_FNS[nm].node))
-            visiting.discard(nm)
-            done.add(nm)
-            ordered.append(_DEVICE_FNS[nm])
+                    f"Recursive helper '{nm}' — WGSL/MSL forbid recursion")
+            if helper not in _DEV_CACHE:
+                _DEV_CACHE[helper] = DeviceFunction(helper)
+            dev = _DEV_CACHE[helper]
+            visiting.add(helper)
+            visit(helper, dev.node)  # nested calls resolve in the helper's scope
+            visiting.discard(helper)
+            done.add(helper)
+            ordered.append(dev)
 
-    visit(_called_names(entry))
+    visit(func, entry)
     return ordered
 
 
@@ -178,6 +209,7 @@ class _WGSLTranslator:
         self._ever_declared: set[str] = set()
         self._mutable: set[str] = set()
         self._device_fns: list[DeviceFunction] = []
+        self._device_fn_names: set[str] = set()
         self._return_type: WGSLType | None = None
 
     def _emit(self, line: str = "") -> None:
@@ -223,7 +255,8 @@ class _WGSLTranslator:
                 self._mutable.add(node.target.id)
         self._mutable |= {n for n, c in assign_counts.items() if c >= 2}
 
-        self._device_fns = _collect_device_fns(func_def)
+        self._device_fns = _collect_device_fns(self._func, func_def)
+        self._device_fn_names = {d.name for d in self._device_fns}
         self._translate_fn(func_def)
         return "\n".join(self._lines)
 
@@ -614,6 +647,7 @@ class _WGSLTranslator:
                 self._workgroup_size,
             )
             sub._return_type = dev.annotations.get("return")
+            sub._device_fn_names = self._device_fn_names
             for line in sub.render_device_fn():
                 self._lines.append(line)
             self._emit()
@@ -689,14 +723,15 @@ class _WGSLTranslator:
         if special is not None:
             return special
         joined = ", ".join(args)
-        if fn in _DEVICE_FNS:
+        if fn in self._device_fn_names:
             return f"{self._ident(fn)}({joined})"
         if fn not in _KNOWN_BUILTINS and \
                 _INTRINSIC_RENAMES.get(fn, fn) not in _SUBGROUP_FNS and \
                 fn not in _INTRINSIC_RENAMES:
             raise TranslationError(
-                f"Unknown function '{fn}': not a WGSL builtin, intrinsic, or "
-                "registered @device_fn helper")
+                f"Unknown function '{fn}': not a WGSL builtin or intrinsic, "
+                "and no function with that name is visible from the kernel "
+                "(helpers need scalar/vector type annotations)")
         fn = _INTRINSIC_RENAMES.get(fn, fn)
         return f"{fn}({joined})"
 

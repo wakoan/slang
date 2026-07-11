@@ -10,12 +10,11 @@ the same KV — kernels assume this.
 """
 
 from py_shader_lang_wgpu import (
-    kernel, device_fn, u32, f32, f16, StorageBuffer, Builtin, WorkgroupArray,
+    kernel, u32, f32, f16, StorageBuffer, Builtin, WorkgroupArray,
 )
 
 
-@device_fn
-def gelu(g: f32) -> f32:
+def gelu(g: f32) -> f32:  # helper — resolved automatically by the DSL
     # gelu_pytorch_tanh: 0.5g(1 + tanh(sqrt(2/pi)(g + 0.044715 g^3)))
     # Clamp: Metal's fast-math tanh computes via exp() and overflows to NaN
     # for |x| >~ 44; tanh(+-20) is already +-1.0 exactly in f32.

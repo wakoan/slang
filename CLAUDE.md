@@ -53,7 +53,7 @@ The translator emits **WGSL** (default) and **MSL** (`translate(fn, target="msl"
 
 ## DSL features beyond the basics
 
-- `@device_fn` registers helper functions callable from kernels (scalar/vector params + return annotation required); definitions are emitted transitively, callee-first, into any shader that calls them, on both backends. Unknown call names now raise `TranslationError` at translate time (typo protection) — extend `_KNOWN_BUILTINS` if a legitimate WGSL builtin is missing
+- Helper functions: any plain annotated function visible from a kernel (module global or enclosing scope) is auto-resolved and its definition emitted transitively, callee-first, on both backends — no decorator needed. `@device_fn` remains as an optional eager-validation marker. Resolution is lexical (per kernel's namespace), builtins take precedence, and closure *values* are NOT captured (only functions). Unknown call names raise `TranslationError` at translate time — extend `_KNOWN_BUILTINS` if a legitimate WGSL builtin is missing
 - `WorkgroupArray[f32, N]` params → `var<workgroup>` shared memory; `barrier()` → `workgroupBarrier()`
 - `f16` storage buffers emit `enable f16;` (needs the `shader-f16` device feature)
 - `subgroupAdd`/`subgroupMax` calls and `Builtin.subgroup_*` emit `enable subgroups;` — the runner strips this directive if naga rejects it (current naga supports the ops but not the directive; feature is named `subgroup`, singular, in wgpu-py)

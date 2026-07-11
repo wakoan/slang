@@ -17,6 +17,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 GENDEMO_DIR = ROOT / "gendemo"
+TENSORSCOPE_DIR = ROOT / "tensorscope"
 DEFAULT_MODEL_DIR = ROOT / "models" / "gemma-3-270m-it"
 
 # Kernels the browser uses: portable WGSL only (no f16 / subgroup features;
@@ -62,6 +63,10 @@ class GemmaWebHandler(BaseHTTPRequestHandler):
             self._send_file(GENDEMO_DIR / "index.html", "text/html")
         elif self.path == "/app.js":
             self._send_file(GENDEMO_DIR / "app.js", "text/javascript")
+        elif self.path in ("/tensorscope", "/tensorscope/"):
+            self._send_file(TENSORSCOPE_DIR / "index.html", "text/html")
+        elif self.path == "/tensorscope.js":
+            self._send_file(TENSORSCOPE_DIR / "tensorscope.js", "text/javascript")
         elif self.path == "/kernels.json":
             self._send_bytes(self.kernels_json.encode(), "application/json")
         elif self.path == "/manifest.json":
@@ -164,6 +169,7 @@ def main():
 
     httpd = make_server(args.port, Path(args.model_dir))
     print(f"Gemma WebGPU server: http://localhost:{args.port}")
+    print(f"tensor debugger:     http://localhost:{args.port}/tensorscope")
     print("open in Chrome/Edge (WebGPU required); Ctrl-C to stop")
     try:
         httpd.serve_forever()

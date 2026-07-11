@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tensorscope · Gemma 3 intermediate tensors</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    font: 14px/1.45 -apple-system, system-ui, sans-serif;
+    background: #111; color: #ddd; margin: 0; padding: 1.2rem;
+  }
+  h1 { font-size: 1.05rem; font-weight: 600; margin: 0 0 .2rem; }
+  h1 small { color: #888; font-weight: 400; }
+  a { color: #4a9eff; text-decoration: none; }
+  #status { color: #999; font-size: .82rem; min-height: 1.2em; margin: .3rem 0 .6rem; }
+  #controls { display: flex; gap: .5rem; align-items: flex-start; margin-bottom: .6rem; }
+  textarea {
+    flex: 1; background: #1a1a1a; color: #eee; border: 1px solid #333;
+    border-radius: 8px; padding: .5rem .7rem; font: inherit; resize: vertical;
+    min-height: 3em;
+  }
+  button {
+    background: #4a9eff; color: #fff; border: 0; border-radius: 8px;
+    padding: .5rem 1.1rem; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { background: #333; color: #777; cursor: default; }
+  #stepinfo { font-size: .85rem; color: #bbb; }
+  #preds { font-size: .85rem; color: #6fbf73; margin: .2rem 0 .8rem; min-height: 1.2em; }
+  #main { display: flex; gap: 1rem; }
+  #tensorlist {
+    width: 240px; height: 640px; background: #1a1a1a; color: #ddd;
+    border: 1px solid #333; border-radius: 8px; font: 12px/1.5 ui-monospace, monospace;
+  }
+  #viz { flex: 1; min-width: 0; }
+  #vizcontrols { display: flex; gap: .8rem; align-items: center; margin-bottom: .5rem;
+    font-size: .82rem; color: #999; }
+  select { background: #1a1a1a; color: #ddd; border: 1px solid #333; border-radius: 6px;
+    padding: .15rem .4rem; font: inherit; }
+  #canvas { background: #000; border: 1px solid #333; border-radius: 6px;
+    image-rendering: pixelated; max-width: 100%; }
+  #tooltip { font: 12px ui-monospace, monospace; color: #4a9eff; min-height: 1.3em; margin-top: .3rem; }
+  #stats { font: 12px ui-monospace, monospace; color: #999; min-height: 1.3em; }
+</style>
+</head>
+<body>
+  <h1>tensorscope <small>— step through Gemma 3 one token at a time and inspect
+  every intermediate tensor · <a href="/">back to generation demo</a></small></h1>
+  <div id="status">initializing…</div>
+  <div id="controls">
+    <textarea id="prompt">Why is the sky blue?</textarea>
+    <button id="tokenize" disabled>Tokenize / Reset</button>
+    <button id="step" disabled>Step ▸</button>
+  </div>
+  <div id="stepinfo"></div>
+  <div id="preds"></div>
+  <div id="main">
+    <select id="tensorlist" size="2" multiple="false"></select>
+    <div id="viz">
+      <div id="vizcontrols">
+        width:
+        <select id="widthsel">
+          <option value="">auto</option>
+          <option>8</option><option>16</option><option>32</option>
+          <option>64</option><option>128</option><option>256</option><option>512</option>
+        </select>
+        scale:
+        <select id="scalesel">
+          <option value="symmetric">symmetric (blue·white·red)</option>
+          <option value="minmax">min–max (grayscale)</option>
+        </select>
+      </div>
+      <canvas id="canvas" width="720" height="200"></canvas>
+      <div id="tooltip"></div>
+      <div id="stats"></div>
+    </div>
+  </div>
+  <script type="module" src="/tensorscope.js"></script>
+</body>
+</html>

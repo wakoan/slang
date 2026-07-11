@@ -131,6 +131,16 @@ class TestEndpoints:
         # template starts with <bos><start_of_turn> = [2, 105, ...]
         assert out["ids"][:2] == [2, 105]
 
+    def test_tensorscope_page(self, base_url):
+        body, headers = get(base_url + "/tensorscope")
+        assert b"tensorscope" in body
+        assert headers["Content-Type"] == "text/html"
+
+    def test_tensorscope_js(self, base_url):
+        body, _ = get(base_url + "/tensorscope.js")
+        assert b"debugStep" in body
+        assert b"copyBufferToBuffer" in body
+
     def test_404(self, base_url):
         with pytest.raises(urllib.error.HTTPError):
             get(base_url + "/nope")

@@ -6,7 +6,7 @@ const $ = id => document.getElementById(id);
 const ui = {
   status: $("status"), prompt: $("prompt"),
   tokenizeBtn: $("tokenize"), stepBtn: $("step"),
-  stepInfo: $("stepinfo"), preds: $("preds"),
+  stepInfo: $("stepinfo"), preds: $("preds"), runPromptBtn: $("runprompt"),
   list: $("tensorlist"), canvas: $("canvas"),
   tooltip: $("tooltip"), stats: $("stats"),
   widthSel: $("widthsel"), scaleSel: $("scalesel"), zoomSel: $("zoomsel"),
@@ -308,37 +308,61 @@ ui.tokenizeBtn.addEventListener("click", async () => {
   ui.stepInfo.textContent = `prompt: ${promptIds.length} tokens — position 0 (KV cache reset)`;
   ui.preds.textContent = "";
   ui.stepBtn.disabled = false;
+  ui.runPromptBtn.disabled = false;
   ctx2d.clearRect(0, 0, ui.canvas.width, ui.canvas.height);
   ui.stats.textContent = "";
 });
 
-ui.stepBtn.addEventListener("click", async () => {
-  ui.stepBtn.disabled = true;
-  try {
-    const inPrompt = pos < promptIds.length;
-    const tid = inPrompt ? promptIds[pos] : nextTok;
-    status(`stepping: pos ${pos}, token ${tid}…`);
-    const t0 = performance.now();
-    await debugStep(tid, pos);
-    const c = capIndex["logits"];
-    const logits = lastCap.subarray(c.offset / 4, c.offset / 4 + c.floats);
-    const top = topK(logits, 5);
-    nextTok = top[0].id;
-    const tidPiece = await piece(tid);
-    ui.stepInfo.textContent =
-      `pos ${pos} ${inPrompt ? "(prompt)" : "(generated)"} — processed ${tid} ` +
-      `${JSON.stringify(tidPiece)} in ${(performance.now() - t0).toFixed(0)} ms`;
-    const parts = [];
-    for (const t of top) parts.push(`${JSON.stringify(await piece(t.id))} ${(t.p * 100).toFixed(1)}%`);
+async function doStep() {
+  const inPrompt = pos < promptIds.length;
+  const tid = inPrompt ? promptIds[pos] : nextTok;
+  status(`stepping: pos ${pos}, token ${tid}…`);
+  const t0 = performance.now();
+  await debugStep(tid, pos);
+  const c = capIndex["logits"];
+  const logits = lastCap.subarray(c.offset / 4, c.offset / 4 + c.floats);
+  const top = topK(logits, 5);
+  nextTok = top[0].id;
+  const tidPiece = await piece(tid);
+  const promptLeft = promptIds.length - 1 - pos;
+  ui.stepInfo.textContent =
+    (inPrompt ? `prompt token ${pos + 1}/${promptIds.length}` : `generated (pos ${pos})`) +
+    ` — processed ${tid} ${JSON.stringify(tidPiece)} ` +
+    `in ${(performance.now() - t0).toFixed(0)} ms`;
+  const parts = [];
+  for (const t of top) parts.push(`${JSON.stringify(await piece(t.id))} ${(t.p * 100).toFixed(1)}%`);
+  if (promptLeft > 0) {
+    // mid-prompt: the model has only seen a prefix — label it honestly
+    ui.preds.className = "partial";
+    ui.preds.textContent =
+      `⚠ prompt unfinished (${promptLeft} tokens left) — continuation of the ` +
+      `partial prefix, NOT the answer: ` + parts.join("  ·  ");
+  } else {
+    ui.preds.className = "";
     ui.preds.textContent = "next: " + parts.join("  ·  ");
-    pos++;
-    status("step done — select a tensor");
-    if (ui.list.value) render(ui.list.value);
-  } catch (e) {
-    status(`error: ${e.message ?? e}`); console.error(e);
-  } finally {
-    ui.stepBtn.disabled = false;
   }
+  pos++;
+  if (pos >= promptIds.length) ui.runPromptBtn.disabled = true;
+  if (ui.list.value) render(ui.list.value);
+}
+
+ui.stepBtn.addEventListener("click", async () => {
+  ui.stepBtn.disabled = true; ui.runPromptBtn.disabled = true;
+  try { await doStep(); status("step done — select a tensor"); }
+  catch (e) { status(`error: ${e.message ?? e}`); console.error(e); }
+  finally {
+    ui.stepBtn.disabled = false;
+    ui.runPromptBtn.disabled = pos >= promptIds.length;
+  }
+});
+
+ui.runPromptBtn.addEventListener("click", async () => {
+  ui.stepBtn.disabled = true; ui.runPromptBtn.disabled = true;
+  try {
+    while (pos < promptIds.length) await doStep();
+    status("prompt complete — predictions below are the real continuation");
+  } catch (e) { status(`error: ${e.message ?? e}`); console.error(e); }
+  finally { ui.stepBtn.disabled = false; }
 });
 
 // ------------------------------------------------------------- rendering

@@ -26,6 +26,7 @@
   button:disabled { background: #333; color: #777; cursor: default; }
   #stepinfo { font-size: .85rem; color: #bbb; }
   #preds { font-size: .85rem; color: #6fbf73; margin: .2rem 0 .8rem; min-height: 1.2em; }
+  #preds.partial { color: #997a3d; }
   #main { display: flex; gap: 1rem; }
   #tensorlist {
     width: 240px; height: 640px; background: #1a1a1a; color: #ddd;
@@ -53,6 +54,7 @@
     <textarea id="prompt">Why is the sky blue?</textarea>
     <button id="tokenize" disabled>Tokenize / Reset</button>
     <button id="step" disabled>Step ▸</button>
+    <button id="runprompt" disabled title="step through all remaining prompt tokens">Finish prompt ▸▸</button>
   </div>
   <div id="stepinfo"></div>
   <div id="preds"></div>

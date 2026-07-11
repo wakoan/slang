@@ -146,29 +146,31 @@ async function init() {
 
   // --- capture arena layout ---
   CAPS = []; capIndex = {}; let off = 0;
-  const addCap = (key, group, src, floats, defCols, kind = "plain") => {
-    const c = { key, group, src, floats, offset: off, defCols, kind };
+  // dims: semantic axes [label, size]; 1-D tensors stay reshapeable via
+  // the width control, 2-D tensors render with fixed labeled axes
+  const addCap = (key, group, src, floats, dims, defCols, kind = "plain") => {
+    const c = { key, group, src, floats, offset: off, dims, defCols, kind };
     CAPS.push(c); capIndex[key] = c; off += floats * 4;
   };
-  addCap("embed", "global", "x", h, 32);
+  addCap("embed", "global", "x", h, [["d", h]], 32);
   for (let L = 0; L < cfg.num_layers; L++) {
     const g = `layer ${L}`;
-    addCap(`L${L}.norm_in`, g, "xn", h, 32);
-    addCap(`L${L}.qkv`, g, "qkv", qDim + 2 * hd, 64);
-    addCap(`L${L}.q`, g, "qn", qDim, 64);
-    addCap(`L${L}.k`, g, "kn", hd, 32);
-    addCap(`L${L}.attn_probs`, g, "scores", nh * MAX_SEQ, MAX_SEQ, "attn");
-    addCap(`L${L}.attn_out`, g, "attn", qDim, 64);
-    addCap(`L${L}.o_proj`, g, "attnProj", h, 32);
-    addCap(`L${L}.hidden_attn`, g, "x", h, 32);
-    addCap(`L${L}.norm_ff`, g, "xn", h, 32);
-    addCap(`L${L}.gateup`, g, "gateup", 2 * inter, 64);
-    addCap(`L${L}.geglu`, g, "ffh", inter, 64);
-    addCap(`L${L}.mlp_out`, g, "mlpOut", h, 32);
-    addCap(`L${L}.hidden`, g, "x", h, 32);
+    addCap(`L${L}.norm_in`, g, "xn", h, [["d", h]], 32);
+    addCap(`L${L}.qkv`, g, "qkv", qDim + 2 * hd, [["q|k|v", qDim + 2 * hd]], 64);
+    addCap(`L${L}.q`, g, "qn", qDim, [["head", nh], ["d", hd]]);
+    addCap(`L${L}.k`, g, "kn", hd, [["head", 1], ["d", hd]]);
+    addCap(`L${L}.attn_probs`, g, "scores", nh * MAX_SEQ, null, null, "attn");
+    addCap(`L${L}.attn_out`, g, "attn", qDim, [["head", nh], ["d", hd]]);
+    addCap(`L${L}.o_proj`, g, "attnProj", h, [["d", h]], 32);
+    addCap(`L${L}.hidden_attn`, g, "x", h, [["d", h]], 32);
+    addCap(`L${L}.norm_ff`, g, "xn", h, [["d", h]], 32);
+    addCap(`L${L}.gateup`, g, "gateup", 2 * inter, [["gate/up", 2], ["ff", inter]]);
+    addCap(`L${L}.geglu`, g, "ffh", inter, [["ff", inter]], 64);
+    addCap(`L${L}.mlp_out`, g, "mlpOut", h, [["d", h]], 32);
+    addCap(`L${L}.hidden`, g, "x", h, [["d", h]], 32);
   }
-  addCap("final_norm", "global", "xn", h, 32);
-  addCap("logits", "global", "logits", cfg.vocab_size, 512);
+  addCap("final_norm", "global", "xn", h, [["d", h]], 32);
+  addCap("logits", "global", "logits", cfg.vocab_size, [["vocab", cfg.vocab_size]], 512);
   const arena = device.createBuffer({ size: off,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
   const staging = device.createBuffer({ size: off,
@@ -336,18 +338,32 @@ ui.stepBtn.addEventListener("click", async () => {
 });
 
 // ------------------------------------------------------------- rendering
+// treescope-style: labeled semantic axes, tick indices, color legend,
+// edge-truncation for huge axes, value digits when cells are large.
 
-let view = null; // {rows, cols, data, cellW, cellH} for hover mapping
+const M_L = 46, M_T = 20, LEGEND_H = 34;   // margins + legend strip
+const EDGE = 512;                          // edge items kept when truncating
+
+let view = null; // hover state
+
+function truncMap(size, limit) {
+  // returns display->original index map, or null when no truncation needed
+  if (size <= limit) return null;
+  const map = new Array(2 * EDGE + 1);
+  for (let i = 0; i < EDGE; i++) map[i] = i;
+  map[EDGE] = -1;                                    // ellipsis band
+  for (let i = 0; i < EDGE; i++) map[EDGE + 1 + i] = size - EDGE + i;
+  return map;
+}
 
 function render(key) {
   if (!lastCap) { ui.stats.textContent = "run a step first"; return; }
   const c = capIndex[key];
   let data = lastCap.subarray(c.offset / 4, c.offset / 4 + c.floats);
-  let cols = +ui.widthSel.value || c.defCols;
-  let rows;
+
+  // resolve semantic shape
+  let rows, cols, rowLab, colLab;
   if (c.kind === "attn") {
-    // scores hold unnormalized exp() weights; normalize per head row and
-    // crop to the visible KV length
     const nh = G.cfg.num_heads;
     const out = new Float32Array(nh * lastKvLen);
     for (let hI = 0; hI < nh; hI++) {
@@ -356,52 +372,141 @@ function render(key) {
       for (let t = 0; t < lastKvLen; t++)
         out[hI * lastKvLen + t] = data[hI * MAX_SEQ + t] / (sum || 1);
     }
-    data = out; cols = lastKvLen; rows = nh;
+    data = out; rows = nh; cols = lastKvLen; rowLab = "head"; colLab = "kv";
+    ui.widthSel.disabled = true;
+  } else if (c.dims.length === 2) {
+    [[rowLab, rows], [colLab, cols]] = c.dims;
+    ui.widthSel.disabled = true;
   } else {
+    colLab = c.dims[0][0]; rowLab = "";
+    cols = +ui.widthSel.value || c.defCols;
     rows = Math.ceil(data.length / cols);
+    ui.widthSel.disabled = false;
   }
 
   // stats (NaN/Inf aware)
   let mn = Infinity, mx = -Infinity, sum = 0, sq = 0, bad = 0, n = 0;
   for (const v of data) {
     if (!Number.isFinite(v)) { bad++; continue; }
-    mn = Math.min(mn, v); mx = Math.max(mx, v); sum += v; sq += v * v; n++;
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+    sum += v; sq += v * v; n++;
   }
   const mean = sum / (n || 1);
   const std = Math.sqrt(Math.max(0, sq / (n || 1) - mean * mean));
+  const shapeStr = c.dims === null || c.kind === "attn" || c.dims.length === 2
+    ? `${rowLab}:${rows} × ${colLab}:${cols}`
+    : `${colLab}:${data.length} (shown ${rows}×${cols})`;
   ui.stats.textContent =
-    `${key}  shape ${rows}×${cols}  min ${mn.toFixed(4)}  max ${mx.toFixed(4)}  ` +
+    `${key}  f32  ${shapeStr}  min ${mn.toFixed(4)}  max ${mx.toFixed(4)}  ` +
     `mean ${mean.toFixed(4)}  std ${std.toFixed(4)}` +
-    (bad ? `  ⚠ ${bad} non-finite values` : "");
+    (bad ? `  ⚠ ${bad} non-finite` : "");
 
-  // color scale
+  // truncation of long axes (treescope edge-items style)
+  const colMap = truncMap(cols, 1040);
+  const rowMap = truncMap(rows, 640);
+  const dCols = colMap ? colMap.length : cols;
+  const dRows = rowMap ? rowMap.length : rows;
+
   const sym = ui.scaleSel.value === "symmetric";
   const lim = sym ? Math.max(Math.abs(mn), Math.abs(mx)) || 1 : null;
-  const img = ctx2d.createImageData(cols, rows);
-  for (let i = 0; i < rows * cols; i++) {
-    const v = i < data.length ? data[i] : 0;
-    let r, g, b;
-    if (!Number.isFinite(v)) { r = 255; g = 0; b = 255; }         // magenta
-    else if (sym) {
+  const color = v => {
+    if (!Number.isFinite(v)) return [255, 0, 255];
+    if (sym) {
       const t = Math.max(-1, Math.min(1, v / lim));
-      if (t >= 0) { r = 255; g = b = Math.round(255 * (1 - t)); } // white→red
-      else { b = 255; r = g = Math.round(255 * (1 + t)); }        // white→blue
-    } else {
-      const t = (v - mn) / ((mx - mn) || 1);
-      r = g = b = Math.round(255 * t);                            // grayscale
+      return t >= 0
+        ? [255, Math.round(255 * (1 - t)), Math.round(255 * (1 - t))]
+        : [Math.round(255 * (1 + t)), Math.round(255 * (1 + t)), 255];
     }
-    img.data.set([r, g, b, 255], i * 4);
+    const t = (v - mn) / ((mx - mn) || 1);
+    const g = Math.round(255 * t);
+    return [g, g, g];
+  };
+
+  const img = ctx2d.createImageData(dCols, dRows);
+  for (let dr = 0; dr < dRows; dr++) {
+    for (let dc = 0; dc < dCols; dc++) {
+      const r = rowMap ? rowMap[dr] : dr;
+      const cc = colMap ? colMap[dc] : dc;
+      let rgb;
+      if (r === -1 || cc === -1) rgb = [34, 34, 34];          // ellipsis band
+      else {
+        const i = r * cols + cc;
+        rgb = i < data.length ? color(data[i]) : [17, 17, 17];
+      }
+      img.data.set([...rgb, 255], (dr * dCols + dc) * 4);
+    }
   }
 
-  // scale to canvas
-  const maxW = 720, maxH = 560;
-  const cell = Math.max(1, Math.min(Math.floor(maxW / cols), Math.floor(maxH / rows), 24));
-  ui.canvas.width = cols * cell; ui.canvas.height = rows * cell;
+  const cell = Math.max(1, Math.min(Math.floor(720 / dCols), Math.floor(560 / dRows), 26));
+  const gw = dCols * cell, gh = dRows * cell;
+  ui.canvas.width = M_L + gw;
+  ui.canvas.height = M_T + gh + LEGEND_H;
+
   createImageBitmap(img).then(bmp => {
     ctx2d.imageSmoothingEnabled = false;
-    ctx2d.drawImage(bmp, 0, 0, cols * cell, rows * cell);
+    ctx2d.fillStyle = "#111";
+    ctx2d.fillRect(0, 0, ui.canvas.width, ui.canvas.height);
+    ctx2d.drawImage(bmp, M_L, M_T, gw, gh);
+
+    // axis labels + tick indices
+    ctx2d.fillStyle = "#888";
+    ctx2d.font = "10px ui-monospace, monospace";
+    ctx2d.textAlign = "left";
+    ctx2d.fillText(`${colLab} →`, M_L, 10);
+    const colTick = dc => (colMap ? colMap[Math.min(dc, dCols - 1)] : dc);
+    for (const dc of [0, dCols >> 1, dCols - 1]) {
+      const orig = colTick(dc);
+      if (orig >= 0) ctx2d.fillText(String(orig), M_L + dc * cell, M_T - 2);
+    }
+    ctx2d.save();
+    ctx2d.translate(10, M_T + 2);
+    ctx2d.rotate(Math.PI / 2);
+    ctx2d.fillText(`${rowLab || "row"} →`, 0, 0);
+    ctx2d.restore();
+    ctx2d.textAlign = "right";
+    for (const dr of [0, dRows >> 1, dRows - 1]) {
+      const orig = rowMap ? rowMap[Math.min(dr, dRows - 1)] : dr;
+      if (orig >= 0) ctx2d.fillText(String(orig), M_L - 4, M_T + dr * cell + Math.max(9, cell / 2));
+    }
+
+    // in-cell digits when cells are big enough (treescope-like)
+    if (cell >= 22 && dRows * dCols <= 2400) {
+      ctx2d.font = "9px ui-monospace, monospace";
+      ctx2d.textAlign = "center";
+      for (let dr = 0; dr < dRows; dr++) {
+        for (let dc = 0; dc < dCols; dc++) {
+          const r = rowMap ? rowMap[dr] : dr;
+          const cc = colMap ? colMap[dc] : dc;
+          if (r === -1 || cc === -1) continue;
+          const i = r * cols + cc;
+          if (i >= data.length) continue;
+          const v = data[i];
+          ctx2d.fillStyle = Math.abs(sym ? v / lim : 0.5) > 0.55 ? "#fff" : "#333";
+          ctx2d.fillText(Number.isFinite(v) ? v.toFixed(2) : "NaN",
+                         M_L + dc * cell + cell / 2, M_T + dr * cell + cell / 2 + 3);
+        }
+      }
+    }
+
+    // legend strip
+    const ly = M_T + gh + 12, lw = Math.min(240, gw);
+    for (let x = 0; x < lw; x++) {
+      const t = x / (lw - 1);
+      const v = sym ? (2 * t - 1) * lim : mn + t * (mx - mn);
+      ctx2d.fillStyle = `rgb(${color(v).join(",")})`;
+      ctx2d.fillRect(M_L + x, ly, 1, 10);
+    }
+    ctx2d.fillStyle = "#888";
+    ctx2d.font = "10px ui-monospace, monospace";
+    ctx2d.textAlign = "left";
+    ctx2d.fillText((sym ? -lim : mn).toPrecision(3), M_L, ly + 20);
+    ctx2d.textAlign = "right";
+    ctx2d.fillText((sym ? lim : mx).toPrecision(3), M_L + lw, ly + 20);
+    if (sym) { ctx2d.textAlign = "center"; ctx2d.fillText("0", M_L + lw / 2, ly + 20); }
   });
-  view = { rows, cols, data, cell, key };
+
+  view = { rows, cols, dRows, dCols, rowMap, colMap, data, cell, rowLab, colLab };
 }
 
 ui.list.addEventListener("change", () => render(ui.list.value));
@@ -411,13 +516,20 @@ ui.scaleSel.addEventListener("change", () => ui.list.value && render(ui.list.val
 ui.canvas.addEventListener("mousemove", e => {
   if (!view) return;
   const rect = ui.canvas.getBoundingClientRect();
-  const col = Math.floor((e.clientX - rect.left) / view.cell);
-  const row = Math.floor((e.clientY - rect.top) / view.cell);
-  const i = row * view.cols + col;
-  if (row < 0 || col < 0 || row >= view.rows || i >= view.data.length) {
+  const scaleX = ui.canvas.width / rect.width;   // CSS may shrink the canvas
+  const dc = Math.floor(((e.clientX - rect.left) * scaleX - M_L) / view.cell);
+  const dr = Math.floor(((e.clientY - rect.top) * scaleX - M_T) / view.cell);
+  if (dr < 0 || dc < 0 || dr >= view.dRows || dc >= view.dCols) {
     ui.tooltip.textContent = ""; return;
   }
-  ui.tooltip.textContent = `[${row}, ${col}]  index ${i}  value ${view.data[i]}`;
+  const r = view.rowMap ? view.rowMap[dr] : dr;
+  const cc = view.colMap ? view.colMap[dc] : dc;
+  if (r === -1 || cc === -1) { ui.tooltip.textContent = "⋯ (truncated region)"; return; }
+  const i = r * view.cols + cc;
+  if (i >= view.data.length) { ui.tooltip.textContent = ""; return; }
+  const rl = view.rowLab || "row";
+  ui.tooltip.textContent =
+    `${rl} ${r}, ${view.colLab} ${cc}  ·  flat index ${i}  ·  value ${view.data[i]}`;
 });
 ui.canvas.addEventListener("mouseleave", () => { ui.tooltip.textContent = ""; });
 

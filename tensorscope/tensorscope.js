@@ -10,10 +10,12 @@ const ui = {
   list: $("tensorlist"), canvas: $("canvas"),
   tooltip: $("tooltip"), stats: $("stats"),
   widthSel: $("widthsel"), scaleSel: $("scalesel"), zoomSel: $("zoomsel"),
-  legend: $("legend"),
+  legend: $("legend"), hist: $("hist"),
 };
 const ctx2d = ui.canvas.getContext("2d");
 const legendCtx = ui.legend.getContext("2d");
+const histCtx = ui.hist.getContext("2d");
+let histView = null;
 
 const MAX_SEQ = 1024;
 let G = null;            // gpu state
@@ -518,8 +520,69 @@ function render(key) {
   legendCtx.fillText((sym ? lim : mx).toPrecision(3), 260, 24);
   if (sym) { legendCtx.textAlign = "center"; legendCtx.fillText("0", 140, 24); }
 
+  drawHistogram(data, mn, mx);
   view = { rows, cols, dRows, dCols, rowMap, colMap, data, cell, rowLab, colLab };
 }
+
+// value distribution: 64 bins, log-scaled counts (peaked distributions
+// would otherwise hide their tails), zero marker, hover for bin counts
+const H_BINS = 64, H_W = 340, H_H = 96, H_PAD = 14;
+
+function drawHistogram(data, mn, mx) {
+  const bins = new Uint32Array(H_BINS);
+  const span = (mx - mn) || 1;
+  let finite = 0;
+  for (const v of data) {
+    if (!Number.isFinite(v)) continue;
+    let b = Math.floor((v - mn) / span * H_BINS);
+    if (b >= H_BINS) b = H_BINS - 1;
+    if (b < 0) b = 0;
+    bins[b]++; finite++;
+  }
+  let cmax = 0;
+  for (const c of bins) if (c > cmax) cmax = c;
+
+  histCtx.clearRect(0, 0, H_W, H_H);
+  histCtx.fillStyle = "#1a1a1a";
+  histCtx.fillRect(0, 0, H_W, H_H - H_PAD);
+  const bw = H_W / H_BINS;
+  const lg = c => Math.log1p(c) / Math.log1p(cmax || 1);
+  histCtx.fillStyle = "#4a9eff";
+  for (let b = 0; b < H_BINS; b++) {
+    const hgt = Math.round(lg(bins[b]) * (H_H - H_PAD - 4));
+    if (hgt > 0) histCtx.fillRect(b * bw, H_H - H_PAD - hgt, Math.max(1, bw - 1), hgt);
+  }
+  if (mn < 0 && mx > 0) {                       // zero marker
+    const zx = (-mn) / span * H_W;
+    histCtx.strokeStyle = "#e05555";
+    histCtx.setLineDash([3, 3]);
+    histCtx.beginPath();
+    histCtx.moveTo(zx, 0); histCtx.lineTo(zx, H_H - H_PAD);
+    histCtx.stroke();
+    histCtx.setLineDash([]);
+  }
+  histCtx.fillStyle = "#888";
+  histCtx.font = "9px ui-monospace, monospace";
+  histCtx.textAlign = "left";
+  histCtx.fillText(mn.toPrecision(3), 0, H_H - 3);
+  histCtx.textAlign = "right";
+  histCtx.fillText(mx.toPrecision(3), H_W, H_H - 3);
+  histCtx.textAlign = "center";
+  histCtx.fillText(`distribution (${finite} values, log count)`, H_W / 2, H_H - 3);
+  histView = { bins, mn, span };
+}
+
+ui.hist.addEventListener("mousemove", e => {
+  if (!histView) return;
+  const rect = ui.hist.getBoundingClientRect();
+  const b = Math.floor((e.clientX - rect.left) / (H_W / H_BINS));
+  if (b < 0 || b >= H_BINS) { ui.tooltip.textContent = ""; return; }
+  const lo = histView.mn + b / H_BINS * histView.span;
+  const hi = histView.mn + (b + 1) / H_BINS * histView.span;
+  ui.tooltip.textContent =
+    `bin [${lo.toPrecision(4)}, ${hi.toPrecision(4)})  ·  ${histView.bins[b]} values`;
+});
+ui.hist.addEventListener("mouseleave", () => { ui.tooltip.textContent = ""; });
 
 ui.list.addEventListener("change", () => render(ui.list.value));
 ui.widthSel.addEventListener("change", () => ui.list.value && render(ui.list.value));

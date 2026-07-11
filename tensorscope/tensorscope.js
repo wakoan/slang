@@ -11,6 +11,7 @@ const ui = {
   tooltip: $("tooltip"), stats: $("stats"),
   widthSel: $("widthsel"), scaleSel: $("scalesel"), zoomSel: $("zoomsel"),
   viewSel: $("viewsel"), tokens: $("tokchips"),
+  headSel: $("headsel"), headCtl: $("headctl"),
   prevTok: $("prevtok"), nextTok: $("nexttok"),
   legend: $("legend"), hist: $("hist"),
   layerSel: $("layersel"), diagram: $("diagram"),
@@ -199,6 +200,11 @@ async function init() {
   }
   buildDiagram();
   ui.layerSel.addEventListener("change", updateDiagram);
+  for (let hI = 0; hI < cfg.num_heads; hI++) {
+    const o = document.createElement("option");
+    o.value = o.textContent = hI;
+    ui.headSel.appendChild(o);
+  }
   status(`ready — ${CAPS.length} capturable tensors, ${(off / 1e6).toFixed(1)} MB per step`);
   ui.tokenizeBtn.disabled = false;
 }
@@ -569,14 +575,36 @@ function render(key) {
   const latest = viewStepIdx === history.length - 1;
   const entry = history[viewStepIdx];
   const wantSeq = ui.viewSel.value === "seq";
-  const seqOk = key !== "logits" && c.kind !== "attn";
+  const seqOk = key !== "logits";
   const seq = wantSeq && seqOk;
   let seqNote = wantSeq && !seqOk
-    ? "  ·  sequence view unavailable for this tensor (single token shown)" : "";
+    ? "  ·  sequence view unavailable for logits (single token shown)" : "";
+  ui.headCtl.style.display = c.kind === "attn" ? "" : "none";
+  const headPick = ui.headSel.value;
 
   // resolve data + shape
-  let data, rows, cols, rowLab, colLab, rowMeta = null;
-  if (seq) {
+  let data, rows, cols, rowLab, colLab, rowMeta = null, colMeta = null;
+  if (seq && c.kind === "attn") {
+    // per-head attention matrix: query position × kv position (triangular)
+    const nh = G.cfg.num_heads;
+    const hSel = headPick === "all" ? 0 : +headPick;
+    if (headPick === "all")
+      seqNote = "  ·  showing head 0 (pick a head for others)";
+    cols = Math.max(...history.map(en => en.kvLen));
+    rows = history.length;
+    data = new Float32Array(rows * cols);          // upper triangle stays 0
+    history.forEach((en, i) => {
+      const raw = en.cap.subarray(c.offset / 4, c.offset / 4 + c.floats);
+      let sum = 0;
+      for (let t = 0; t < en.kvLen; t++) sum += raw[hSel * MAX_SEQ + t];
+      for (let t = 0; t < en.kvLen; t++)
+        data[i * cols + t] = raw[hSel * MAX_SEQ + t] / (sum || 1);
+    });
+    rowLab = "query"; colLab = "kv";
+    rowMeta = history.map(en => en.piece);
+    colMeta = Array.from({ length: cols }, (_, i) => history[i]?.piece ?? "?");
+    ui.widthSel.disabled = true;
+  } else if (seq) {
     // [positions × features]: this tensor stacked across every processed token
     cols = c.floats; rows = history.length;
     data = new Float32Array(rows * cols);
@@ -600,13 +628,17 @@ function render(key) {
   } else if (c.kind === "attn") {
     const raw = entry.cap.subarray(c.offset / 4, c.offset / 4 + c.floats);
     const nh = G.cfg.num_heads, kv = entry.kvLen;
-    const out = new Float32Array(nh * kv);
-    for (let hI = 0; hI < nh; hI++) {
+    const heads = headPick === "all"
+      ? Array.from({ length: nh }, (_, i) => i) : [+headPick];
+    const out = new Float32Array(heads.length * kv);
+    heads.forEach((hI, r) => {
       let sum = 0;
       for (let t = 0; t < kv; t++) sum += raw[hI * MAX_SEQ + t];
-      for (let t = 0; t < kv; t++) out[hI * kv + t] = raw[hI * MAX_SEQ + t] / (sum || 1);
-    }
-    data = out; rows = nh; cols = kv; rowLab = "head"; colLab = "kv";
+      for (let t = 0; t < kv; t++) out[r * kv + t] = raw[hI * MAX_SEQ + t] / (sum || 1);
+    });
+    data = out; rows = heads.length; cols = kv;
+    rowLab = headPick === "all" ? "head" : `head ${headPick}`; colLab = "kv";
+    colMeta = Array.from({ length: kv }, (_, i) => history[i]?.piece ?? "?");
     ui.widthSel.disabled = true;
   } else {
     data = entry.cap.subarray(c.offset / 4, c.offset / 4 + c.floats);
@@ -746,7 +778,8 @@ function render(key) {
   if (sym) { legendCtx.textAlign = "center"; legendCtx.fillText("0", 140, 24); }
 
   drawHistogram(data, mn, mx);
-  view = { rows, cols, dRows, dCols, rowMap, colMap, data, cell, rowLab, colLab, rowMeta };
+  view = { rows, cols, dRows, dCols, rowMap, colMap, data, cell, rowLab, colLab,
+           rowMeta, colMeta };
 }
 
 // value distribution: 64 bins, log-scaled counts (peaked distributions
@@ -820,6 +853,7 @@ ui.widthSel.addEventListener("change", () => ui.list.value && render(ui.list.val
 ui.scaleSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
 ui.zoomSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
 ui.viewSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
+ui.headSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
 
 ui.canvas.addEventListener("mousemove", e => {
   if (!view) return;
@@ -835,7 +869,8 @@ ui.canvas.addEventListener("mousemove", e => {
   const i = r * view.cols + cc;
   if (i >= view.data.length) { ui.tooltip.textContent = ""; return; }
   const rl = view.rowLab || "row";
-  const tokStr = view.rowMeta ? `  ·  token ${JSON.stringify(view.rowMeta[r] ?? "?")}` : "";
+  let tokStr = view.rowMeta ? `  ·  ${JSON.stringify(view.rowMeta[r] ?? "?")}` : "";
+  if (view.colMeta) tokStr += ` → ${JSON.stringify(view.colMeta[cc] ?? "?")}`;
   ui.tooltip.textContent =
     `${rl} ${r}, ${view.colLab} ${cc}${tokStr}  ·  flat index ${i}  ·  value ${view.data[i]}`;
 });

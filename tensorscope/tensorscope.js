@@ -9,9 +9,11 @@ const ui = {
   stepInfo: $("stepinfo"), preds: $("preds"),
   list: $("tensorlist"), canvas: $("canvas"),
   tooltip: $("tooltip"), stats: $("stats"),
-  widthSel: $("widthsel"), scaleSel: $("scalesel"),
+  widthSel: $("widthsel"), scaleSel: $("scalesel"), zoomSel: $("zoomsel"),
+  legend: $("legend"),
 };
 const ctx2d = ui.canvas.getContext("2d");
+const legendCtx = ui.legend.getContext("2d");
 
 const MAX_SEQ = 1024;
 let G = null;            // gpu state
@@ -341,18 +343,18 @@ ui.stepBtn.addEventListener("click", async () => {
 // treescope-style: labeled semantic axes, tick indices, color legend,
 // edge-truncation for huge axes, value digits when cells are large.
 
-const M_L = 46, M_T = 20, LEGEND_H = 34;   // margins + legend strip
-const EDGE = 512;                          // edge items kept when truncating
+const M_L = 46, M_T = 20;
 
 let view = null; // hover state
 
 function truncMap(size, limit) {
-  // returns display->original index map, or null when no truncation needed
+  // display->original index map with an ellipsis band, or null if it fits
   if (size <= limit) return null;
-  const map = new Array(2 * EDGE + 1);
-  for (let i = 0; i < EDGE; i++) map[i] = i;
-  map[EDGE] = -1;                                    // ellipsis band
-  for (let i = 0; i < EDGE; i++) map[EDGE + 1 + i] = size - EDGE + i;
+  const edge = Math.floor((limit - 1) / 2);
+  const map = new Array(2 * edge + 1);
+  for (let i = 0; i < edge; i++) map[i] = i;
+  map[edge] = -1;
+  for (let i = 0; i < edge; i++) map[edge + 1 + i] = size - edge + i;
   return map;
 }
 
@@ -384,7 +386,7 @@ function render(key) {
     ui.widthSel.disabled = false;
   }
 
-  // stats (NaN/Inf aware)
+  // stats
   let mn = Infinity, mx = -Infinity, sum = 0, sq = 0, bad = 0, n = 0;
   for (const v of data) {
     if (!Number.isFinite(v)) { bad++; continue; }
@@ -394,19 +396,32 @@ function render(key) {
   }
   const mean = sum / (n || 1);
   const std = Math.sqrt(Math.max(0, sq / (n || 1) - mean * mean));
-  const shapeStr = c.dims === null || c.kind === "attn" || c.dims.length === 2
+  const shapeStr = c.kind === "attn" || c.dims?.length === 2
     ? `${rowLab}:${rows} × ${colLab}:${cols}`
     : `${colLab}:${data.length} (shown ${rows}×${cols})`;
+
+  // unified zoom model: one rule for every tensor
+  //   fit    → cells sized to the viewport, never any digits
+  //   N px   → fixed cell size, scroll to explore
+  //   values → 24 px cells + digits, axes truncated to first/last 31
+  const zoom = ui.zoomSel.value;
+  const digits = zoom === "values";
+  let cell, axisLimit;
+  if (zoom === "fit") { cell = 0; axisLimit = 1040; }          // cell set below
+  else if (digits) { cell = 24; axisLimit = 63; }
+  else { cell = +zoom; axisLimit = Math.min(1040, Math.floor(8192 / +zoom)); }
+
+  const colMap = truncMap(cols, axisLimit);
+  const rowMap = truncMap(rows, axisLimit);
+  const dCols = colMap ? colMap.length : cols;
+  const dRows = rowMap ? rowMap.length : rows;
+  if (!cell) cell = Math.max(1, Math.min(Math.floor(720 / dCols), Math.floor(560 / dRows), 20));
+
   ui.stats.textContent =
     `${key}  f32  ${shapeStr}  min ${mn.toFixed(4)}  max ${mx.toFixed(4)}  ` +
     `mean ${mean.toFixed(4)}  std ${std.toFixed(4)}` +
-    (bad ? `  ⚠ ${bad} non-finite` : "");
-
-  // truncation of long axes (treescope edge-items style)
-  const colMap = truncMap(cols, 1040);
-  const rowMap = truncMap(rows, 640);
-  const dCols = colMap ? colMap.length : cols;
-  const dRows = rowMap ? rowMap.length : rows;
+    (bad ? `  ⚠ ${bad} non-finite` : "") +
+    (digits ? "" : "  ·  hover for values, zoom 'values' for numbers");
 
   const sym = ui.scaleSel.value === "symmetric";
   const lim = sym ? Math.max(Math.abs(mn), Math.abs(mx)) || 1 : null;
@@ -429,7 +444,7 @@ function render(key) {
       const r = rowMap ? rowMap[dr] : dr;
       const cc = colMap ? colMap[dc] : dc;
       let rgb;
-      if (r === -1 || cc === -1) rgb = [34, 34, 34];          // ellipsis band
+      if (r === -1 || cc === -1) rgb = [34, 34, 34];
       else {
         const i = r * cols + cc;
         rgb = i < data.length ? color(data[i]) : [17, 17, 17];
@@ -438,10 +453,9 @@ function render(key) {
     }
   }
 
-  const cell = Math.max(1, Math.min(Math.floor(720 / dCols), Math.floor(560 / dRows), 26));
   const gw = dCols * cell, gh = dRows * cell;
   ui.canvas.width = M_L + gw;
-  ui.canvas.height = M_T + gh + LEGEND_H;
+  ui.canvas.height = M_T + gh + 4;
 
   createImageBitmap(img).then(bmp => {
     ctx2d.imageSmoothingEnabled = false;
@@ -449,14 +463,12 @@ function render(key) {
     ctx2d.fillRect(0, 0, ui.canvas.width, ui.canvas.height);
     ctx2d.drawImage(bmp, M_L, M_T, gw, gh);
 
-    // axis labels + tick indices
     ctx2d.fillStyle = "#888";
     ctx2d.font = "10px ui-monospace, monospace";
     ctx2d.textAlign = "left";
     ctx2d.fillText(`${colLab} →`, M_L, 10);
-    const colTick = dc => (colMap ? colMap[Math.min(dc, dCols - 1)] : dc);
     for (const dc of [0, dCols >> 1, dCols - 1]) {
-      const orig = colTick(dc);
+      const orig = colMap ? colMap[Math.min(dc, dCols - 1)] : dc;
       if (orig >= 0) ctx2d.fillText(String(orig), M_L + dc * cell, M_T - 2);
     }
     ctx2d.save();
@@ -470,8 +482,7 @@ function render(key) {
       if (orig >= 0) ctx2d.fillText(String(orig), M_L - 4, M_T + dr * cell + Math.max(9, cell / 2));
     }
 
-    // in-cell digits when cells are big enough (treescope-like)
-    if (cell >= 22 && dRows * dCols <= 2400) {
+    if (digits) {
       ctx2d.font = "9px ui-monospace, monospace";
       ctx2d.textAlign = "center";
       for (let dr = 0; dr < dRows; dr++) {
@@ -482,29 +493,30 @@ function render(key) {
           const i = r * cols + cc;
           if (i >= data.length) continue;
           const v = data[i];
-          ctx2d.fillStyle = Math.abs(sym ? v / lim : 0.5) > 0.55 ? "#fff" : "#333";
+          const strong = Number.isFinite(v) && sym && Math.abs(v / lim) > 0.55;
+          ctx2d.fillStyle = strong || !Number.isFinite(v) ? "#fff" : "#333";
           ctx2d.fillText(Number.isFinite(v) ? v.toFixed(2) : "NaN",
                          M_L + dc * cell + cell / 2, M_T + dr * cell + cell / 2 + 3);
         }
       }
     }
-
-    // legend strip
-    const ly = M_T + gh + 12, lw = Math.min(240, gw);
-    for (let x = 0; x < lw; x++) {
-      const t = x / (lw - 1);
-      const v = sym ? (2 * t - 1) * lim : mn + t * (mx - mn);
-      ctx2d.fillStyle = `rgb(${color(v).join(",")})`;
-      ctx2d.fillRect(M_L + x, ly, 1, 10);
-    }
-    ctx2d.fillStyle = "#888";
-    ctx2d.font = "10px ui-monospace, monospace";
-    ctx2d.textAlign = "left";
-    ctx2d.fillText((sym ? -lim : mn).toPrecision(3), M_L, ly + 20);
-    ctx2d.textAlign = "right";
-    ctx2d.fillText((sym ? lim : mx).toPrecision(3), M_L + lw, ly + 20);
-    if (sym) { ctx2d.textAlign = "center"; ctx2d.fillText("0", M_L + lw / 2, ly + 20); }
   });
+
+  // legend on its own always-visible canvas
+  legendCtx.clearRect(0, 0, 280, 26);
+  for (let x = 0; x < 240; x++) {
+    const t = x / 239;
+    const v = sym ? (2 * t - 1) * lim : mn + t * (mx - mn);
+    legendCtx.fillStyle = `rgb(${color(v).join(",")})`;
+    legendCtx.fillRect(x + 20, 2, 1, 10);
+  }
+  legendCtx.fillStyle = "#888";
+  legendCtx.font = "10px ui-monospace, monospace";
+  legendCtx.textAlign = "left";
+  legendCtx.fillText((sym ? -lim : mn).toPrecision(3), 0, 24);
+  legendCtx.textAlign = "right";
+  legendCtx.fillText((sym ? lim : mx).toPrecision(3), 260, 24);
+  if (sym) { legendCtx.textAlign = "center"; legendCtx.fillText("0", 140, 24); }
 
   view = { rows, cols, dRows, dCols, rowMap, colMap, data, cell, rowLab, colLab };
 }
@@ -512,13 +524,13 @@ function render(key) {
 ui.list.addEventListener("change", () => render(ui.list.value));
 ui.widthSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
 ui.scaleSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
+ui.zoomSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
 
 ui.canvas.addEventListener("mousemove", e => {
   if (!view) return;
   const rect = ui.canvas.getBoundingClientRect();
-  const scaleX = ui.canvas.width / rect.width;   // CSS may shrink the canvas
-  const dc = Math.floor(((e.clientX - rect.left) * scaleX - M_L) / view.cell);
-  const dr = Math.floor(((e.clientY - rect.top) * scaleX - M_T) / view.cell);
+  const dc = Math.floor((e.clientX - rect.left - M_L) / view.cell);
+  const dr = Math.floor((e.clientY - rect.top - M_T) / view.cell);
   if (dr < 0 || dc < 0 || dr >= view.dRows || dc >= view.dCols) {
     ui.tooltip.textContent = ""; return;
   }

@@ -13,6 +13,7 @@ const ui = {
   viewSel: $("viewsel"), tokens: $("tokchips"),
   prevTok: $("prevtok"), nextTok: $("nexttok"),
   legend: $("legend"), hist: $("hist"),
+  layerSel: $("layersel"), diagram: $("diagram"),
 };
 const ctx2d = ui.canvas.getContext("2d");
 const legendCtx = ui.legend.getContext("2d");
@@ -190,8 +191,146 @@ async function init() {
         arenaBytes: off };
 
   buildTensorList();
+  ui.layerSel.innerHTML = "";
+  for (let L = 0; L < cfg.num_layers; L++) {
+    const o = document.createElement("option");
+    o.value = o.textContent = L;
+    ui.layerSel.appendChild(o);
+  }
+  buildDiagram();
+  ui.layerSel.addEventListener("change", updateDiagram);
   status(`ready — ${CAPS.length} capturable tensors, ${(off / 1e6).toFixed(1)} MB per step`);
   ui.tokenizeBtn.disabled = false;
+}
+
+// ---------------------------------------------------- layer diagram (SVG)
+
+const SVGNS = "http://www.w3.org/2000/svg";
+// [suffix, label, x, y, width?] — one transformer layer, top to bottom
+const DIAG_NODES = [
+  ["norm_in", "input norm", 55, 22],
+  ["qkv", "qkv proj", 55, 58],
+  ["q", "q", 55, 94, 62], ["k", "k", 123, 94, 62],
+  ["attn_probs", "attention", 55, 130],
+  ["attn_out", "attn out", 55, 166],
+  ["o_proj", "o proj", 55, 202],
+  ["hidden_attn", "+ residual", 55, 238],
+  ["norm_ff", "ff norm", 55, 274],
+  ["gateup", "gate · up", 55, 310],
+  ["geglu", "geglu", 55, 346],
+  ["mlp_out", "down proj", 55, 382],
+  ["hidden", "+ residual", 55, 418],
+];
+const DIAG_GLOBALS = [["embed", 8], ["final_norm", 86], ["logits", 164]];
+const NODE_W = 130, NODE_H = 22;
+let diagRects = {};   // key suffix -> {rect, text}
+
+function svgEl(tag, attrs) {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  return el;
+}
+
+function buildDiagram() {
+  const svg = ui.diagram;
+  svg.innerHTML = "";
+  const edge = (x1, y1, x2, y2, dash) => svg.appendChild(svgEl("path", {
+    d: `M ${x1} ${y1} L ${x2} ${y2}`, stroke: dash ? "#555" : "#444",
+    "stroke-dasharray": dash ? "3,3" : "none", fill: "none" }));
+  // main chain
+  for (let i = 0; i < DIAG_NODES.length - 1; i++) {
+    const [, , x1, y1, w1] = DIAG_NODES[i];
+    const [, , x2, y2, w2] = DIAG_NODES[i + 1];
+    const cx1 = x1 + (w1 ?? NODE_W) / 2, cx2 = x2 + (w2 ?? NODE_W) / 2;
+    edge(cx1, y1 + NODE_H, cx2, y2);
+  }
+  // qkv fans out to q and k, both feed attention
+  edge(120, 80, 86, 94); edge(120, 80, 154, 94);
+  edge(86, 116, 120, 130); edge(154, 116, 120, 130);
+  // residual bypasses (dashed left rail)
+  svg.appendChild(svgEl("path", { d: `M 120 10 L 12 10 L 12 249 L 55 249`,
+    stroke: "#555", "stroke-dasharray": "3,3", fill: "none" }));
+  svg.appendChild(svgEl("path", { d: `M 55 249 L 12 249 L 12 429 L 55 429`,
+    stroke: "#555", "stroke-dasharray": "3,3", fill: "none" }));
+
+  const mkNode = (key, label, x, y, w) => {
+    const g = svgEl("g", { style: "cursor:pointer" });
+    const rect = svgEl("rect", { x, y, width: w, height: NODE_H, rx: 5,
+      fill: "#262626", stroke: "#3a3a3a" });
+    const text = svgEl("text", { x: x + w / 2, y: y + 15, "text-anchor": "middle",
+      fill: "#ccc", "font-size": "10", "font-family": "ui-monospace, monospace" });
+    text.textContent = label;
+    g.appendChild(rect); g.appendChild(text);
+    g.addEventListener("click", () => {
+      const full = key.startsWith("@") ? key.slice(1) : `L${ui.layerSel.value}.${key}`;
+      ui.list.value = full;
+      if (history.length) render(full);
+      updateDiagram();
+    });
+    svg.appendChild(g);
+    diagRects[key] = { rect, text };
+  };
+  for (const [suffix, label, x, y, w] of DIAG_NODES)
+    mkNode(suffix, label, x, y, w ?? NODE_W);
+  const gy = 468;
+  svg.appendChild(svgEl("text", { x: 8, y: gy - 8, fill: "#666", "font-size": "9",
+    "font-family": "ui-monospace, monospace" })).textContent = "global:";
+  for (const [key, x] of DIAG_GLOBALS) mkNode("@" + key, key, x, gy, 70);
+}
+
+function tensorStd(key) {
+  const entry = history[viewStepIdx];
+  if (!entry) return null;
+  const c = capIndex[key];
+  if (!c) return null;
+  let data;
+  if (key === "logits") {
+    if (viewStepIdx !== history.length - 1 || !lastCap) return null;
+    data = lastCap.subarray(c.offset / 4, c.offset / 4 + c.floats);
+  } else {
+    data = entry.cap.subarray(c.offset / 4, c.offset / 4 + c.floats);
+  }
+  let sm = 0, sq = 0, n = 0, bad = 0;
+  for (const v of data) {
+    if (!Number.isFinite(v)) { bad++; continue; }
+    sm += v; sq += v * v; n++;
+  }
+  if (!n) return null;
+  const m = sm / n;
+  return { std: Math.sqrt(Math.max(0, sq / n - m * m)), bad };
+}
+
+function updateDiagram() {
+  if (!G) return;
+  const L = ui.layerSel.value;
+  const entries = [];
+  for (const [suffix] of DIAG_NODES)
+    entries.push([suffix, `L${L}.${suffix}`, tensorStd(`L${L}.${suffix}`)]);
+  for (const [key] of DIAG_GLOBALS)
+    entries.push(["@" + key, key, tensorStd(key)]);
+
+  const lstds = entries.filter(e => e[2]?.std > 0).map(e => Math.log(e[2].std));
+  const lo = Math.min(...lstds), hi = Math.max(...lstds);
+  for (const [suffix, full, st] of entries) {
+    const node = diagRects[suffix];
+    if (!node) continue;
+    if (!st) {
+      node.rect.setAttribute("fill", "#262626");
+    } else if (st.bad) {
+      node.rect.setAttribute("fill", "#a020a0");            // non-finite alert
+    } else {
+      const t = hi > lo ? (Math.log(st.std || 1e-9) - lo) / (hi - lo) : 0;
+      const r = Math.round(38 + t * 186), gb = Math.round(38 + (1 - t) * 30);
+      node.rect.setAttribute("fill", `rgb(${r},${gb + Math.round((1 - t) * 20)},${gb})`);
+    }
+    node.rect.setAttribute("stroke",
+      ui.list.value === full ? "#4a9eff" : "#3a3a3a");
+    node.text.parentNode.querySelector("title")?.remove();
+    const title = svgEl("title", {});
+    title.textContent = st ? `${full}  σ=${st.std.toPrecision(4)}` +
+      (st.bad ? `  ⚠ ${st.bad} non-finite` : "") : full;
+    node.text.parentNode.appendChild(title);
+  }
 }
 
 function buildTensorList() {
@@ -351,6 +490,7 @@ async function doStep() {
                  cap: lastCap.slice(0, capIndex["logits"].offset / 4) });
   viewStepIdx = history.length - 1;
   renderTokens();
+  updateDiagram();
   pos++;
   if (pos >= promptIds.length) ui.runPromptBtn.disabled = true;
   if (ui.list.value) render(ui.list.value);
@@ -361,6 +501,7 @@ function gotoStep(i) {
   viewStepIdx = Math.max(0, Math.min(history.length - 1, i));
   ui.viewSel.value = "step";
   renderTokens();
+  updateDiagram();
   if (ui.list.value) render(ui.list.value);
 }
 
@@ -668,7 +809,13 @@ ui.hist.addEventListener("mousemove", e => {
 });
 ui.hist.addEventListener("mouseleave", () => { ui.tooltip.textContent = ""; });
 
-ui.list.addEventListener("change", () => render(ui.list.value));
+ui.list.addEventListener("change", () => {
+  render(ui.list.value);
+  // follow the selection into the diagram (switch layer if needed)
+  const m = ui.list.value.match(/^L(\d+)\./);
+  if (m) ui.layerSel.value = m[1];
+  updateDiagram();
+});
 ui.widthSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
 ui.scaleSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
 ui.zoomSel.addEventListener("change", () => ui.list.value && render(ui.list.value));

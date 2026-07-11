@@ -38,8 +38,13 @@
     cursor: pointer; }
   .nav:hover { border-color: #666; color: #ddd; }
   #main { display: flex; gap: 1rem; }
+  #side { width: 250px; flex-shrink: 0; }
+  #diagctl { font-size: .8rem; color: #999; margin-bottom: .3rem; }
+  #diaghint { color: #666; font-size: .72rem; }
+  #diagram { background: #161616; border: 1px solid #333; border-radius: 8px;
+    display: block; margin-bottom: .5rem; }
   #tensorlist {
-    width: 240px; height: 640px; background: #1a1a1a; color: #ddd;
+    width: 240px; height: 240px; background: #1a1a1a; color: #ddd;
     border: 1px solid #333; border-radius: 8px; font: 12px/1.5 ui-monospace, monospace;
   }
   #viz { flex: 1; min-width: 0; }
@@ -70,7 +75,12 @@
   <div id="preds"></div>
   <div id="tokens"><button id="prevtok" class="nav" title="previous step (←)">◀</button><button id="nexttok" class="nav" title="next step (→)">▶</button><span id="tokchips"></span></div>
   <div id="main">
-    <select id="tensorlist" size="2" multiple="false"></select>
+    <div id="side">
+      <div id="diagctl">layer <select id="layersel"></select>
+        <span id="diaghint">σ per tensor · click to inspect</span></div>
+      <svg id="diagram" width="240" height="508"></svg>
+      <select id="tensorlist" size="2" multiple="false"></select>
+    </div>
     <div id="viz">
       <div id="vizcontrols">
         width:

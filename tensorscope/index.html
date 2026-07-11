@@ -33,6 +33,10 @@
     font: 11px ui-monospace, monospace; cursor: pointer; white-space: pre; }
   .tok:hover { border-color: #666; }
   .tok.sel { border-color: #4a9eff; color: #4a9eff; }
+  .nav { background: #1a1a1a; color: #999; border: 1px solid #333; border-radius: 5px;
+    padding: .05rem .45rem; font: 11px ui-monospace, monospace; margin-right: 3px;
+    cursor: pointer; }
+  .nav:hover { border-color: #666; color: #ddd; }
   #main { display: flex; gap: 1rem; }
   #tensorlist {
     width: 240px; height: 640px; background: #1a1a1a; color: #ddd;
@@ -64,7 +68,7 @@
   </div>
   <div id="stepinfo"></div>
   <div id="preds"></div>
-  <div id="tokens"></div>
+  <div id="tokens"><button id="prevtok" class="nav" title="previous step (←)">◀</button><button id="nexttok" class="nav" title="next step (→)">▶</button><span id="tokchips"></span></div>
   <div id="main">
     <select id="tensorlist" size="2" multiple="false"></select>
     <div id="viz">

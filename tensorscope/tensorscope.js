@@ -10,7 +10,8 @@ const ui = {
   list: $("tensorlist"), canvas: $("canvas"),
   tooltip: $("tooltip"), stats: $("stats"),
   widthSel: $("widthsel"), scaleSel: $("scalesel"), zoomSel: $("zoomsel"),
-  viewSel: $("viewsel"), tokens: $("tokens"),
+  viewSel: $("viewsel"), tokens: $("tokchips"),
+  prevTok: $("prevtok"), nextTok: $("nexttok"),
   legend: $("legend"), hist: $("hist"),
 };
 const ctx2d = ui.canvas.getContext("2d");
@@ -355,6 +356,22 @@ async function doStep() {
   if (ui.list.value) render(ui.list.value);
 }
 
+function gotoStep(i) {
+  if (!history.length) return;
+  viewStepIdx = Math.max(0, Math.min(history.length - 1, i));
+  ui.viewSel.value = "step";
+  renderTokens();
+  if (ui.list.value) render(ui.list.value);
+}
+
+ui.prevTok.addEventListener("click", () => gotoStep(viewStepIdx - 1));
+ui.nextTok.addEventListener("click", () => gotoStep(viewStepIdx + 1));
+document.addEventListener("keydown", e => {
+  if (e.target === ui.prompt || !history.length) return;
+  if (e.key === "ArrowLeft") { gotoStep(viewStepIdx - 1); e.preventDefault(); }
+  if (e.key === "ArrowRight") { gotoStep(viewStepIdx + 1); e.preventDefault(); }
+});
+
 function renderTokens() {
   ui.tokens.innerHTML = "";
   history.forEach((en, i) => {
@@ -362,12 +379,7 @@ function renderTokens() {
     b.className = "tok" + (i === viewStepIdx ? " sel" : "");
     b.textContent = en.piece === "" ? "·" : en.piece;
     b.title = `pos ${en.pos} · id ${en.tid} — click to inspect this token`;
-    b.onclick = () => {
-      viewStepIdx = i;
-      ui.viewSel.value = "step";
-      renderTokens();
-      if (ui.list.value) render(ui.list.value);
-    };
+    b.onclick = () => gotoStep(i);
     ui.tokens.appendChild(b);
   });
 }

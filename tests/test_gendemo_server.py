@@ -1,4 +1,4 @@
-"""Tests for the browser-inference HTTP server and weight export."""
+"""Tests for the gendemo HTTP server and weight export."""
 
 import json
 import threading
@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def base_url():
-    from gemma3.server import make_server
+    from gemma3.gendemo_server import make_server
 
     httpd = make_server(port=0, model_dir=MODEL_DIR)
     port = httpd.server_address[1]
@@ -43,7 +43,7 @@ def post_json(url, payload):
 
 class TestExport:
     def test_manifest_matches_blob(self):
-        web = MODEL_DIR / "web"
+        web = MODEL_DIR / "gendemo"
         manifest = json.loads((web / "manifest.json").read_text())
         blob_size = (web / "weights.bin").stat().st_size
         assert manifest["totalBytes"] == blob_size
@@ -60,7 +60,7 @@ class TestExport:
         from gemma3.loader import load_model
 
         cfg, w = load_model(MODEL_DIR)
-        web = MODEL_DIR / "web"
+        web = MODEL_DIR / "gendemo"
         manifest = json.loads((web / "manifest.json").read_text())
         entry = next(t for t in manifest["tensors"] if t["name"] == "L0.qkv")
         with open(web / "weights.bin", "rb") as f:
@@ -73,7 +73,7 @@ class TestExport:
         np.testing.assert_array_equal(got, want.ravel())
 
     def test_config_in_manifest(self):
-        manifest = json.loads((MODEL_DIR / "web" / "manifest.json").read_text())
+        manifest = json.loads((MODEL_DIR / "gendemo" / "manifest.json").read_text())
         cfg = manifest["config"]
         assert cfg["num_layers"] == 18
         assert cfg["vocab_size"] == 262144
@@ -111,14 +111,14 @@ class TestEndpoints:
         manifest = json.loads(body)
         assert manifest["config"]["hidden_size"] == 640
         # served manifest carries a cache-busting version (size-mtime)
-        size = (MODEL_DIR / "web" / "weights.bin").stat().st_size
+        size = (MODEL_DIR / "gendemo" / "weights.bin").stat().st_size
         assert manifest["weightsVersion"].startswith(f"{size}-")
 
     def test_weights_head(self, base_url):
         req = urllib.request.Request(base_url + "/weights.bin", method="HEAD")
         with urllib.request.urlopen(req, timeout=10) as r:
             size = int(r.headers["Content-Length"])
-        assert size == (MODEL_DIR / "web" / "weights.bin").stat().st_size
+        assert size == (MODEL_DIR / "gendemo" / "weights.bin").stat().st_size
 
     def test_tokenize_roundtrip(self, base_url):
         out = post_json(base_url + "/tokenize", {"text": "Hello world", "chat": False})
@@ -144,9 +144,9 @@ class TestBrowserArtifactsEndToEnd:
 
     def test_generate_paris_from_web_artifacts(self):
         wgpu = pytest.importorskip("wgpu")
-        from gemma3.server import build_kernels_json
+        from gemma3.gendemo_server import build_kernels_json
 
-        web = MODEL_DIR / "web"
+        web = MODEL_DIR / "gendemo"
         manifest = json.loads((web / "manifest.json").read_text())
         cfg = manifest["config"]
         kernels = json.loads(build_kernels_json())

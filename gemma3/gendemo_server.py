@@ -4,7 +4,7 @@ Serves the WebGPU page, DSL-generated WGSL kernels, prepacked weights,
 and tokenizer endpoints. All inference happens in the browser.
 
 Usage:
-    python -m gemma3.server [--port 8000] [--model-dir ...]
+    python -m gemma3.gendemo_server [--port 8000] [--model-dir ...]
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-WEB_DIR = ROOT / "web"
+GENDEMO_DIR = ROOT / "gendemo"
 DEFAULT_MODEL_DIR = ROOT / "models" / "gemma-3-270m-it"
 
 # Kernels the browser uses: portable WGSL only (no f16 / subgroup features;
@@ -59,31 +59,31 @@ class GemmaWebHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
-            self._send_file(WEB_DIR / "index.html", "text/html")
+            self._send_file(GENDEMO_DIR / "index.html", "text/html")
         elif self.path == "/app.js":
-            self._send_file(WEB_DIR / "app.js", "text/javascript")
+            self._send_file(GENDEMO_DIR / "app.js", "text/javascript")
         elif self.path == "/kernels.json":
             self._send_bytes(self.kernels_json.encode(), "application/json")
         elif self.path == "/manifest.json":
             # inject a weights version so the browser cache invalidates
             # when weights.bin is re-exported
-            mpath = self.model_dir / "web" / "manifest.json"
+            mpath = self.model_dir / "gendemo" / "manifest.json"
             if not mpath.exists():
                 self.send_error(404)
                 return
             manifest = json.loads(mpath.read_text())
-            st = (self.model_dir / "web" / "weights.bin").stat()
+            st = (self.model_dir / "gendemo" / "weights.bin").stat()
             manifest["weightsVersion"] = f"{st.st_size}-{int(st.st_mtime)}"
             self._send_bytes(json.dumps(manifest).encode(), "application/json")
         elif self.path == "/weights.bin":
-            self._send_file(self.model_dir / "web" / "weights.bin",
+            self._send_file(self.model_dir / "gendemo" / "weights.bin",
                             "application/octet-stream")
         else:
             self.send_error(404)
 
     def do_HEAD(self):
         if self.path == "/weights.bin":
-            path = self.model_dir / "web" / "weights.bin"
+            path = self.model_dir / "gendemo" / "weights.bin"
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(path.stat().st_size))
@@ -142,11 +142,11 @@ def make_server(port: int = 8000,
                 model_dir: Path = DEFAULT_MODEL_DIR) -> ThreadingHTTPServer:
     from tokenizers import Tokenizer
 
-    web_weights = model_dir / "web" / "weights.bin"
-    if not web_weights.exists():
+    demo_weights = model_dir / "gendemo" / "weights.bin"
+    if not demo_weights.exists():
         print("weights.bin missing — exporting (one-time)...")
-        from .export_web import export_web
-        export_web(model_dir)
+        from .export_gendemo import export_gendemo
+        export_gendemo(model_dir)
 
     GemmaWebHandler.model_dir = Path(model_dir)
     GemmaWebHandler.tokenizer = Tokenizer.from_file(str(model_dir / "tokenizer.json"))

@@ -7,7 +7,7 @@ slices one ArrayBuffer into GPU buffers with zero format logic:
 - embedding table: f16-packed u32 (shared by embed lookup and logits)
 
 Usage:
-    python -m gemma3.export_web [model_dir]
+    python -m gemma3.export_gendemo [model_dir]
 """
 
 from __future__ import annotations
@@ -27,9 +27,9 @@ def _pack_f16_u32(arr: np.ndarray) -> np.ndarray:
     return np.frombuffer(arr.astype(np.float16).tobytes(), dtype=np.uint32)
 
 
-def export_web(model_dir: str | Path, out_dir: str | Path | None = None) -> Path:
+def export_gendemo(model_dir: str | Path, out_dir: str | Path | None = None) -> Path:
     model_dir = Path(model_dir)
-    out_dir = Path(out_dir) if out_dir else model_dir / "web"
+    out_dir = Path(out_dir) if out_dir else model_dir / "gendemo"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cfg, w = load_model(model_dir)
@@ -102,4 +102,4 @@ def export_web(model_dir: str | Path, out_dir: str | Path | None = None) -> Path
 if __name__ == "__main__":
     model_dir = sys.argv[1] if len(sys.argv) > 1 else \
         Path(__file__).resolve().parent.parent / "models" / "gemma-3-270m-it"
-    export_web(model_dir)
+    export_gendemo(model_dir)

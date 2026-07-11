@@ -10,6 +10,7 @@ const ui = {
   list: $("tensorlist"), canvas: $("canvas"),
   tooltip: $("tooltip"), stats: $("stats"),
   widthSel: $("widthsel"), scaleSel: $("scalesel"), zoomSel: $("zoomsel"),
+  viewSel: $("viewsel"), tokens: $("tokens"),
   legend: $("legend"), hist: $("hist"),
 };
 const ctx2d = ui.canvas.getContext("2d");
@@ -24,6 +25,9 @@ let capIndex = {};       // key -> cap
 let lastCap = null;      // Float32Array of the whole arena after a step
 let lastKvLen = 0;
 let promptIds = [], pos = 0, nextTok = null;
+// per-token capture history: {pos, tid, piece, kvLen, cap} — cap excludes
+// logits (1MB/step); logits are kept for the latest step only (lastCap)
+let history = [], viewStepIdx = -1;
 
 function status(m) { ui.status.textContent = m; }
 
@@ -305,6 +309,7 @@ function topK(logits, k) {
 ui.tokenizeBtn.addEventListener("click", async () => {
   const out = await post("/tokenize", { text: ui.prompt.value, chat: true });
   promptIds = out.ids; pos = 0; nextTok = null; lastCap = null;
+  history = []; viewStepIdx = -1; ui.tokens.innerHTML = "";
   ui.stepInfo.textContent = `prompt: ${promptIds.length} tokens — position 0 (KV cache reset)`;
   ui.preds.textContent = "";
   ui.stepBtn.disabled = false;
@@ -341,9 +346,30 @@ async function doStep() {
     ui.preds.className = "";
     ui.preds.textContent = "next: " + parts.join("  ·  ");
   }
+  history.push({ pos, tid, piece: tidPiece, kvLen: lastKvLen,
+                 cap: lastCap.slice(0, capIndex["logits"].offset / 4) });
+  viewStepIdx = history.length - 1;
+  renderTokens();
   pos++;
   if (pos >= promptIds.length) ui.runPromptBtn.disabled = true;
   if (ui.list.value) render(ui.list.value);
+}
+
+function renderTokens() {
+  ui.tokens.innerHTML = "";
+  history.forEach((en, i) => {
+    const b = document.createElement("span");
+    b.className = "tok" + (i === viewStepIdx ? " sel" : "");
+    b.textContent = en.piece === "" ? "·" : en.piece;
+    b.title = `pos ${en.pos} · id ${en.tid} — click to inspect this token`;
+    b.onclick = () => {
+      viewStepIdx = i;
+      ui.viewSel.value = "step";
+      renderTokens();
+      if (ui.list.value) render(ui.list.value);
+    };
+    ui.tokens.appendChild(b);
+  });
 }
 
 ui.stepBtn.addEventListener("click", async () => {
@@ -385,31 +411,61 @@ function truncMap(size, limit) {
 }
 
 function render(key) {
-  if (!lastCap) { ui.stats.textContent = "run a step first"; return; }
+  if (!history.length) { ui.stats.textContent = "run a step first"; return; }
   const c = capIndex[key];
-  let data = lastCap.subarray(c.offset / 4, c.offset / 4 + c.floats);
+  const latest = viewStepIdx === history.length - 1;
+  const entry = history[viewStepIdx];
+  const wantSeq = ui.viewSel.value === "seq";
+  const seqOk = key !== "logits" && c.kind !== "attn";
+  const seq = wantSeq && seqOk;
+  let seqNote = wantSeq && !seqOk
+    ? "  ·  sequence view unavailable for this tensor (single token shown)" : "";
 
-  // resolve semantic shape
-  let rows, cols, rowLab, colLab;
-  if (c.kind === "attn") {
-    const nh = G.cfg.num_heads;
-    const out = new Float32Array(nh * lastKvLen);
-    for (let hI = 0; hI < nh; hI++) {
-      let sum = 0;
-      for (let t = 0; t < lastKvLen; t++) sum += data[hI * MAX_SEQ + t];
-      for (let t = 0; t < lastKvLen; t++)
-        out[hI * lastKvLen + t] = data[hI * MAX_SEQ + t] / (sum || 1);
+  // resolve data + shape
+  let data, rows, cols, rowLab, colLab, rowMeta = null;
+  if (seq) {
+    // [positions × features]: this tensor stacked across every processed token
+    cols = c.floats; rows = history.length;
+    data = new Float32Array(rows * cols);
+    history.forEach((en, i) =>
+      data.set(en.cap.subarray(c.offset / 4, c.offset / 4 + c.floats), i * cols));
+    rowLab = "pos";
+    colLab = c.dims.length === 2 ? c.dims.map(d => d[0]).join("·") : c.dims[0][0];
+    rowMeta = history.map(en => en.piece);
+    ui.widthSel.disabled = true;
+  } else if (key === "logits") {
+    if (!latest) {
+      ui.stats.textContent =
+        "logits are kept for the latest token only — select the last chip";
+      return;
     }
-    data = out; rows = nh; cols = lastKvLen; rowLab = "head"; colLab = "kv";
-    ui.widthSel.disabled = true;
-  } else if (c.dims.length === 2) {
-    [[rowLab, rows], [colLab, cols]] = c.dims;
-    ui.widthSel.disabled = true;
-  } else {
+    data = lastCap.subarray(c.offset / 4, c.offset / 4 + c.floats);
     colLab = c.dims[0][0]; rowLab = "";
     cols = +ui.widthSel.value || c.defCols;
     rows = Math.ceil(data.length / cols);
     ui.widthSel.disabled = false;
+  } else if (c.kind === "attn") {
+    const raw = entry.cap.subarray(c.offset / 4, c.offset / 4 + c.floats);
+    const nh = G.cfg.num_heads, kv = entry.kvLen;
+    const out = new Float32Array(nh * kv);
+    for (let hI = 0; hI < nh; hI++) {
+      let sum = 0;
+      for (let t = 0; t < kv; t++) sum += raw[hI * MAX_SEQ + t];
+      for (let t = 0; t < kv; t++) out[hI * kv + t] = raw[hI * MAX_SEQ + t] / (sum || 1);
+    }
+    data = out; rows = nh; cols = kv; rowLab = "head"; colLab = "kv";
+    ui.widthSel.disabled = true;
+  } else {
+    data = entry.cap.subarray(c.offset / 4, c.offset / 4 + c.floats);
+    if (c.dims.length === 2) {
+      [[rowLab, rows], [colLab, cols]] = c.dims;
+      ui.widthSel.disabled = true;
+    } else {
+      colLab = c.dims[0][0]; rowLab = "";
+      cols = +ui.widthSel.value || c.defCols;
+      rows = Math.ceil(data.length / cols);
+      ui.widthSel.disabled = false;
+    }
   }
 
   // stats
@@ -422,18 +478,13 @@ function render(key) {
   }
   const mean = sum / (n || 1);
   const std = Math.sqrt(Math.max(0, sq / (n || 1) - mean * mean));
-  const shapeStr = c.kind === "attn" || c.dims?.length === 2
-    ? `${rowLab}:${rows} × ${colLab}:${cols}`
-    : `${colLab}:${data.length} (shown ${rows}×${cols})`;
+  const shapeStr = `${rowLab || "row"}:${rows} × ${colLab}:${cols}`;
+  const stepStr = seq ? `all ${rows} tokens` : `token ${viewStepIdx} ${JSON.stringify(entry.piece)}`;
 
-  // unified zoom model: one rule for every tensor
-  //   fit    → cells sized to the viewport, never any digits
-  //   N px   → fixed cell size, scroll to explore
-  //   values → 24 px cells + digits, axes truncated to first/last 31
   const zoom = ui.zoomSel.value;
   const digits = zoom === "values";
   let cell, axisLimit;
-  if (zoom === "fit") { cell = 0; axisLimit = 1040; }          // cell set below
+  if (zoom === "fit") { cell = 0; axisLimit = 1040; }
   else if (digits) { cell = 24; axisLimit = 63; }
   else { cell = +zoom; axisLimit = Math.min(1040, Math.floor(8192 / +zoom)); }
 
@@ -444,10 +495,10 @@ function render(key) {
   if (!cell) cell = Math.max(1, Math.min(Math.floor(720 / dCols), Math.floor(560 / dRows), 20));
 
   ui.stats.textContent =
-    `${key}  f32  ${shapeStr}  min ${mn.toFixed(4)}  max ${mx.toFixed(4)}  ` +
+    `${key} (${stepStr})  f32  ${shapeStr}  min ${mn.toFixed(4)}  max ${mx.toFixed(4)}  ` +
     `mean ${mean.toFixed(4)}  std ${std.toFixed(4)}` +
-    (bad ? `  ⚠ ${bad} non-finite` : "") +
-    (digits ? "" : "  ·  hover for values, zoom 'values' for numbers");
+    (bad ? `  ⚠ ${bad} non-finite` : "") + seqNote +
+    (digits ? "" : "  ·  hover for values");
 
   const sym = ui.scaleSel.value === "symmetric";
   const lim = sym ? Math.max(Math.abs(mn), Math.abs(mx)) || 1 : null;
@@ -488,7 +539,6 @@ function render(key) {
     ctx2d.fillStyle = "#111";
     ctx2d.fillRect(0, 0, ui.canvas.width, ui.canvas.height);
     ctx2d.drawImage(bmp, M_L, M_T, gw, gh);
-
     ctx2d.fillStyle = "#888";
     ctx2d.font = "10px ui-monospace, monospace";
     ctx2d.textAlign = "left";
@@ -507,7 +557,6 @@ function render(key) {
       const orig = rowMap ? rowMap[Math.min(dr, dRows - 1)] : dr;
       if (orig >= 0) ctx2d.fillText(String(orig), M_L - 4, M_T + dr * cell + Math.max(9, cell / 2));
     }
-
     if (digits) {
       ctx2d.font = "9px ui-monospace, monospace";
       ctx2d.textAlign = "center";
@@ -528,7 +577,6 @@ function render(key) {
     }
   });
 
-  // legend on its own always-visible canvas
   legendCtx.clearRect(0, 0, 280, 26);
   for (let x = 0; x < 240; x++) {
     const t = x / 239;
@@ -545,7 +593,7 @@ function render(key) {
   if (sym) { legendCtx.textAlign = "center"; legendCtx.fillText("0", 140, 24); }
 
   drawHistogram(data, mn, mx);
-  view = { rows, cols, dRows, dCols, rowMap, colMap, data, cell, rowLab, colLab };
+  view = { rows, cols, dRows, dCols, rowMap, colMap, data, cell, rowLab, colLab, rowMeta };
 }
 
 // value distribution: 64 bins, log-scaled counts (peaked distributions
@@ -612,6 +660,7 @@ ui.list.addEventListener("change", () => render(ui.list.value));
 ui.widthSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
 ui.scaleSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
 ui.zoomSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
+ui.viewSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
 
 ui.canvas.addEventListener("mousemove", e => {
   if (!view) return;
@@ -627,8 +676,9 @@ ui.canvas.addEventListener("mousemove", e => {
   const i = r * view.cols + cc;
   if (i >= view.data.length) { ui.tooltip.textContent = ""; return; }
   const rl = view.rowLab || "row";
+  const tokStr = view.rowMeta ? `  ·  token ${JSON.stringify(view.rowMeta[r] ?? "?")}` : "";
   ui.tooltip.textContent =
-    `${rl} ${r}, ${view.colLab} ${cc}  ·  flat index ${i}  ·  value ${view.data[i]}`;
+    `${rl} ${r}, ${view.colLab} ${cc}${tokStr}  ·  flat index ${i}  ·  value ${view.data[i]}`;
 });
 ui.canvas.addEventListener("mouseleave", () => { ui.tooltip.textContent = ""; });
 

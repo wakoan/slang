@@ -27,6 +27,12 @@
   #stepinfo { font-size: .85rem; color: #bbb; }
   #preds { font-size: .85rem; color: #6fbf73; margin: .2rem 0 .8rem; min-height: 1.2em; }
   #preds.partial { color: #997a3d; }
+  #tokens { margin: 0 0 .6rem; line-height: 1.9; }
+  .tok { display: inline-block; padding: .05rem .35rem; margin: 1px;
+    background: #1a1a1a; border: 1px solid #333; border-radius: 5px;
+    font: 11px ui-monospace, monospace; cursor: pointer; white-space: pre; }
+  .tok:hover { border-color: #666; }
+  .tok.sel { border-color: #4a9eff; color: #4a9eff; }
   #main { display: flex; gap: 1rem; }
   #tensorlist {
     width: 240px; height: 640px; background: #1a1a1a; color: #ddd;
@@ -58,6 +64,7 @@
   </div>
   <div id="stepinfo"></div>
   <div id="preds"></div>
+  <div id="tokens"></div>
   <div id="main">
     <select id="tensorlist" size="2" multiple="false"></select>
     <div id="viz">
@@ -72,6 +79,11 @@
         <select id="scalesel">
           <option value="symmetric">symmetric (blue·white·red)</option>
           <option value="minmax">min–max (grayscale)</option>
+        </select>
+        view:
+        <select id="viewsel">
+          <option value="step">selected token</option>
+          <option value="seq">all tokens × features</option>
         </select>
         zoom:
         <select id="zoomsel">

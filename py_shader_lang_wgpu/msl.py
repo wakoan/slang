@@ -91,6 +91,7 @@ class _MSLTranslator(_WGSLTranslator):
         self._emit("#include <metal_stdlib>")
         self._emit("using namespace metal;")
         self._emit()
+        self._emit_device_fns()
         ws = ", ".join(str(s) for s in self._workgroup_size)
         self._emit(f"// dispatch with threadsPerThreadgroup = ({ws})")
 
@@ -121,6 +122,18 @@ class _MSLTranslator(_WGSLTranslator):
         self._indent -= 1
         self._emit("}")
 
+    def _translate_device_fn(self, node):
+        params = self._device_params(node)
+        sig = ", ".join(f"{_msl_type(t.wgsl_name)} {self._ident(n)}"
+                        for n, t in params)
+        ret = _msl_type(self._return_type.wgsl_name) if self._return_type else "void"
+        self._emit(f"{ret} {self._ident(node.name)}({sig}) {{")
+        self._indent += 1
+        for stmt in node.body:
+            self._stmt(stmt)
+        self._indent -= 1
+        self._emit("}")
+
     # ------------------------------------------------------------------ #
     # Backend hooks                                                        #
     # ------------------------------------------------------------------ #
@@ -139,7 +152,7 @@ class _MSLTranslator(_WGSLTranslator):
         ty = _MSL_SCALARS[loop_ty]
         return f"for ({ty} {var} = {start}; {var} {cmp} {stop}; {incr}) {{"
 
-    def _render_call(self, fn: str, args: list[str]) -> str:
+    def _call_special(self, fn: str, args: list[str]) -> str | None:
         joined = ", ".join(args)
         if fn in ("barrier", "workgroupBarrier"):
             return "threadgroup_barrier(mem_flags::mem_threadgroup)"
@@ -147,8 +160,9 @@ class _MSLTranslator(_WGSLTranslator):
             return "simdgroup_barrier(mem_flags::mem_device)"
         if fn == "unpack2x16float":
             return f"float2(as_type<half2>({joined}))"
-        fn = _MSL_INTRINSICS.get(fn, fn)
-        return f"{fn}({joined})"
+        if fn in _MSL_INTRINSICS:
+            return f"{_MSL_INTRINSICS[fn]}({joined})"
+        return None
 
     def _ann_to_wgsl(self, node: ast.expr) -> str:
         # body annotations (x: f32, v: vec3[u32]) → MSL spellings

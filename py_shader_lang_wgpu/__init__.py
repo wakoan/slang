@@ -6,7 +6,7 @@ from .types import (
     StorageBuffer, Uniform, Builtin, WorkgroupArray,
     WGSLType, StorageBufferType, UniformType, BuiltinValue, WorkgroupArrayType,
 )
-from .translator import translate, kernel, TranslationError
+from .translator import translate, kernel, device_fn, TranslationError
 
 __all__ = [
     # Type primitives
@@ -17,5 +17,5 @@ __all__ = [
     "WGSLType", "StorageBufferType", "UniformType", "BuiltinValue",
     "WorkgroupArrayType",
     # Core API
-    "translate", "kernel", "TranslationError",
+    "translate", "kernel", "device_fn", "TranslationError",
 ]

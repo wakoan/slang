@@ -18,6 +18,87 @@ _INTRINSIC_RENAMES = {
     "subgroup_barrier": "subgroupBarrier",
 }
 
+# WGSL builtins (and DSL casts/intrinsics) that may be called from kernels.
+# Anything else must be a registered @device_fn — unknown names raise at
+# translation time instead of failing at GPU pipeline creation.
+_KNOWN_BUILTINS = frozenset("""
+abs acos acosh asin asinh atan atanh atan2 ceil clamp cos cosh
+countLeadingZeros countOneBits countTrailingZeros cross degrees determinant
+distance dot exp exp2 extractBits faceForward firstLeadingBit
+firstTrailingBit floor fma fract insertBits inverseSqrt ldexp length log
+log2 max min mix modf normalize pow radians reflect refract reverseBits
+round saturate sign sin sinh smoothstep sqrt step tan tanh transpose trunc
+select arrayLength
+pack2x16float unpack2x16float pack2x16snorm pack2x16unorm pack4x8snorm
+pack4x8unorm unpack2x16snorm unpack2x16unorm unpack4x8snorm unpack4x8unorm
+f32 u32 i32 f16 bool vec2 vec3 vec4
+""".split())
+
+
+class DeviceFunction:
+    """A helper function translatable into a shader-level function."""
+
+    def __init__(self, func: Callable) -> None:
+        self.func = func
+        self.name = func.__name__
+        try:
+            hints = typing.get_type_hints(func)
+        except Exception:
+            hints = dict(func.__annotations__)
+        self.annotations = hints
+        try:
+            source = textwrap.dedent(inspect.getsource(func))
+        except (OSError, TypeError) as exc:
+            raise TranslationError(
+                f"Cannot retrieve source for device_fn '{func.__qualname__}'"
+            ) from exc
+        node = ast.parse(source).body[0]
+        if not isinstance(node, ast.FunctionDef):
+            raise TranslationError("@device_fn must decorate a plain function")
+        node.decorator_list = []
+        self.node = node
+
+
+_DEVICE_FNS: dict[str, DeviceFunction] = {}
+
+
+def device_fn(func: Callable) -> Callable:
+    """Register a helper callable from kernels; its definition is emitted
+    into any shader that (transitively) calls it."""
+    _DEVICE_FNS[func.__name__] = DeviceFunction(func)
+    return func
+
+
+def _called_names(node: ast.AST) -> set[str]:
+    return {
+        n.func.id for n in ast.walk(node)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
+
+
+def _collect_device_fns(entry: ast.AST) -> list[DeviceFunction]:
+    """Transitive device-fn dependencies, callees before callers."""
+    ordered: list[DeviceFunction] = []
+    done: set[str] = set()
+    visiting: set[str] = set()
+
+    def visit(names: set[str]) -> None:
+        for nm in sorted(names):
+            if nm not in _DEVICE_FNS or nm in done:
+                continue
+            if nm in visiting:
+                raise TranslationError(
+                    f"Recursive device_fn '{nm}' — WGSL/MSL forbid recursion")
+            visiting.add(nm)
+            visit(_called_names(_DEVICE_FNS[nm].node))
+            visiting.discard(nm)
+            done.add(nm)
+            ordered.append(_DEVICE_FNS[nm])
+
+    visit(_called_names(entry))
+    return ordered
+
+
 # Calls that require `enable subgroups;`
 _SUBGROUP_FNS = {
     "subgroupAdd", "subgroupMax", "subgroupMin", "subgroupMul",
@@ -96,6 +177,8 @@ class _WGSLTranslator:
         self._scopes: list[set[str]] = [set()]
         self._ever_declared: set[str] = set()
         self._mutable: set[str] = set()
+        self._device_fns: list[DeviceFunction] = []
+        self._return_type: WGSLType | None = None
 
     def _emit(self, line: str = "") -> None:
         self._lines.append(("  " * self._indent + line) if line else "")
@@ -140,6 +223,7 @@ class _WGSLTranslator:
                 self._mutable.add(node.target.id)
         self._mutable |= {n for n, c in assign_counts.items() if c >= 2}
 
+        self._device_fns = _collect_device_fns(func_def)
         self._translate_fn(func_def)
         return "\n".join(self._lines)
 
@@ -181,19 +265,23 @@ class _WGSLTranslator:
         bindings, uniforms, builtins, wg_arrays = self._classify_params(node)
 
         # f16 anywhere in the interface requires the enable directive
+        dev_types = [t for d in self._device_fns
+                     for t in d.annotations.values() if isinstance(t, WGSLType)]
         if any("f16" in t.wgsl_name for _, _, _, t in bindings) or \
            any("f16" in t.wgsl_name for _, _, _, t in uniforms) or \
-           any("f16" in t.wgsl_name for _, t in wg_arrays):
+           any("f16" in t.wgsl_name for _, t in wg_arrays) or \
+           any("f16" in t.wgsl_name for t in dev_types):
             self._emit("enable f16;")
             self._emit()
 
         # subgroup builtins / intrinsic calls require `enable subgroups;`
+        scan_nodes = [node] + [d.node for d in self._device_fns]
         uses_subgroups = any(
             bv.builtin_name.startswith("subgroup") for _, bv in builtins
         ) or any(
             isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
             and _INTRINSIC_RENAMES.get(n.func.id, n.func.id) in _SUBGROUP_FNS
-            for n in ast.walk(node)
+            for sn in scan_nodes for n in ast.walk(sn)
         )
         if uses_subgroups:
             self._emit("enable subgroups;")
@@ -215,6 +303,8 @@ class _WGSLTranslator:
             self._emit(f"var<workgroup> {name}: {typ.wgsl_name};")
         if bindings or uniforms or wg_arrays:
             self._emit()
+
+        self._emit_device_fns()
 
         # @compute entry point
         ws = ", ".join(str(s) for s in self._workgroup_size)
@@ -443,7 +533,12 @@ class _WGSLTranslator:
         if isinstance(node, ast.BoolOp):
             return self._boolop(node, prec)
         if isinstance(node, ast.Call):
-            fn = self._expr(node.func, _P_ATOM)
+            # raw name (no identifier mangling): renaming/mangling of call
+            # targets is _render_call's job, keyed on the Python-level name
+            if isinstance(node.func, ast.Name):
+                fn = node.func.id
+            else:
+                fn = self._expr(node.func, _P_ATOM)
             args = [self._expr(a) for a in node.args]
             return self._render_call(fn, args)
         if isinstance(node, ast.IfExp):
@@ -507,6 +602,70 @@ class _WGSLTranslator:
         s = f" {sym} ".join(rendered)
         return f"({s})" if myprec < prec else s
 
+    # ------------------------------------------------------------------ #
+    # Device functions                                                     #
+    # ------------------------------------------------------------------ #
+
+    def _emit_device_fns(self) -> None:
+        for dev in self._device_fns:
+            sub = type(self)(
+                dev.func,
+                {k: v for k, v in dev.annotations.items() if k != "return"},
+                self._workgroup_size,
+            )
+            sub._return_type = dev.annotations.get("return")
+            for line in sub.render_device_fn():
+                self._lines.append(line)
+            self._emit()
+
+    def render_device_fn(self) -> list[str]:
+        node = self._func_node()
+        self._translate_device_fn(node)
+        return self._lines
+
+    def _func_node(self) -> ast.FunctionDef:
+        source = textwrap.dedent(inspect.getsource(self._func))
+        node = ast.parse(source).body[0]
+        node.decorator_list = []
+        # mutability pre-pass (same rules as kernels)
+        counts: dict[str, int] = {}
+        for n in ast.walk(node):
+            if isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, ast.Name):
+                        counts[t.id] = counts.get(t.id, 0) + 1
+            elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name):
+                self._mutable.add(n.target.id)
+            elif isinstance(n, ast.For) and isinstance(n.target, ast.Name):
+                self._mutable.add(n.target.id)
+        self._mutable |= {nm for nm, c in counts.items() if c >= 2}
+        return node
+
+    def _device_params(self, node: ast.FunctionDef) -> list[tuple[str, WGSLType]]:
+        params = []
+        for arg in node.args.args:
+            ann = self._annotations.get(arg.arg)
+            if ann is None or not isinstance(ann, WGSLType) or isinstance(
+                    ann, (StorageBufferType, UniformType, BuiltinValue,
+                          WorkgroupArrayType)):
+                raise TranslationError(
+                    f"device_fn parameter '{arg.arg}' must be a scalar or "
+                    "vector value type (f32, u32, vec3[f32], ...)")
+            self._scopes[0].add(arg.arg)
+            params.append((arg.arg, ann))
+        return params
+
+    def _translate_device_fn(self, node: ast.FunctionDef) -> None:
+        params = self._device_params(node)
+        sig = ", ".join(f"{self._ident(n)}: {t.wgsl_name}" for n, t in params)
+        ret = f" -> {self._return_type.wgsl_name}" if self._return_type else ""
+        self._emit(f"fn {self._ident(node.name)}({sig}){ret} {{")
+        self._indent += 1
+        for stmt in node.body:
+            self._stmt(stmt)
+        self._indent -= 1
+        self._emit("}")
+
     # ---- backend hooks (WGSL defaults; overridden by other emitters) ---- #
 
     def _decl_infer(self, name: str, value: str, mutable: bool) -> str:
@@ -522,9 +681,24 @@ class _WGSLTranslator:
                     stop: str, incr: str) -> str:
         return f"for (var {var}: {loop_ty} = {start}; {var} {cmp} {stop}; {incr}) {{"
 
+    def _call_special(self, fn: str, args: list[str]) -> str | None:
+        return None
+
     def _render_call(self, fn: str, args: list[str]) -> str:
+        special = self._call_special(fn, args)
+        if special is not None:
+            return special
+        joined = ", ".join(args)
+        if fn in _DEVICE_FNS:
+            return f"{self._ident(fn)}({joined})"
+        if fn not in _KNOWN_BUILTINS and \
+                _INTRINSIC_RENAMES.get(fn, fn) not in _SUBGROUP_FNS and \
+                fn not in _INTRINSIC_RENAMES:
+            raise TranslationError(
+                f"Unknown function '{fn}': not a WGSL builtin, intrinsic, or "
+                "registered @device_fn helper")
         fn = _INTRINSIC_RENAMES.get(fn, fn)
-        return f"{fn}({', '.join(args)})"
+        return f"{fn}({joined})"
 
     def _literal(self, value: object) -> str:
         if isinstance(value, bool):
@@ -631,4 +805,4 @@ def kernel(
     return _wrap
 
 
-__all__ = ["translate", "kernel", "TranslationError"]
+__all__ = ["translate", "kernel", "device_fn", "TranslationError"]

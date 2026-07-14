@@ -189,7 +189,7 @@ async function init() {
 
   G = { device, cfg, pipelines, W, B, D, layers, kCache, vCache,
         ropeLocal, ropeGlobal, bgEmbed, bgFinalNorm, bgLogits, arena, staging,
-        arenaBytes: off };
+        arenaBytes: off, manifestVersion: manifest.weightsVersion ?? "0" };
 
   buildTensorList();
   ui.layerSel.innerHTML = "";
@@ -207,6 +207,7 @@ async function init() {
   }
   status(`ready — ${CAPS.length} capturable tensors, ${(off / 1e6).toFixed(1)} MB per step`);
   ui.tokenizeBtn.disabled = false;
+  await restoreState();
 }
 
 // ---------------------------------------------------- layer diagram (SVG)
@@ -339,6 +340,59 @@ function updateDiagram() {
   }
 }
 
+// ------------------------------------------------- session persistence
+// Decode is deterministic, so restoring = replaying the recorded token
+// ids; that rebuilds the GPU KV cache and full capture history exactly.
+// Only the token sequence and UI prefs are stored (~1KB, localStorage).
+
+const STATE_KEY = "tensorscope-state-v1";
+
+function saveState() {
+  try {
+    localStorage.setItem(STATE_KEY, JSON.stringify({
+      v: G?.manifestVersion,
+      promptText: ui.prompt.value,
+      promptIds,
+      tids: history.map(en => en.tid),
+      nextTok,
+      sel: {
+        list: ui.list.value, layer: ui.layerSel.value, view: ui.viewSel.value,
+        head: ui.headSel.value, zoom: ui.zoomSel.value,
+        scale: ui.scaleSel.value, width: ui.widthSel.value,
+      },
+    }));
+  } catch { /* storage blocked — persistence is best-effort */ }
+}
+
+async function restoreState() {
+  let st = null;
+  try { st = JSON.parse(localStorage.getItem(STATE_KEY)); } catch { return; }
+  if (!st || st.v !== G.manifestVersion || !st.tids?.length) return;
+  ui.prompt.value = st.promptText ?? ui.prompt.value;
+  promptIds = st.promptIds ?? [];
+  pos = 0; nextTok = null;
+  history = []; viewStepIdx = -1; ui.tokens.innerHTML = "";
+  ui.tokenizeBtn.disabled = ui.stepBtn.disabled = ui.runPromptBtn.disabled = true;
+  for (let i = 0; i < st.tids.length; i++) {
+    status(`restoring session — replaying step ${i + 1}/${st.tids.length}…`);
+    await doStep(st.tids[i]);
+  }
+  nextTok = st.nextTok ?? nextTok;
+  for (const [k, el] of [["layer", ui.layerSel], ["view", ui.viewSel],
+                         ["head", ui.headSel], ["zoom", ui.zoomSel],
+                         ["scale", ui.scaleSel], ["width", ui.widthSel]]) {
+    if (st.sel?.[k] != null) el.value = st.sel[k];
+  }
+  if (st.sel?.list) {
+    ui.list.value = st.sel.list;
+    render(st.sel.list);
+  }
+  updateDiagram();
+  ui.tokenizeBtn.disabled = ui.stepBtn.disabled = false;
+  ui.runPromptBtn.disabled = pos >= promptIds.length;
+  status(`session restored — ${history.length} steps replayed`);
+}
+
 function buildTensorList() {
   ui.list.innerHTML = "";
   let curGroup = null, og = null;
@@ -456,6 +510,7 @@ ui.tokenizeBtn.addEventListener("click", async () => {
   const out = await post("/tokenize", { text: ui.prompt.value, chat: true });
   promptIds = out.ids; pos = 0; nextTok = null; lastCap = null;
   history = []; viewStepIdx = -1; ui.tokens.innerHTML = "";
+  try { localStorage.removeItem(STATE_KEY); } catch { /* ok */ }
   ui.stepInfo.textContent = `prompt: ${promptIds.length} tokens — position 0 (KV cache reset)`;
   ui.preds.textContent = "";
   ui.stepBtn.disabled = false;
@@ -464,9 +519,9 @@ ui.tokenizeBtn.addEventListener("click", async () => {
   ui.stats.textContent = "";
 });
 
-async function doStep() {
+async function doStep(forceTid) {
   const inPrompt = pos < promptIds.length;
-  const tid = inPrompt ? promptIds[pos] : nextTok;
+  const tid = forceTid ?? (inPrompt ? promptIds[pos] : nextTok);
   status(`stepping: pos ${pos}, token ${tid}…`);
   const t0 = performance.now();
   await debugStep(tid, pos);
@@ -500,6 +555,7 @@ async function doStep() {
   pos++;
   if (pos >= promptIds.length) ui.runPromptBtn.disabled = true;
   if (ui.list.value) render(ui.list.value);
+  saveState();
 }
 
 function gotoStep(i) {
@@ -854,6 +910,11 @@ ui.scaleSel.addEventListener("change", () => ui.list.value && render(ui.list.val
 ui.zoomSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
 ui.viewSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
 ui.headSel.addEventListener("change", () => ui.list.value && render(ui.list.value));
+
+for (const el of [ui.list, ui.layerSel, ui.viewSel, ui.headSel,
+                  ui.zoomSel, ui.scaleSel, ui.widthSel]) {
+  el.addEventListener("change", saveState);
+}
 
 ui.canvas.addEventListener("mousemove", e => {
   if (!view) return;

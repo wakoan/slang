@@ -10,9 +10,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 source venv/bin/activate
+python -m gemma3.download   # fetches model weights/tokenizer (~570MB, idempotent)
 ```
 
-Dependencies already installed in `venv`: `wgpu`, `numpy`, `rendercanvas`.
+Dependencies already installed in `venv`: `wgpu`, `numpy`, `tokenizers`, `metalgpu`, `pytest`. Weights come from the ungated `unsloth/gemma-3-270m-it` mirror (the official Google repo is license-gated).
 
 ## Testing
 

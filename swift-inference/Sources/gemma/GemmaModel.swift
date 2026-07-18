@@ -201,9 +201,13 @@ final class GemmaModel {
         var produced = 0
         let budget = min(maxNewTokens, maxSeq - startPos)
         let outTokens = b["out_tokens"]!.contents().assumingMemoryBound(to: UInt32.self)
+        // ramp the chunk size so short answers don't pay for 64 speculative
+        // forward passes; EOS usually lands in the first chunks
+        var nextChunk = min(8, chunk)
         let t0 = Date()
         while produced < budget {
-            let k = min(chunk, budget - produced)
+            let k = min(nextChunk, budget - produced)
+            nextChunk = min(nextChunk * 2, chunk)
             let batch = try runner.batch()
             for _ in 0..<k {
                 try batch.dispatchGroups("step_setup",

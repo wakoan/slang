@@ -1,121 +1,148 @@
 import Foundation
+import Metal
 
-func Float16toFloat32(_ bits: UInt16) -> Float {
-    // Convert IEEE 754 half-precision to single-precision
-    let exponent = (bits >> 10) & 0x1F
-    let mantissa = bits & 0x3FF
-    let sign = bits >> 15
+struct TensorInfo {
+    let dtype: String
+    let shape: [Int]
+    let start: Int  // absolute byte offset in file
+    let end: Int
 
-    if exponent == 0 {
-        return sign == 0 ? 0.0 : -0.0
-    } else if exponent == 31 {
-        return mantissa == 0 ? (sign == 0 ? Float.infinity : -Float.infinity) : Float.nan
-    }
-
-    let f32Mantissa = UInt32(mantissa) << 13
-    let f32Exponent = UInt32((Int(exponent) - 15 + 127)) << 23
-    let f32Sign = UInt32(sign) << 31
-    let f32Bits = f32Sign | f32Exponent | f32Mantissa
-    return Float(bitPattern: f32Bits)
+    var elementCount: Int { shape.reduce(1, *) }
 }
 
-class SafetensorsLoader {
-    let fileURL: URL
+/// Memory-mapped safetensors file with raw per-tensor access.
+final class SafetensorsFile {
+    private let data: Data
+    let tensors: [String: TensorInfo]
 
-    init(path: String) {
-        self.fileURL = URL(fileURLWithPath: path)
-    }
-
-    func load() throws -> [String: [Float]] {
-        let data = try Data(contentsOf: fileURL)
-
-        // Read header length (first 8 bytes, little-endian u64)
-        var headerLen: UInt64 = 0
-        _ = withUnsafeMutableBytes(of: &headerLen) { buffer in
-            data.copyBytes(to: buffer, from: 0..<8)
-        }
-
-        // Parse header JSON
-        let headerData = data.subdata(in: 8..<(8 + Int(headerLen)))
-        guard let headerJson = try JSONSerialization.jsonObject(
-            with: headerData
-        ) as? [String: Any] else {
-            throw LoadError("Failed to parse header")
-        }
-
-        var tensors: [String: [Float]] = [:]
+    init(path: String) throws {
+        data = try Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe)
+        guard data.count >= 8 else { throw RuntimeError("safetensors file too small") }
+        let headerLen = data.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }
         let base = 8 + Int(headerLen)
-
-        for (name, info) in headerJson {
-            if name == "__metadata__" { continue }
-
-            guard let infoDict = info as? [String: Any],
-                  let offsets = infoDict["data_offsets"] as? [Int],
-                  offsets.count == 2,
-                  let shape = infoDict["shape"] as? [Int],
-                  let dtype = infoDict["dtype"] as? String else {
-                continue
-            }
-
-            let start = offsets[0]
-            let end = offsets[1]
-            let bufferRange = base + start..<base + end
-
-            let buffer = data.subdata(in: bufferRange)
-            let floatData = try parseBuffer(buffer, dtype: dtype, shape: shape)
-            tensors[name] = floatData
+        guard let header = try JSONSerialization.jsonObject(
+            with: data.subdata(in: 8..<base)) as? [String: Any] else {
+            throw RuntimeError("safetensors header is not a JSON object")
         }
 
-        return tensors
+        var tensors: [String: TensorInfo] = [:]
+        for (name, info) in header where name != "__metadata__" {
+            guard let d = info as? [String: Any],
+                  let offsets = d["data_offsets"] as? [Int], offsets.count == 2,
+                  let shape = d["shape"] as? [Int],
+                  let dtype = d["dtype"] as? String else {
+                throw RuntimeError("malformed header entry for \(name)")
+            }
+            tensors[name] = TensorInfo(dtype: dtype, shape: shape,
+                                       start: base + offsets[0], end: base + offsets[1])
+        }
+        self.tensors = tensors
     }
 
-    private func parseBuffer(_ buffer: Data, dtype: String, shape: [Int]) throws -> [Float] {
-        let elementCount = shape.reduce(1, *)
+    func info(_ name: String) throws -> TensorInfo {
+        guard let t = tensors[name] else { throw RuntimeError("tensor not found: \(name)") }
+        return t
+    }
 
-        if dtype == "F32" {
-            var floats = [Float](repeating: 0, count: elementCount)
-            buffer.withUnsafeBytes { ptr in
-                guard let src = ptr.baseAddress?.assumingMemoryBound(to: Float.self) else {
-                    return
-                }
-                memcpy(&floats, src, MemoryLayout<Float>.size * elementCount)
-            }
-            return floats
-        } else if dtype == "F16" {
-            var floats = [Float]()
-            floats.reserveCapacity(elementCount)
-            _ = buffer.withUnsafeBytes { ptr in
-                guard let baseAddress = ptr.baseAddress else { return 0 }
-                for i in 0..<elementCount {
-                    let u16Ptr = baseAddress.assumingMemoryBound(to: UInt16.self)
-                    let u16 = u16Ptr[i]
-                    floats.append(Float16toFloat32(u16))
-                }
-                return 0
-            }
-            return floats
-        } else if dtype == "BF16" {
-            var floats = [Float]()
-            floats.reserveCapacity(elementCount)
-            let uint16Array = buffer.withUnsafeBytes { ptr in
-                Array(ptr.bindMemory(to: UInt16.self))
-            }
-            for u16 in uint16Array {
-                // BF16: shift left 16 bits to reconstruct f32
-                let f32Bits = UInt32(u16) << 16
-                floats.append(Float(bitPattern: f32Bits))
-            }
-            return floats
-        } else {
-            throw LoadError("Unsupported dtype: \(dtype)")
+    /// Raw bf16 element access (Gemma weights are all BF16 on disk).
+    func withBF16<R>(_ name: String, _ body: (UnsafeBufferPointer<UInt16>) throws -> R) throws -> R {
+        let t = try info(name)
+        guard t.dtype == "BF16" else {
+            throw RuntimeError("\(name): expected BF16, got \(t.dtype)")
+        }
+        return try data.withUnsafeBytes { raw -> R in
+            let ptr = raw.baseAddress! + t.start
+            precondition(Int(bitPattern: ptr) % 2 == 0, "unaligned bf16 tensor")
+            return try body(UnsafeBufferPointer(
+                start: ptr.assumingMemoryBound(to: UInt16.self), count: t.elementCount))
         }
     }
 }
 
-enum LoadError: Error {
-    case message(String)
+private func bf16ToF32(_ bits: UInt16) -> Float {
+    Float(bitPattern: UInt32(bits) << 16)
+}
 
-    init(_ msg: String) {
-        self = .message(msg)
+/// All model weights as MTLBuffers laid out the way the kernels expect:
+/// matmul weights + embed table as f16 (halves; packed-u32 kernels read the
+/// same bytes as uint pairs), norm weights as f32. QKV and gate/up are merged
+/// by row-concatenation into single matrices, consumed via buffer offsets.
+final class WeightStore {
+    private(set) var buffers: [String: MTLBuffer] = [:]
+
+    subscript(name: String) -> MTLBuffer {
+        guard let b = buffers[name] else { fatalError("weight not loaded: \(name)") }
+        return b
+    }
+
+    init(file: SafetensorsFile, config: GemmaConfig, runner: MetalRunner) throws {
+        // bf16 tensor → f16 halves at byte `offset` inside `buf`
+        func convertF16(_ name: String, into buf: MTLBuffer, offset: Int) throws {
+            try file.withBF16(name) { src in
+                let dst = (buf.contents() + offset).assumingMemoryBound(to: UInt16.self)
+                for i in 0..<src.count {
+                    dst[i] = Float16(bf16ToF32(src[i])).bitPattern
+                }
+            }
+        }
+
+        func f16Buffer(_ label: String, elements: Int) throws -> MTLBuffer {
+            let b = try runner.makeBuffer(bytes: elements * 2, label: label)
+            buffers[label] = b
+            return b
+        }
+
+        func loadF16(_ name: String) throws {
+            let buf = try f16Buffer(name, elements: try file.info(name).elementCount)
+            try convertF16(name, into: buf, offset: 0)
+        }
+
+        func loadF32(_ name: String) throws {
+            let count = try file.info(name).elementCount
+            let buf = try runner.makeBuffer(bytes: count * 4, label: name)
+            try file.withBF16(name) { src in
+                let dst = buf.contents().assumingMemoryBound(to: Float.self)
+                for i in 0..<src.count { dst[i] = bf16ToF32(src[i]) }
+            }
+            buffers[name] = buf
+        }
+
+        try loadF16("model.embed_tokens.weight")
+        try loadF32("model.norm.weight")
+
+        for L in 0..<config.numLayers {
+            let p = "model.layers.\(L)."
+            let a = p + "self_attn.", m = p + "mlp."
+
+            // merged QKV: rows [q_dim | hd | hd] × hiddenSize
+            let qCount = try file.info(a + "q_proj.weight").elementCount
+            let kCount = try file.info(a + "k_proj.weight").elementCount
+            let vCount = try file.info(a + "v_proj.weight").elementCount
+            let qkv = try f16Buffer(a + "qkv_proj.weight", elements: qCount + kCount + vCount)
+            try convertF16(a + "q_proj.weight", into: qkv, offset: 0)
+            try convertF16(a + "k_proj.weight", into: qkv, offset: qCount * 2)
+            try convertF16(a + "v_proj.weight", into: qkv, offset: (qCount + kCount) * 2)
+
+            // merged gate/up: rows [inter | inter] × hiddenSize
+            let gCount = try file.info(m + "gate_proj.weight").elementCount
+            let uCount = try file.info(m + "up_proj.weight").elementCount
+            let gu = try f16Buffer(m + "gateup_proj.weight", elements: gCount + uCount)
+            try convertF16(m + "gate_proj.weight", into: gu, offset: 0)
+            try convertF16(m + "up_proj.weight", into: gu, offset: gCount * 2)
+
+            try loadF16(a + "o_proj.weight")
+            try loadF16(m + "down_proj.weight")
+
+            for norm in ["input_layernorm", "post_attention_layernorm",
+                         "pre_feedforward_layernorm", "post_feedforward_layernorm"] {
+                try loadF32(p + norm + ".weight")
+            }
+            try loadF32(a + "q_norm.weight")
+            try loadF32(a + "k_norm.weight")
+        }
+    }
+
+    var totalBytes: Int {
+        buffers.values.reduce(0) { $0 + $1.length }
     }
 }

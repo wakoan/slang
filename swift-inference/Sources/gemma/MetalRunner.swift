@@ -117,6 +117,21 @@ final class MetalRunner {
             try dispatch(name, buffers: buffers.map { ($0, 0) }, totalThreads: totalThreads)
         }
 
+        /// Explicit threadgroup count (e.g. one workgroup per matrix row).
+        func dispatchGroups(_ name: String, buffers: [(MTLBuffer, Int)], groups: Int) throws {
+            guard let kernel = runner.kernels[name] else {
+                throw RuntimeError("Kernel '\(name)' not compiled")
+            }
+            encoder.setComputePipelineState(kernel.pipeline)
+            for (i, (buf, offset)) in buffers.enumerated() {
+                encoder.setBuffer(buf, offset: offset, index: i)
+            }
+            encoder.dispatchThreadgroups(
+                MTLSize(width: groups, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: kernel.threadsPerGroup, height: 1, depth: 1)
+            )
+        }
+
         func commitAndWait() {
             encoder.endEncoding()
             cmdBuffer.commit()

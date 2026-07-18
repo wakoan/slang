@@ -148,6 +148,48 @@ do {
         let model = try GemmaModel(cfg: config, runner: runner, weights: weights)
 
         let ignoreEOS = CommandLine.arguments.contains("--ignore-eos")
+
+        if CommandLine.arguments.contains("--profile") {
+            // prefill unprofiled, then time N decode steps kernel-by-kernel
+            for (i, tok) in promptIds.dropLast().enumerated() {
+                _ = try model.step(tokenId: tok, pos: i, wantLogits: false)
+            }
+            let profiler = try KernelProfiler(device: runner.device)
+            model.profiler = profiler
+            var next = promptIds.last!
+            var pos = promptIds.count - 1
+            for _ in 0..<maxTokens {
+                let logits = try model.step(tokenId: next, pos: pos, wantLogits: true)!
+                var best = 0
+                var bestVal = -Float.infinity
+                for i in 0..<logits.count where logits[i] > bestVal {
+                    bestVal = logits[i]; best = i
+                }
+                next = best; pos += 1
+            }
+            print("== per-kernel GPU time (\(maxTokens) decode steps, " +
+                  "mean kv_len \(promptIds.count + maxTokens / 2)) ==")
+            print(profiler.report())
+
+            let groups: [(String, [String])] = [
+                ("embed", ["embed"]),
+                ("attention", ["mv_qkv", "qk_norm", "rope", "kv_append",
+                               "attn_fused", "mv_o"]),
+                ("ffn", ["mv_gateup", "geglu", "mv_down"]),
+                ("norms", ["norm_input", "norm_post_add", "norm_pre_ff", "norm_final"]),
+                ("logits", ["mv_logits"]),
+            ]
+            let grand = profiler.totals.values.reduce(0.0) { $0 + $1.ns }
+            print("\n== grouped (per decode step) ==")
+            for (name, labels) in groups {
+                let ns = labels.reduce(0.0) { $0 + (profiler.totals[$1]?.ns ?? 0) }
+                let padded = name.padding(toLength: 10, withPad: " ", startingAt: 0)
+                print(padded + String(format: "%8.1f µs  %5.1f%%",
+                                      ns / Double(maxTokens) / 1000, 100 * ns / grand))
+            }
+            exit(0)
+        }
+
         let (out, rate): ([Int], Double)
         if CommandLine.arguments.contains("--step-mode") {
             (out, rate) = try model.generateGreedy(

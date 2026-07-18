@@ -14,6 +14,8 @@ final class GemmaModel {
     private var d: [String: MTLBuffer] = [:]
     private var kCache: [MTLBuffer] = []
     private var vCache: [MTLBuffer] = []
+    /// Attach to collect per-kernel GPU timings (forces per-dispatch encoders).
+    var profiler: KernelProfiler?
 
     init(cfg: GemmaConfig, runner: MetalRunner, weights: WeightStore, maxSeq: Int = 1024) throws {
         self.cfg = cfg
@@ -95,7 +97,7 @@ final class GemmaModel {
 
         try batch.dispatch("embed_scale_f16",
             buffers: [b["token"]!, w["model.embed_tokens.weight"], b["x"]!, d["embed"]!],
-            totalThreads: h)
+            totalThreads: h, label: "embed")
 
         for L in 0..<cfg.numLayers {
             let p = "model.layers.\(L)."
@@ -107,65 +109,77 @@ final class GemmaModel {
 
             try batch.dispatchGroups("rmsnorm_wg_sg",
                 buffers: [(b["x"]!, 0), (w[p + "input_layernorm.weight"], 0),
-                          (b["xn"]!, 0), (d["norm_h"]!, 0)], groups: 1)
+                          (b["xn"]!, 0), (d["norm_h"]!, 0)], groups: 1,
+                label: "norm_input")
             try batch.dispatchGroups("matvec_wg_packed_sg",
                 buffers: [(w[a + "qkv_proj.weight"], 0), (b["xn"]!, 0),
-                          (qkv, 0), (d["mv_qkv"]!, 0)], groups: qDim + 2 * hd)
+                          (qkv, 0), (d["mv_qkv"]!, 0)], groups: qDim + 2 * hd,
+                label: "mv_qkv")
             try batch.dispatchGroups("rmsnorm_wg_sg",
                 buffers: [(qkv, 0), (w[a + "q_norm.weight"], 0),
-                          (b["qn"]!, 0), (d["norm_q"]!, 0)], groups: nh)
+                          (b["qn"]!, 0), (d["norm_q"]!, 0)], groups: nh,
+                label: "qk_norm")
             try batch.dispatchGroups("rmsnorm_wg_sg",
                 buffers: [(qkv, qBytes), (w[a + "k_norm.weight"], 0),
-                          (b["kn"]!, 0), (d["norm_k"]!, 0)], groups: 1)
+                          (b["kn"]!, 0), (d["norm_k"]!, 0)], groups: 1,
+                label: "qk_norm")
             try batch.dispatch("rope",
                 buffers: [(b["qn"]!, 0), (ropeF, 0), (d["rope_q"]!, 0)],
-                totalThreads: qDim / 2)
+                totalThreads: qDim / 2, label: "rope")
             try batch.dispatch("rope",
                 buffers: [(b["kn"]!, 0), (ropeF, 0), (d["rope_k"]!, 0)],
-                totalThreads: hd / 2)
+                totalThreads: hd / 2, label: "rope")
             try batch.dispatch("kv_append",
                 buffers: [(b["kn"]!, 0), (kCache[L], 0), (d["kv_append"]!, 0)],
-                totalThreads: hd)
+                totalThreads: hd, label: "kv_append")
             try batch.dispatch("kv_append",
                 buffers: [(qkv, qBytes + kvBytes), (vCache[L], 0), (d["kv_append"]!, 0)],
-                totalThreads: hd)
+                totalThreads: hd, label: "kv_append")
             try batch.dispatchGroups("attention_fused_sg",
                 buffers: [(b["qn"]!, 0), (kCache[L], 0), (vCache[L], 0),
-                          (b["scores"]!, 0), (b["attn"]!, 0), (scoresD, 0)], groups: nh)
+                          (b["scores"]!, 0), (b["attn"]!, 0), (scoresD, 0)], groups: nh,
+                label: "attn_fused")
             try batch.dispatchGroups("matvec_wg_packed_sg",
                 buffers: [(w[a + "o_proj.weight"], 0), (b["attn"]!, 0),
-                          (b["attn_proj"]!, 0), (d["mv_o"]!, 0)], groups: h)
+                          (b["attn_proj"]!, 0), (d["mv_o"]!, 0)], groups: h,
+                label: "mv_o")
             try batch.dispatchGroups("rmsnorm_add_wg_sg",
                 buffers: [(b["attn_proj"]!, 0), (w[p + "post_attention_layernorm.weight"], 0),
-                          (b["x"]!, 0), (d["norm_h"]!, 0)], groups: 1)
+                          (b["x"]!, 0), (d["norm_h"]!, 0)], groups: 1,
+                label: "norm_post_add")
             try batch.dispatchGroups("rmsnorm_wg_sg",
                 buffers: [(b["x"]!, 0), (w[p + "pre_feedforward_layernorm.weight"], 0),
-                          (b["xn"]!, 0), (d["norm_h"]!, 0)], groups: 1)
+                          (b["xn"]!, 0), (d["norm_h"]!, 0)], groups: 1,
+                label: "norm_pre_ff")
             try batch.dispatchGroups("matvec_wg_packed_sg",
                 buffers: [(w[m + "gateup_proj.weight"], 0), (b["xn"]!, 0),
-                          (b["gateup"]!, 0), (d["mv_gateup"]!, 0)], groups: 2 * inter)
+                          (b["gateup"]!, 0), (d["mv_gateup"]!, 0)], groups: 2 * inter,
+                label: "mv_gateup")
             try batch.dispatch("geglu",
                 buffers: [(b["gateup"]!, 0), (b["gateup"]!, inter * 4),
                           (b["ffh"]!, 0), (d["geglu"]!, 0)],
-                totalThreads: inter)
+                totalThreads: inter, label: "geglu")
             try batch.dispatchGroups("matvec_wg_packed_sg",
                 buffers: [(w[m + "down_proj.weight"], 0), (b["ffh"]!, 0),
-                          (b["mlp_out"]!, 0), (d["mv_down"]!, 0)], groups: h)
+                          (b["mlp_out"]!, 0), (d["mv_down"]!, 0)], groups: h,
+                label: "mv_down")
             try batch.dispatchGroups("rmsnorm_add_wg_sg",
                 buffers: [(b["mlp_out"]!, 0), (w[p + "post_feedforward_layernorm.weight"], 0),
-                          (b["x"]!, 0), (d["norm_h"]!, 0)], groups: 1)
+                          (b["x"]!, 0), (d["norm_h"]!, 0)], groups: 1,
+                label: "norm_post_add")
         }
 
         if wantLogits {
             try batch.dispatchGroups("rmsnorm_wg_sg",
                 buffers: [(b["x"]!, 0), (w["model.norm.weight"], 0),
-                          (b["xn"]!, 0), (d["norm_h"]!, 0)], groups: 1)
+                          (b["xn"]!, 0), (d["norm_h"]!, 0)], groups: 1,
+                label: "norm_final")
             // one workgroup per row: coalesced weight loads, unlike the
             // per-thread matvec_packed the wgpu runner uses here
             try batch.dispatchGroups("matvec_wg_packed_sg",
                 buffers: [(w["model.embed_tokens.weight"], 0), (b["xn"]!, 0),
                           (b["logits"]!, 0), (d["mv_logits"]!, 0)],
-                groups: cfg.vocabSize)
+                groups: cfg.vocabSize, label: "mv_logits")
         }
     }
 
@@ -174,7 +188,7 @@ final class GemmaModel {
     func step(tokenId: Int, pos: Int, wantLogits: Bool = true) throws -> UnsafeBufferPointer<Float>? {
         guard pos < maxSeq else { throw RuntimeError("position \(pos) exceeds maxSeq \(maxSeq)") }
         writeStepParams(tokenId: tokenId, pos: pos)
-        let batch = try runner.batch()
+        let batch = try runner.batch(profiler: profiler)
         try encodeForward(batch, wantLogits: wantLogits)
         batch.commitAndWait()
 

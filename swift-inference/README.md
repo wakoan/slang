@@ -37,13 +37,34 @@ for name, k in {**KERNELS, **METAL_KERNELS}.items():
     open(f"swift-inference/kernels/{name}.metal", "w").write(k.msl)
 ```
 
-## Status / next steps
+## Status
 
 - [x] Metal runner: per-file compile, batched dispatch, offset binding
 - [x] All 32 DSL kernels compile as MSL at runtime
-- [x] matvec verified vs CPU reference
-- [ ] Weight loading into f16-packed GPU buffers (current loader is slow copy-based)
-- [ ] Full decode step (use the `_wg`/`_sg` kernels — controllable threadgroups
-      mean we are NOT limited to the simd-only `kernels_metal.py` set)
-- [ ] Simple tokenizer from tokenizer.json
-- [ ] tok/s benchmark vs wgpu (175) and metalgpu (120); f16 bandwidth floor ≈ 370
+- [x] Weights: mmap → bf16→f16 straight into MTLBuffers (~0.5 GB, warm ~0.07s)
+- [x] Full decode, wgpu-parity kernel sequence (`_wg`/`_sg` set); greedy output
+      matches the Python runner token-for-token
+- [x] GPU-resident decode (step_setup + argmax on GPU, chunked EOS checks)
+
+Usage: `gemma --ids 2,105,... [--max-tokens N] [--chunk N] [--step-mode] [--ignore-eos]`
+(token ids from the Python tokenizer for now).
+
+## Performance (M4 Pro, 256-token greedy decode, same prompt)
+
+| backend | tok/s |
+|---|---|
+| Swift/Metal resident, chunk 64 | **202–210** |
+| Swift/Metal CPU-driven steps | 172 |
+| wgpu GPU-resident (same day, same prompt) | ~149 |
+| metalgpu (simd-only kernels) | ~120 |
+
+Wins over wgpu: coalesced `matvec_wg_packed_sg` for the logits matvec
+(the per-thread `matvec_packed` costs ~7%), chunk 64, no Python overhead.
+f16 bandwidth floor ≈ 370 tok/s — next: per-kernel GPU profiling
+(MTLCounterSampleBuffer), attention scaling at long kv_len.
+
+## Next steps
+
+- [ ] Simple tokenizer from tokenizer.json (currently ids in/out via CLI)
+- [ ] Per-kernel GPU timing to find the gap to the bandwidth floor
+- [ ] Sampling (temperature) path

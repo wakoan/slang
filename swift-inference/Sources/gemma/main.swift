@@ -148,8 +148,16 @@ do {
         let model = try GemmaModel(cfg: config, runner: runner, weights: weights)
 
         let ignoreEOS = CommandLine.arguments.contains("--ignore-eos")
-        let (out, rate) = try model.generateGreedy(
-            promptIds: promptIds, maxNewTokens: maxTokens, ignoreEOS: ignoreEOS)
+        let (out, rate): ([Int], Double)
+        if CommandLine.arguments.contains("--step-mode") {
+            (out, rate) = try model.generateGreedy(
+                promptIds: promptIds, maxNewTokens: maxTokens, ignoreEOS: ignoreEOS)
+        } else {
+            let chunk = Int(argValue("--chunk") ?? "64") ?? 64
+            (out, rate) = try model.generateResident(
+                promptIds: promptIds, maxNewTokens: maxTokens, chunk: chunk,
+                ignoreEOS: ignoreEOS)
+        }
         print("ids: " + out.map(String.init).joined(separator: ","))
         print(String(format: "%d decode tokens → %.1f tok/s", out.count, rate))
     } else {

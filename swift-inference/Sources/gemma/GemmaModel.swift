@@ -62,7 +62,17 @@ final class GemmaModel {
         try ubuf("scores_full", [UInt32(nh), UInt32(hd), 0, 0, UInt32(maxSeq)])
         d["rope_local"] = try runner.makeBuffer([cfg.ropeThetaLocal, 0], label: "rope_local")
         d["rope_global"] = try runner.makeBuffer([cfg.ropeThetaGlobal, 0], label: "rope_global")
+
+        // GPU-resident decode state
+        try fbuf("pos", 1); try fbuf("counter", 1)
+        try fbuf("out_tokens", maxSeq)
+        try fbuf("part_val", Self.nArgmaxWGs); try fbuf("part_idx", Self.nArgmaxWGs)
+        try ubuf("argmax1", [UInt32(cfg.vocabSize), UInt32(Self.nArgmaxWGs)])
+        try ubuf("argmax2", [UInt32(Self.nArgmaxWGs)])
+        try ubuf("setup_cfg", [UInt32(cfg.slidingWindow)])
     }
+
+    private static let nArgmaxWGs = 128
 
     private func writeStepParams(tokenId: Int, pos: Int) {
         let kvLen = UInt32(pos + 1)
@@ -76,19 +86,13 @@ final class GemmaModel {
         d["rope_global"]!.contents().assumingMemoryBound(to: Float.self)[1] = Float(pos)
     }
 
-    /// One decoder forward pass; returns a pointer to logits (valid until the
-    /// next step) or nil when `wantLogits` is false.
-    func step(tokenId: Int, pos: Int, wantLogits: Bool = true) throws -> UnsafeBufferPointer<Float>? {
-        guard pos < maxSeq else { throw RuntimeError("position \(pos) exceeds maxSeq \(maxSeq)") }
+    private func encodeForward(_ batch: MetalRunner.CommandBatch, wantLogits: Bool) throws {
         let h = cfg.hiddenSize, hd = cfg.headDim, nh = cfg.numHeads
         let inter = cfg.intermediateSize
         let qDim = nh * hd
         let qBytes = qDim * 4, kvBytes = hd * 4
         let w = weights
 
-        writeStepParams(tokenId: tokenId, pos: pos)
-
-        let batch = try runner.batch()
         try batch.dispatch("embed_scale_f16",
             buffers: [b["token"]!, w["model.embed_tokens.weight"], b["x"]!, d["embed"]!],
             totalThreads: h)
@@ -156,17 +160,80 @@ final class GemmaModel {
             try batch.dispatchGroups("rmsnorm_wg_sg",
                 buffers: [(b["x"]!, 0), (w["model.norm.weight"], 0),
                           (b["xn"]!, 0), (d["norm_h"]!, 0)], groups: 1)
-            try batch.dispatch("matvec_packed",
-                buffers: [w["model.embed_tokens.weight"], b["xn"]!,
-                          b["logits"]!, d["mv_logits"]!],
-                totalThreads: cfg.vocabSize)
+            // one workgroup per row: coalesced weight loads, unlike the
+            // per-thread matvec_packed the wgpu runner uses here
+            try batch.dispatchGroups("matvec_wg_packed_sg",
+                buffers: [(w["model.embed_tokens.weight"], 0), (b["xn"]!, 0),
+                          (b["logits"]!, 0), (d["mv_logits"]!, 0)],
+                groups: cfg.vocabSize)
         }
+    }
+
+    /// One decoder forward pass; returns a pointer to logits (valid until the
+    /// next step) or nil when `wantLogits` is false.
+    func step(tokenId: Int, pos: Int, wantLogits: Bool = true) throws -> UnsafeBufferPointer<Float>? {
+        guard pos < maxSeq else { throw RuntimeError("position \(pos) exceeds maxSeq \(maxSeq)") }
+        writeStepParams(tokenId: tokenId, pos: pos)
+        let batch = try runner.batch()
+        try encodeForward(batch, wantLogits: wantLogits)
         batch.commitAndWait()
 
         guard wantLogits else { return nil }
         return UnsafeBufferPointer(
             start: b["logits"]!.contents().assumingMemoryBound(to: Float.self),
             count: cfg.vocabSize)
+    }
+
+    /// Greedy decode fully on-GPU: step params, token feedback, and argmax
+    /// never leave the device; the CPU checks EOS once per `chunk` tokens.
+    func generateResident(promptIds: [Int], maxNewTokens: Int, chunk: Int = 64,
+                          ignoreEOS: Bool = false) throws -> (ids: [Int], decodeTokPerSec: Double) {
+        precondition(!promptIds.isEmpty)
+        for (i, tok) in promptIds.dropLast().enumerated() {
+            _ = try step(tokenId: tok, pos: i, wantLogits: false)
+        }
+        let startPos = promptIds.count - 1
+        b["token"]!.contents().assumingMemoryBound(to: UInt32.self)[0] = UInt32(promptIds.last!)
+        b["pos"]!.contents().assumingMemoryBound(to: UInt32.self)[0] = UInt32(startPos)
+        b["counter"]!.contents().assumingMemoryBound(to: UInt32.self)[0] = 0
+
+        var out: [Int] = []
+        var produced = 0
+        let budget = min(maxNewTokens, maxSeq - startPos)
+        let outTokens = b["out_tokens"]!.contents().assumingMemoryBound(to: UInt32.self)
+        let t0 = Date()
+        while produced < budget {
+            let k = min(chunk, budget - produced)
+            let batch = try runner.batch()
+            for _ in 0..<k {
+                try batch.dispatchGroups("step_setup",
+                    buffers: [(b["pos"]!, 0), (d["kv_append"]!, 0),
+                              (d["scores_sliding"]!, 0), (d["scores_full"]!, 0),
+                              (d["rope_local"]!, 0), (d["rope_global"]!, 0),
+                              (d["setup_cfg"]!, 0)], groups: 1)
+                try encodeForward(batch, wantLogits: true)
+                try batch.dispatchGroups("argmax_stage1",
+                    buffers: [(b["logits"]!, 0), (b["part_val"]!, 0),
+                              (b["part_idx"]!, 0), (d["argmax1"]!, 0)],
+                    groups: Self.nArgmaxWGs)
+                try batch.dispatchGroups("argmax_stage2",
+                    buffers: [(b["part_val"]!, 0), (b["part_idx"]!, 0),
+                              (b["token"]!, 0), (b["out_tokens"]!, 0),
+                              (b["counter"]!, 0), (d["argmax2"]!, 0)], groups: 1)
+            }
+            batch.commitAndWait()
+
+            var stop = false
+            for i in produced..<(produced + k) {
+                let tid = Int(outTokens[i])
+                out.append(tid)
+                if !ignoreEOS && cfg.eosTokenIds.contains(tid) { stop = true; break }
+            }
+            produced += k
+            if stop { break }
+        }
+        let dt = Date().timeIntervalSince(t0)
+        return (out, Double(out.count) / dt)
     }
 
     /// Greedy generation from prompt ids. Returns generated ids (prompt

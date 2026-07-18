@@ -188,7 +188,6 @@ class GemmaGPU:
             "mv_o": ubuf(h, q_dim),
             "mv_gateup": ubuf(2 * inter, h),
             "mv_down": ubuf(h, inter),
-            "mv_logits": ubuf(cfg.vocab_size, h),
             "rope_q": ubuf(nh, hd),
             "rope_k": ubuf(1, hd),
             "geglu": ubuf(inter),
@@ -202,6 +201,16 @@ class GemmaGPU:
             "rope_local": dynbuf(2, np.float32),
             "rope_global": dynbuf(2, np.float32),
         }
+
+        # Logits matvec runs workgroup-per-row (coalesced weight loads, ~7%
+        # overall vs one row per thread), but a dispatch is capped at 65535
+        # workgroups per dimension — split the vocab into row chunks bound
+        # at buffer offsets. 32768-row chunks keep offsets 256-aligned.
+        LC = 32768
+        self._logits_chunks = [(s, min(LC, cfg.vocab_size - s))
+                               for s in range(0, cfg.vocab_size, LC)]
+        for _, rows in self._logits_chunks:
+            self.d.setdefault(f"mv_logits_{rows}", ubuf(rows, h))
 
         # --- GPU-resident decode state ---
         N_ARGMAX_WGS = 128
@@ -276,7 +285,16 @@ class GemmaGPU:
 
         self.bg_final_norm = self._bg(
             "rmsnorm_wg", b["x"], w["model.norm.weight"], b["xn"], d["norm_h"])
-        self.bg_logits = self._bg(self._kn["matvec"], emb, b["xn"], b["logits"], d["mv_logits"])
+        w_elem = 2 if self.dtype == "f16" else 4
+        row_bytes = cfg.hidden_size * w_elem
+        self.bg_logits_chunks = [
+            (rows, self._bg(self._kn["matvec_wg"],
+                            (emb, start * row_bytes, rows * row_bytes),
+                            b["xn"],
+                            (b["logits"], start * 4, rows * 4),
+                            d[f"mv_logits_{rows}"]))
+            for start, rows in self._logits_chunks
+        ]
 
         self.bg_setup = self._bg(
             "step_setup", b["pos"], d["kv_append"], d["scores_sliding"],
@@ -393,7 +411,9 @@ class GemmaGPU:
 
         if want_logits:
             run(self._kn["rmsnorm_wg"], self.bg_final_norm, h, label="norm_final", grid=(1, 1, 1))
-            run(self._kn["matvec"], self.bg_logits, cfg.vocab_size, label="mv_logits")
+            for rows, bg in self.bg_logits_chunks:
+                run(self._kn["matvec_wg"], bg, rows, label="mv_logits",
+                    grid=(rows, 1, 1))
 
     def step(self, token_id: int, pos: int, want_logits: bool = True) -> np.ndarray | None:
         """Run one decoder forward pass on the GPU for `token_id` at `pos`."""
@@ -569,7 +589,7 @@ class GemmaGPU:
         return int(rng.choice(len(probs), p=probs))
 
     def _generate_resident(self, prompt_ids: list[int], max_new_tokens: int,
-                           on_token, chunk: int = 16) -> list[int]:
+                           on_token, chunk: int = 64) -> list[int]:
         """Greedy decode fully on-GPU: token feedback, params, and argmax
         never leave the device; the CPU checks for EOS once per chunk."""
         q = self.device.queue
@@ -590,9 +610,8 @@ class GemmaGPU:
         out: list[int] = []
         produced = 0
         budget = min(max_new_tokens, self.max_seq - start_pos)
-        while produced < budget:
-            k = min(chunk, budget - produced)
-            t0 = time.perf_counter()
+
+        def encode_chunk(k: int):
             enc = self.device.create_command_encoder()
             cp = enc.begin_compute_pass()
 
@@ -612,17 +631,39 @@ class GemmaGPU:
                     grid=(self._n_argmax_wgs, 1, 1))
                 run("argmax_stage2", self.bg_argmax2, 64, grid=(1, 1, 1))
             cp.end()
-            t1 = time.perf_counter()
-            q.submit([enc.finish()])
-            produced += k
+            return enc.finish()
 
+        # Chunk sizes ramp 8→chunk so short answers don't pay for a full
+        # chunk of speculative forward passes. Encoding is pipelined: while
+        # the GPU runs chunk N, the CPU encodes chunk N+1 (all state is
+        # GPU-resident, so encoding ahead is safe; an unsubmitted chunk is
+        # simply dropped when EOS lands).
+        sizes: list[int] = []
+        c, left = min(8, chunk), budget
+        while left > 0:
+            k = min(c, left)
+            sizes.append(k)
+            left -= k
+            c = min(c * 2, chunk)
+
+        t0 = time.perf_counter()
+        cmd = encode_chunk(sizes[0])
+        t1 = time.perf_counter()
+        self._prof_phases["encode"] += t1 - t0
+        q.submit([cmd])
+
+        for i, k in enumerate(sizes):
+            t1 = time.perf_counter()
+            next_cmd = encode_chunk(sizes[i + 1]) if i + 1 < len(sizes) else None
+            t2 = time.perf_counter()
+            produced += k
             raw = q.read_buffer(self.b["out_tokens"], size=produced * 4)
             toks = np.frombuffer(raw, dtype=np.uint32)
-            t2 = time.perf_counter()
+            t3 = time.perf_counter()
             ph = self._prof_phases
-            ph["encode"] += t1 - t0
-            ph["chunk_submit_readback"] += t2 - t1
-            self._prof_steps.append((start_pos + produced, (t2 - t0) / k, True))
+            ph["encode"] += t2 - t1
+            ph["chunk_submit_readback"] += t3 - t2
+            self._prof_steps.append((start_pos + produced, (t3 - t1) / k, True))
 
             stop = False
             for tid in toks[emitted:]:
@@ -634,8 +675,9 @@ class GemmaGPU:
                 if tid in cfg.eos_token_ids:
                     stop = True
                     break
-            if stop:
+            if stop or next_cmd is None:
                 break
+            q.submit([next_cmd])
         return out
 
     def generate(self, prompt_ids: list[int], max_new_tokens: int = 64,

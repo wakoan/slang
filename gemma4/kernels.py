@@ -25,9 +25,11 @@ from gemma3.kernels import (
     argmax_stage1,
     argmax_stage2,
     embed_scale,
+    embed_scale_f16,
     geglu,
     kv_append,
     matvec_wg,
+    matvec_wg_packed,
     rmsnorm_add_wg,
     rmsnorm_wg,
 )
@@ -221,7 +223,9 @@ def combine_scaled(
 KERNELS = {
     # unchanged gemma3 kernels
     "embed_scale": embed_scale,
+    "embed_scale_f16": embed_scale_f16,
     "matvec_wg": matvec_wg,
+    "matvec_wg_packed": matvec_wg_packed,
     "rmsnorm_wg": rmsnorm_wg,          # fed (w - 1) to realise Gemma 4's w scale
     "rmsnorm_add_wg": rmsnorm_add_wg,  # fed (w - 1), same trick
     "kv_append": kv_append,

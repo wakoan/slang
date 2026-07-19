@@ -49,25 +49,35 @@ def _binding_access(wgsl: str) -> list[bool]:
 
 
 class Gemma4GPU:
+    #: weights stored f16 (packed-u32 matvec loads); norms/activations stay f32
+    _F16_SUFFIXES = (
+        "embed_tokens.weight", "qkv_proj.weight", "q_proj.weight",
+        "o_proj.weight", "gateup_proj.weight", "down_proj.weight",
+        "per_layer_input_gate.weight", "per_layer_projection.weight",
+        "per_layer_model_projection.weight",
+    )
+
     def __init__(self, config: Gemma4Config, index: SafetensorsIndex,
                  max_seq: int = 1024, profile: bool = False,
-                 dtype: str = "f32", ple: bool = True) -> None:
-        if dtype != "f32":
-            raise ValueError("only dtype='f32' is implemented so far")
+                 dtype: str = "f16", ple: bool = True) -> None:
         self.cfg = config
         self.idx = index
         self.max_seq = max_seq
         self.profile = profile
-        self.dtype = dtype
-        self.ple = ple  # False isolates the non-PLE pipeline for verification
 
         adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
+        if dtype == "f16" and "shader-f16" not in adapter.features:
+            dtype = "f32"  # graceful fallback
+        self.dtype = dtype
+        self.ple = ple  # False isolates the non-PLE pipeline for verification
         embed_bytes = config.vocab_size * config.hidden_size * 4
         limits = {
             "max-buffer-size": max(embed_bytes, 1 << 28),
             "max-storage-buffer-binding-size": max(embed_bytes, 1 << 28),
         }
         features = []
+        if dtype == "f16":
+            features.append("shader-f16")
         if profile:
             if "timestamp-query" not in adapter.features:
                 raise RuntimeError("profile=True requires the timestamp-query feature")
@@ -88,6 +98,8 @@ class Gemma4GPU:
         # --- pipelines (one per kernel) ---
         self._pipelines: dict[str, tuple] = {}
         for name, kern in K.KERNELS.items():
+            if name.endswith("_f16") and self.dtype != "f16":
+                continue  # f16 shaders need the shader-f16 feature
             module = self.device.create_shader_module(code=kern.wgsl)
             access = _binding_access(kern.wgsl)
             entries = [
@@ -108,6 +120,13 @@ class Gemma4GPU:
             )
             self._pipelines[name] = (pipeline, layout)
 
+        # resolved kernel names per call-site family
+        f16 = self.dtype == "f16"
+        self._kn = {
+            "embed_scale": "embed_scale_f16" if f16 else "embed_scale",
+            "matvec_wg": "matvec_wg_packed" if f16 else "matvec_wg",
+        }
+
         # --- weight buffers (streamed: one host tensor alive at a time) ---
         st = wgpu.BufferUsage.STORAGE
         cfg = config
@@ -121,6 +140,11 @@ class Gemma4GPU:
             if name == PREFIX + "per_layer_model_projection.weight":
                 arr = arr * np.float32(h ** -0.5)  # fold the ctx scale in
             return arr
+
+        def wdata(name: str, arr: np.ndarray) -> bytes:
+            if f16 and name.endswith(self._F16_SUFFIXES):
+                return arr.astype(np.float16).tobytes()
+            return arr.tobytes()
 
         # mapped-at-creation uploads are staged until a queue submit; wgpu
         # silently drops the pending copies if gigabytes accumulate unflushed
@@ -137,7 +161,7 @@ class Gemma4GPU:
             return buf
 
         def wbuf(name: str) -> object:
-            return upload(wtensor(name).tobytes())
+            return upload(wdata(name, wtensor(name)))
 
         self._wbuf: dict[str, object] = {}
         w = self._wbuf
@@ -157,7 +181,8 @@ class Gemma4GPU:
                 w[p + suffix] = wbuf(p + suffix)
             gu = np.concatenate([wtensor(p + "mlp.gate_proj.weight"),
                                  wtensor(p + "mlp.up_proj.weight")])
-            w[p + "mlp.gateup_proj.weight"] = upload(gu.tobytes())
+            w[p + "mlp.gateup_proj.weight"] = upload(
+                wdata(p + "mlp.gateup_proj.weight", gu))
             del gu
             if spec.kv_shared:
                 w[p + "self_attn.q_proj.weight"] = wbuf(p + "self_attn.q_proj.weight")
@@ -165,7 +190,8 @@ class Gemma4GPU:
                 qkv = np.concatenate([wtensor(p + "self_attn.q_proj.weight"),
                                       wtensor(p + "self_attn.k_proj.weight"),
                                       wtensor(p + "self_attn.v_proj.weight")])
-                w[p + "self_attn.qkv_proj.weight"] = upload(qkv.tobytes())
+                w[p + "self_attn.qkv_proj.weight"] = upload(
+                    wdata(p + "self_attn.qkv_proj.weight", qkv))
                 del qkv
                 w[p + "self_attn.k_norm.weight"] = wbuf(p + "self_attn.k_norm.weight")
             if ple:
@@ -296,12 +322,12 @@ class Gemma4GPU:
     def _build_bind_groups(self) -> None:
         cfg, b, d, w = self.cfg, self.b, self.d, self._wbuf
         emb = w[PREFIX + "embed_tokens.weight"]
-        self.bg_embed = self._bg("embed_scale", b["token"], emb, b["x"], d["embed"])
+        self.bg_embed = self._bg(self._kn["embed_scale"], b["token"], emb, b["x"], d["embed"])
         self.bg_final_norm = self._bg(
             "rmsnorm_wg", b["x"], w[PREFIX + "norm.weight"], b["xn"], d["norm_h"])
-        row_bytes = cfg.hidden_size * 4
+        row_bytes = cfg.hidden_size * (2 if self.dtype == "f16" else 4)
         self.bg_logits_chunks = [
-            (rows, self._bg("matvec_wg",
+            (rows, self._bg(self._kn["matvec_wg"],
                             (emb, start * row_bytes, rows * row_bytes),
                             b["xn"],
                             (b["logits"], start * 4, rows * 4),
@@ -313,7 +339,7 @@ class Gemma4GPU:
 
         if self.ple:
             self.bg_ple_ctx = self._bg(
-                "matvec_wg", w[PREFIX + "per_layer_model_projection.weight"],
+                self._kn["matvec_wg"], w[PREFIX + "per_layer_model_projection.weight"],
                 b["x"], b["ple_ctx"], d["mv_ple_ctx"])
             self.bg_ple_ctx_norm = self._bg(
                 "rmsnorm_wg", b["ple_ctx"],
@@ -348,7 +374,7 @@ class Gemma4GPU:
                                  self.k_cache[spec.kv_source],
                                  self.v_cache[spec.kv_source],
                                  b["scores"], b["attn"], scores_d),
-                "mv_o": self._bg("matvec_wg", w[p + "self_attn.o_proj.weight"],
+                "mv_o": self._bg(self._kn["matvec_wg"], w[p + "self_attn.o_proj.weight"],
                                  b["attn"], b["attn_proj"], d[f"mv_o_{tag}"]),
                 "norm_pa_add": self._bg("rmsnorm_add_wg", b["attn_proj"],
                                         w[p + "post_attention_layernorm.weight"],
@@ -356,21 +382,21 @@ class Gemma4GPU:
                 "norm_pf": self._bg("rmsnorm_wg", b["x"],
                                     w[p + "pre_feedforward_layernorm.weight"],
                                     b["xn"], d["norm_h"]),
-                "mv_gateup": self._bg("matvec_wg", w[p + "mlp.gateup_proj.weight"],
+                "mv_gateup": self._bg(self._kn["matvec_wg"], w[p + "mlp.gateup_proj.weight"],
                                       b["xn"], gu, d[f"mv_gateup_{wtag}"]),
                 "geglu": self._bg("geglu", (gu, 0, inter * 4), (gu, inter * 4, inter * 4),
                                   b["ffh"], d[f"geglu_{wtag}"]),
-                "mv_down": self._bg("matvec_wg", w[p + "mlp.down_proj.weight"],
+                "mv_down": self._bg(self._kn["matvec_wg"], w[p + "mlp.down_proj.weight"],
                                     b["ffh"], b["mlp_out"], d[f"mv_down_{wtag}"]),
                 "norm_pff_add": self._bg("rmsnorm_add_wg", b["mlp_out"],
                                          w[p + "post_feedforward_layernorm.weight"],
                                          b["x"], d["norm_h"]),
             }
             if spec.kv_shared:
-                bg["mv_q"] = self._bg("matvec_wg", w[p + "self_attn.q_proj.weight"],
+                bg["mv_q"] = self._bg(self._kn["matvec_wg"], w[p + "self_attn.q_proj.weight"],
                                       b["xn"], (qkv, 0, q_bytes), d[f"mv_q_{tag}"])
             else:
-                bg["mv_qkv"] = self._bg("matvec_wg", w[p + "self_attn.qkv_proj.weight"],
+                bg["mv_qkv"] = self._bg(self._kn["matvec_wg"], w[p + "self_attn.qkv_proj.weight"],
                                         b["xn"], qkv, d[f"mv_qkv_{tag}"])
                 bg["knorm"] = self._bg("rmsnorm_wg", (qkv, q_bytes, kv_bytes),
                                        w[p + "self_attn.k_norm.weight"],
@@ -385,13 +411,13 @@ class Gemma4GPU:
                                        d[f"kv_append_{tag}"])
             if self.ple:
                 bg["mv_ple_gate"] = self._bg(
-                    "matvec_wg", w[p + "per_layer_input_gate.weight"],
+                    self._kn["matvec_wg"], w[p + "per_layer_input_gate.weight"],
                     b["x"], b["ple_g"], d["mv_ple_gate"])
                 bg["geglu_ple"] = self._bg(
                     "geglu", b["ple_g"], (b["ple_in"], L * ple_bytes, ple_bytes),
                     b["ple_h"], d["geglu_ple"])
                 bg["mv_ple_proj"] = self._bg(
-                    "matvec_wg", w[p + "per_layer_projection.weight"],
+                    self._kn["matvec_wg"], w[p + "per_layer_projection.weight"],
                     b["ple_h"], b["ple_proj"], d["mv_ple_proj"])
                 bg["norm_ple"] = self._bg(
                     "rmsnorm_wg", b["ple_proj"],
@@ -435,9 +461,9 @@ class Gemma4GPU:
         nh, h = cfg.num_heads, cfg.hidden_size
         ple_h = cfg.hidden_size_per_layer_input
         ple_n = cfg.num_layers * ple_h
-        run("embed_scale", self.bg_embed, h, label="embed")
+        run(self._kn["embed_scale"], self.bg_embed, h, label="embed")
         if self.ple:
-            run("matvec_wg", self.bg_ple_ctx, ple_n, label="mv_ple_ctx",
+            run(self._kn["matvec_wg"], self.bg_ple_ctx, ple_n, label="mv_ple_ctx",
                 grid=(ple_n, 1, 1))
             run("rmsnorm_wg", self.bg_ple_ctx_norm, ple_n, label="norm_ple_ctx",
                 grid=(cfg.num_layers, 1, 1))
@@ -447,10 +473,10 @@ class Gemma4GPU:
             hd, q_dim, inter = spec.head_dim, spec.q_dim, spec.intermediate
             run("rmsnorm_wg", bg["norm1"], h, label="norm_input", grid=(1, 1, 1))
             if spec.kv_shared:
-                run("matvec_wg", bg["mv_q"], q_dim, label="mv_qkv",
+                run(self._kn["matvec_wg"], bg["mv_q"], q_dim, label="mv_qkv",
                     grid=(q_dim, 1, 1))
             else:
-                run("matvec_wg", bg["mv_qkv"], q_dim + 2 * hd, label="mv_qkv",
+                run(self._kn["matvec_wg"], bg["mv_qkv"], q_dim + 2 * hd, label="mv_qkv",
                     grid=(q_dim + 2 * hd, 1, 1))
             run("rmsnorm_wg", bg["qnorm"], q_dim, label="qk_norm", grid=(nh, 1, 1))
             run("rope_pl", bg["rope_q"], nh * hd // 2, label="rope")
@@ -462,21 +488,21 @@ class Gemma4GPU:
                 run("kv_append", bg["app_v"], hd, label="kv_append")
             run("attention_fused_g4", bg["attn"], nh * 64, label="attn_fused",
                 grid=(nh, 1, 1))
-            run("matvec_wg", bg["mv_o"], h, label="mv_o", grid=(h, 1, 1))
+            run(self._kn["matvec_wg"], bg["mv_o"], h, label="mv_o", grid=(h, 1, 1))
             run("rmsnorm_add_wg", bg["norm_pa_add"], h, label="norm_post_add",
                 grid=(1, 1, 1))
             run("rmsnorm_wg", bg["norm_pf"], h, label="norm_pre_ff", grid=(1, 1, 1))
-            run("matvec_wg", bg["mv_gateup"], 2 * inter, label="mv_gateup",
+            run(self._kn["matvec_wg"], bg["mv_gateup"], 2 * inter, label="mv_gateup",
                 grid=(2 * inter, 1, 1))
             run("geglu", bg["geglu"], inter, label="geglu")
-            run("matvec_wg", bg["mv_down"], h, label="mv_down", grid=(h, 1, 1))
+            run(self._kn["matvec_wg"], bg["mv_down"], h, label="mv_down", grid=(h, 1, 1))
             run("rmsnorm_add_wg", bg["norm_pff_add"], h, label="norm_post_add",
                 grid=(1, 1, 1))
             if self.ple:
-                run("matvec_wg", bg["mv_ple_gate"], ple_h, label="mv_ple",
+                run(self._kn["matvec_wg"], bg["mv_ple_gate"], ple_h, label="mv_ple",
                     grid=(ple_h, 1, 1))
                 run("geglu", bg["geglu_ple"], ple_h, label="geglu")
-                run("matvec_wg", bg["mv_ple_proj"], h, label="mv_ple",
+                run(self._kn["matvec_wg"], bg["mv_ple_proj"], h, label="mv_ple",
                     grid=(h, 1, 1))
                 run("rmsnorm_wg", bg["norm_ple"], h, label="norm_ple", grid=(1, 1, 1))
                 run("add_scale", bg["add_scale"], h, label="add_scale")
@@ -484,7 +510,7 @@ class Gemma4GPU:
         if want_logits:
             run("rmsnorm_wg", self.bg_final_norm, h, label="norm_final", grid=(1, 1, 1))
             for rows, bg in self.bg_logits_chunks:
-                run("matvec_wg", bg, rows, label="mv_logits", grid=(rows, 1, 1))
+                run(self._kn["matvec_wg"], bg, rows, label="mv_logits", grid=(rows, 1, 1))
             run("softcap", self.bg_softcap, cfg.vocab_size, label="softcap")
 
     def step(self, token_id: int, pos: int, want_logits: bool = True) -> np.ndarray | None:

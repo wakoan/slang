@@ -144,10 +144,24 @@ def matvec_dq2(
     if r < n_out:
         for j in range(li, n16, 64):
             p: u32 = w_packed[r * n16 + j]
-            base: u32 = 16 * j
-            for m in range(16):
-                v: i32 = i32((p >> (2 * m)) & 3) - 2
-                acc += f32(v) * x_in[base + m]
+            b: u32 = 16 * j
+            # unrolled constant shifts — a variable-shift loop is ~2.5x slower
+            acc += f32(i32(p & 3) - 2) * x_in[b]
+            acc += f32(i32((p >> 2) & 3) - 2) * x_in[b + 1]
+            acc += f32(i32((p >> 4) & 3) - 2) * x_in[b + 2]
+            acc += f32(i32((p >> 6) & 3) - 2) * x_in[b + 3]
+            acc += f32(i32((p >> 8) & 3) - 2) * x_in[b + 4]
+            acc += f32(i32((p >> 10) & 3) - 2) * x_in[b + 5]
+            acc += f32(i32((p >> 12) & 3) - 2) * x_in[b + 6]
+            acc += f32(i32((p >> 14) & 3) - 2) * x_in[b + 7]
+            acc += f32(i32((p >> 16) & 3) - 2) * x_in[b + 8]
+            acc += f32(i32((p >> 18) & 3) - 2) * x_in[b + 9]
+            acc += f32(i32((p >> 20) & 3) - 2) * x_in[b + 10]
+            acc += f32(i32((p >> 22) & 3) - 2) * x_in[b + 11]
+            acc += f32(i32((p >> 24) & 3) - 2) * x_in[b + 12]
+            acc += f32(i32((p >> 26) & 3) - 2) * x_in[b + 13]
+            acc += f32(i32((p >> 28) & 3) - 2) * x_in[b + 14]
+            acc += f32(i32((p >> 30) & 3) - 2) * x_in[b + 15]
     partial[li] = acc
     barrier()
     s: u32 = 32

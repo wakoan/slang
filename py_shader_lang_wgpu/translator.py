@@ -31,6 +31,7 @@ round saturate sign sin sinh smoothstep sqrt step tan tanh transpose trunc
 select arrayLength
 pack2x16float unpack2x16float pack2x16snorm pack2x16unorm pack4x8snorm
 pack4x8unorm unpack2x16snorm unpack2x16unorm unpack4x8snorm unpack4x8unorm
+pack4xI8 pack4xU8 unpack4xI8 unpack4xU8 dot4I8Packed dot4U8Packed
 f32 u32 i32 f16 bool vec2 vec3 vec4
 """.split())
 

@@ -73,6 +73,54 @@ def matvec_dq4(
 
 
 @kernel(workgroup_size=(64,))
+def qat_embed_2bit(
+    gid: Builtin.global_invocation_id,
+    token: StorageBuffer[u32, "read"],        # [1] token id
+    table: StorageBuffer[u32, "read"],        # [vocab, hidden/16] packed int2
+    scale: StorageBuffer[f32, "read"],        # [vocab] per-row scale
+    x_out: StorageBuffer[f32, "read_write"],  # [hidden]
+    fparams: StorageBuffer[f32, "read"],      # [embed_scale] = sqrt(hidden)
+    dims: StorageBuffer[u32, "read"],         # [hidden]
+):
+    # 2-bit embedding gather: x_out[i] = (crumb - 2) * scale[token] * embed_scale
+    i: u32 = gid.x
+    hidden: u32 = dims[0]
+    if i >= hidden:
+        return
+    t: u32 = token[0]
+    row: u32 = hidden / 16
+    word: u32 = table[t * row + i / 16]
+    v: i32 = i32((word >> (2 * (i % 16))) & 3) - 2
+    x_out[i] = f32(v) * scale[t] * fparams[0]
+
+
+@kernel(workgroup_size=(64,))
+def qat_ple_gather_4bit(
+    gid: Builtin.global_invocation_id,
+    token: StorageBuffer[u32, "read"],        # [1] token id
+    table: StorageBuffer[u32, "read"],        # [vocab, n/8] packed int4
+    scale: StorageBuffer[f32, "read"],        # [vocab, n_layers] per-layer scale
+    out: StorageBuffer[f32, "read_write"],    # [n] = n_layers*ple_hidden
+    fparams: StorageBuffer[f32, "read"],      # [ple_embed_scale] = sqrt(ple_hidden)
+    dims: StorageBuffer[u32, "read"],         # [n, ple_hidden, n_layers]
+):
+    # 4-bit PLE table gather: out[i] = (nibble - 8) * scale[token, layer]
+    #                                  * ple_embed_scale, layer = i / ple_hidden
+    i: u32 = gid.x
+    n: u32 = dims[0]
+    ple_hidden: u32 = dims[1]
+    n_layers: u32 = dims[2]
+    if i >= n:
+        return
+    t: u32 = token[0]
+    row: u32 = n / 8
+    word: u32 = table[t * row + i / 8]
+    v: i32 = i32((word >> (4 * (i % 8))) & 15) - 8
+    layer: u32 = i / ple_hidden
+    out[i] = f32(v) * scale[t * n_layers + layer] * fparams[0]
+
+
+@kernel(workgroup_size=(64,))
 def matvec_dq2(
     wid: Builtin.workgroup_id,
     lid: Builtin.local_invocation_id,

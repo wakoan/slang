@@ -273,6 +273,7 @@ class Gemma4QATGPU:
     # -- matvec dispatch -------------------------------------------------- #
 
     def _mv_kernel(self, rec: dict) -> str:
+        # scalar dq beats vec4-with-dynamic-index (wv[c] spills on Apple GPUs)
         return {"dq4": "matvec_dq4", "dq2": "matvec_dq2",
                 "f16": "matvec_wg_packed_v4"}[rec["kind"]]
 

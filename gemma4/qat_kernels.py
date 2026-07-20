@@ -24,6 +24,8 @@ from py_shader_lang_wgpu.types import (
     u32,
 )
 
+from . import kernels as K4
+
 
 @kernel(workgroup_size=(64,))
 def matvec_dq4(
@@ -156,3 +158,21 @@ def matvec_dq2(
         s = s / 2
     if li == 0 and r < n_out:
         y_out[r] = partial[0] * scale[r]
+
+
+# Registry for the QAT runner: reusable base gemma4 kernels (norms, rope,
+# attention, geglu, argmax, resident-decode helpers, f16 matvec for 8-bit /
+# unquantized modules) plus the QAT-specific dequant matmuls and gathers.
+_REUSE = (
+    "rmsnorm_wg", "rmsnorm_ns_wg", "rmsnorm_add_wg", "rmsnorm_add_norm_wg",
+    "rmsnorm_add_scale_wg", "rope_pl", "attention_fused_g4", "geglu",
+    "kv_append", "combine_scaled", "softcap", "argmax_stage1", "argmax_stage2",
+    "step_setup_g4", "matvec_wg_packed_v4",
+)
+KERNELS = {name: K4.KERNELS[name] for name in _REUSE}
+KERNELS.update({
+    "matvec_dq4": matvec_dq4,
+    "matvec_dq2": matvec_dq2,
+    "qat_embed_2bit": qat_embed_2bit,
+    "qat_ple_gather_4bit": qat_ple_gather_4bit,
+})

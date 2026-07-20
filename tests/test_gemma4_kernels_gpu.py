@@ -91,6 +91,21 @@ class TestRmsNormNoScale:
         np.testing.assert_allclose(res[1], rms_norm_noscale(x), rtol=1e-4, atol=1e-5)
 
 
+class TestMatvecPackedV4:
+    @pytest.mark.parametrize("n_out,n_in", [(512, 1536), (1536, 6144), (256, 256)])
+    def test_matches_numpy(self, device, n_out, n_in):
+        W16 = (rng.standard_normal((n_out, n_in), dtype=np.float32) * 0.05).astype(np.float16)
+        w_view = np.frombuffer(W16.tobytes(), dtype=np.uint32).reshape(n_out, n_in // 2)
+        x = rng.standard_normal(n_in, dtype=np.float32)
+        y = np.zeros(n_out, dtype=np.float32)
+        res = run_kernel(
+            device, K4.matvec_wg_packed_v4,
+            [(w_view, False), (x, False), (y, True), (u32(n_out, n_in), False)],
+            (n_out, 1, 1),
+        )
+        np.testing.assert_allclose(res[2], W16.astype(np.float32) @ x, rtol=1e-4, atol=1e-4)
+
+
 class TestRmsNormAddNorm:
     def test_matches_two_separate_norms(self, device):
         from gemma3.reference import rms_norm

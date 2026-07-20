@@ -20,6 +20,7 @@ from py_shader_lang_wgpu.types import (
     f16,
     f32,
     u32,
+    vec4,
 )
 
 from gemma3.kernels import (
@@ -209,6 +210,51 @@ def attention_fused_g4_sg(
         for t in range(start, kv_len):
             acc += scores[base + t] * v_cache[t * head_dim + d]
         out_vec[h * head_dim + d] = acc / denom
+
+
+@kernel(workgroup_size=(64,))
+def matvec_wg_packed_v4(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    w_mat: StorageBuffer[vec4[u32], "read"],  # [n_out, n_in/8]: 4 u32 = 8 packed f16
+    x_in: StorageBuffer[vec4[f32], "read"],   # [n_in/4]
+    y_out: StorageBuffer[f32, "read_write"],  # [n_out]
+    dims: StorageBuffer[u32, "read"],         # [n_out, n_in] (n_in % 8 == 0)
+    partial: WorkgroupArray[f32, 64],
+):
+    # matvec_wg_packed with vec4 loads: 8 f16 weights + 8 activations per
+    # iteration (one vec4<u32> + two vec4<f32>), for higher achieved
+    # bandwidth on the big f16 matvecs. Requires n_in divisible by 8.
+    r: u32 = wid.x
+    li: u32 = lid.x
+    n_out: u32 = dims[0]
+    n_in: u32 = dims[1]
+    n8: u32 = n_in / 8
+
+    acc: f32 = 0.0
+    if r < n_out:
+        for j in range(li, n8, 64):
+            wv = w_mat[r * n8 + j]
+            p0 = unpack2x16float(wv.x)
+            p1 = unpack2x16float(wv.y)
+            p2 = unpack2x16float(wv.z)
+            p3 = unpack2x16float(wv.w)
+            xa = x_in[2 * j]
+            xb = x_in[2 * j + 1]
+            acc += p0.x * xa.x + p0.y * xa.y + p1.x * xa.z + p1.y * xa.w
+            acc += p2.x * xb.x + p2.y * xb.y + p3.x * xb.z + p3.y * xb.w
+    partial[li] = acc
+    barrier()
+
+    s: u32 = 32
+    while s > 0:
+        if li < s:
+            partial[li] = partial[li] + partial[li + s]
+        barrier()
+        s = s / 2
+
+    if li == 0 and r < n_out:
+        y_out[r] = partial[0]
 
 
 @kernel(workgroup_size=(64,))
@@ -457,6 +503,7 @@ KERNELS = {
     "embed_scale_f16": embed_scale_f16,
     "matvec_wg": matvec_wg,
     "matvec_wg_packed": matvec_wg_packed,
+    "matvec_wg_packed_v4": matvec_wg_packed_v4,
     "matvec_wg_packed_sg": matvec_wg_packed_sg,
     "rmsnorm_wg_sg": rmsnorm_wg_sg,
     "rmsnorm_add_wg_sg": rmsnorm_add_wg_sg,

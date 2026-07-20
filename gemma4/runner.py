@@ -142,9 +142,11 @@ class Gemma4GPU:
         # resolved kernel names per call-site family
         f16 = self.dtype == "f16"
         sg = "_sg" if self.use_subgroups else ""
+        # f16 matvec uses vec4 loads (8 f16/iter); all our n_in are % 8 == 0.
+        # v4 has no subgroup variant, but subgroups are off for E2B anyway.
         self._kn = {
             "embed_scale": "embed_scale_f16" if f16 else "embed_scale",
-            "matvec_wg": ("matvec_wg_packed" + sg) if f16 else "matvec_wg",
+            "matvec_wg": "matvec_wg_packed_v4" if f16 else "matvec_wg",
             "rmsnorm_wg": "rmsnorm_wg" + sg,
             "rmsnorm_add_wg": "rmsnorm_add_wg" + sg,
             "attention_fused_g4": "attention_fused_g4" + sg,

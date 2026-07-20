@@ -520,8 +520,71 @@ class Gemma4QATGPU:
     def read_hidden(self):
         return np.frombuffer(self.device.queue.read_buffer(self.b["x"]), np.float32).copy()
 
-    def generate(self, prompt_ids, max_new_tokens=64, on_token=None):
-        """Greedy decode (GPU argmax, CPU-driven per step: PLE gather needs the token)."""
+    def _encode_chunk(self, k: int):
+        enc = self.device.create_command_encoder()
+        cp = enc.begin_compute_pass()
+
+        def run(name, bg, n, wg=64, label=None, grid=None):
+            pipe, _ = self._pipelines[name]
+            cp.set_pipeline(pipe)
+            cp.set_bind_group(0, bg)
+            cp.dispatch_workgroups(*(grid or ((n + wg - 1) // wg, 1, 1)))
+
+        for _ in range(k):
+            run("step_setup_g4", self.bg_setup, 1, grid=(1, 1, 1))
+            self._encode(run, argmax=True)
+        cp.end()
+        return enc.finish()
+
+    def _generate_resident(self, prompt_ids, max_new_tokens, on_token):
+        """GPU-resident greedy decode: step params, PLE gather, argmax feedback
+        stay on-device; the CPU reads out_tokens once per chunk (EOS check)."""
+        q = self.device.queue
+        for pos, tid in enumerate(prompt_ids[:-1]):
+            self._write_step_params(tid, pos)
+            self.step(tid, pos, argmax=False)  # prefill (logits unused)
+        start = len(prompt_ids) - 1
+        self._write_step_params(prompt_ids[-1], start)
+        q.write_buffer(self.b["pos"], 0, np.array([start], np.uint32).tobytes())
+        q.write_buffer(self.b["counter"], 0, np.zeros(1, np.uint32).tobytes())
+
+        budget = min(max_new_tokens, self.max_seq - start)
+        sizes, c, left = [], min(8, 64), budget
+        while left > 0:
+            k = min(c, left)
+            sizes.append(k)
+            left -= k
+            c = min(c * 2, 64)
+
+        out, emitted, produced = [], 0, 0
+        cmd = self._encode_chunk(sizes[0])
+        t0 = time.perf_counter()
+        q.submit([cmd])
+        for i, k in enumerate(sizes):
+            nxt = self._encode_chunk(sizes[i + 1]) if i + 1 < len(sizes) else None
+            produced += k
+            toks = np.frombuffer(q.read_buffer(self.b["out_tokens"], size=produced * 4), np.uint32)
+            self._prof_steps.append((start + produced, (time.perf_counter() - t0) / k, True))
+            t0 = time.perf_counter()
+            stop = False
+            for tid in toks[emitted:]:
+                tid = int(tid)
+                out.append(tid)
+                if on_token:
+                    on_token(tid)
+                emitted += 1
+                if tid in self.cfg.eos_token_ids:
+                    stop = True
+                    break
+            if stop or nxt is None:
+                break
+            q.submit([nxt])
+        return out
+
+    def generate(self, prompt_ids, max_new_tokens=64, on_token=None, resident=True):
+        """Greedy decode. Resident keeps the whole loop on-GPU (chunked)."""
+        if resident and not self.profile:
+            return self._generate_resident(prompt_ids, max_new_tokens, on_token)
         q = self.device.queue
         q.write_buffer(self.b["counter"], 0, np.zeros(1, np.uint32).tobytes())
         nxt = None

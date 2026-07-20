@@ -78,12 +78,22 @@ class ReferenceGemma4:
     def _w(self, name: str) -> np.ndarray:
         return self.idx.tensor(name)
 
+    def _embed_row(self, token_id: int) -> np.ndarray:
+        """Unscaled embedding row [hidden] (overridable for quantized tables)."""
+        return bf16_to_f32(self.idx.raw(PREFIX + "embed_tokens.weight")[token_id])
+
+    def _ple_table_row(self, token_id: int) -> np.ndarray:
+        """Unscaled per-layer embedding row [num_layers, ple_hidden]."""
+        cfg = self.cfg
+        table = self.idx.raw(PREFIX + "embed_tokens_per_layer.weight")
+        return bf16_to_f32(table[token_id]).reshape(
+            cfg.num_layers, cfg.hidden_size_per_layer_input)
+
     def _ple_input(self, token_id: int, x: np.ndarray) -> np.ndarray:
         """Per-layer input [num_layers, 256], computed once per token."""
         cfg = self.cfg
         n, d = cfg.num_layers, cfg.hidden_size_per_layer_input
-        table = self.idx.raw(PREFIX + "embed_tokens_per_layer.weight")
-        ple = bf16_to_f32(table[token_id]).reshape(n, d) * np.float32(cfg.ple_scale)
+        ple = self._ple_table_row(token_id) * np.float32(cfg.ple_scale)
         ctx = self._w(PREFIX + "per_layer_model_projection.weight") @ x
         ctx = ctx.reshape(n, d) * np.float32(cfg.hidden_size ** -0.5)
         ctx = rms_norm(ctx, self._w(PREFIX + "per_layer_projection_norm.weight"),
@@ -156,8 +166,7 @@ class ReferenceGemma4:
                 collect_hidden: bool = False) -> np.ndarray | tuple:
         """Process one token at `pos`; returns logits (and per-layer hiddens)."""
         cfg = self.cfg
-        embed_raw = self.idx.raw(PREFIX + "embed_tokens.weight")
-        x = bf16_to_f32(embed_raw[token_id]) * np.float32(cfg.embed_scale)
+        x = self._embed_row(token_id) * np.float32(cfg.embed_scale)
         ple_in = self._ple_input(token_id, x) if self.ple else None
         hiddens = [x.copy()]
         for layer in range(cfg.num_layers):

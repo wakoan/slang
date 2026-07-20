@@ -83,7 +83,8 @@ class QATIndex:
         return name in self._names
 
     def is_quantized(self, module: str) -> bool:
-        return f"model.{module}.weight" in self._names
+        # quantized linears carry a per-row weight_scale; bf16 ones don't
+        return f"model.{module}.weight_scale" in self._names
 
     # -- linear weights --------------------------------------------------- #
 
@@ -110,6 +111,14 @@ class QATIndex:
         ints = unpack_bits(packed, bits).astype(np.float32)  # [n_cols]
         block = n_cols // scale.shape[-1]
         return ints * np.repeat(scale, block)
+
+    def dequant_embedding_full(self, table: str, bits: int, n_cols: int) -> np.ndarray:
+        """Full dequantized embedding table [vocab, n_cols] (for the tied lm_head)."""
+        packed = self.idx.raw(f"model.{table}.embedding_quantized")
+        scale = self.idx.tensor(f"model.{table}.embedding_scale")  # [vocab, n_blocks]
+        ints = unpack_bits(packed, bits).astype(np.float32)
+        block = n_cols // scale.shape[-1]
+        return ints * np.repeat(scale, block, axis=-1)
 
     def activation_scales_all_zero(self) -> bool:
         """True if every *activation* scale is 0 (weight-only == exact)."""

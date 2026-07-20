@@ -114,6 +114,25 @@ class TestRmsNormAddNorm:
         np.testing.assert_allclose(res[4], xn_after, rtol=1e-4, atol=1e-5)
 
 
+class TestRmsNormAddScale:
+    def test_matches_norm_then_add_scale(self, device):
+        from gemma3.reference import rms_norm
+
+        n = 1536
+        src = rng.standard_normal(n, dtype=np.float32)
+        x = rng.standard_normal(n, dtype=np.float32)
+        w = rng.standard_normal(n, dtype=np.float32) * 0.1
+        scale = 0.535
+        res = run_kernel(
+            device, K4.rmsnorm_add_scale_wg,
+            [(src, False), (w, False), (x.copy(), True),
+             (f32a(scale), False), (u32(1, n), False)],
+            (1, 1, 1),
+        )
+        expected = (x + rms_norm(src, w)) * np.float32(scale)
+        np.testing.assert_allclose(res[2], expected, rtol=1e-4, atol=1e-5)
+
+
 class TestSoftcap:
     def test_matches_numpy(self, device):
         n = 1000

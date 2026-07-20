@@ -273,7 +273,7 @@ class Gemma4GPU:
             "logits": fbuf(cfg.vocab_size),
             "ple_ctx": fbuf(ple_n), "ple_ctx_n": fbuf(ple_n), "ple_in": fbuf(ple_n),
             "ple_g": fbuf(ple_h), "ple_h": fbuf(ple_h),
-            "ple_proj": fbuf(h), "ple_norm": fbuf(h),
+            "ple_proj": fbuf(h),
         }
         self.b["token"] = self.device.create_buffer(
             size=4, usage=upd | wgpu.BufferUsage.COPY_SRC)
@@ -311,7 +311,6 @@ class Gemma4GPU:
             "embed": ubuf(h),
             "norm_h": ubuf(1, h),
             "geglu_ple": ubuf(ple_h),
-            "add": ubuf(h),
             "mv_ple_ctx": ubuf(ple_n, h),
             "norm_ple_rows": ubuf(cfg.num_layers, ple_h),
             "combine": ubuf(ple_n),
@@ -520,12 +519,11 @@ class Gemma4GPU:
                 bg["mv_ple_proj"] = self._bg(
                     self._kn["matvec_wg"], w[p + "per_layer_projection.weight"],
                     b["ple_h"], b["ple_proj"], d["mv_ple_proj"])
-                bg["norm_ple"] = self._bg(
-                    self._kn["rmsnorm_wg"], b["ple_proj"],
+                # fused PLE post-norm + scaled residual add (one dispatch)
+                bg["norm_ple_add"] = self._bg(
+                    "rmsnorm_add_scale_wg", b["ple_proj"],
                     w[p + "post_per_layer_input_norm.weight"],
-                    b["ple_norm"], d["norm_h"])
-                bg["add_scale"] = self._bg(
-                    "add_scale", b["ple_norm"], b["x"], self._fp_scalar[L], d["add"])
+                    b["x"], self._fp_scalar[L], d["norm_h"])
             self.layer_bgs.append(bg)
 
     # ------------------------------------------------------------------ #
@@ -604,8 +602,8 @@ class Gemma4GPU:
                 run("geglu", bg["geglu_ple"], ple_h, label="geglu")
                 run(self._kn["matvec_wg"], bg["mv_ple_proj"], h, label="mv_ple",
                     grid=(h, 1, 1))
-                run(self._kn["rmsnorm_wg"], bg["norm_ple"], h, label="norm_ple", grid=(1, 1, 1))
-                run("add_scale", bg["add_scale"], h, label="add_scale")
+                run("rmsnorm_add_scale_wg", bg["norm_ple_add"], h,
+                    label="norm_ple_add", grid=(1, 1, 1))
 
         if want_logits or argmax:
             run(self._kn["rmsnorm_wg"], self.bg_final_norm, h, label="norm_final", grid=(1, 1, 1))

@@ -308,6 +308,46 @@ def rmsnorm_add_norm_wg(
 
 
 @kernel(workgroup_size=(64,))
+def rmsnorm_add_scale_wg(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    src: StorageBuffer[f32, "read"],          # [n_rows, row_len] PLE projection
+    w: StorageBuffer[f32, "read"],            # [row_len] norm weight (w-1)
+    x_io: StorageBuffer[f32, "read_write"],   # [n_rows, row_len] residual accumulator
+    fparams: StorageBuffer[f32, "read"],      # [scale] = learned layer_scalar
+    dims: StorageBuffer[u32, "read"],         # [n_rows, row_len]
+    partial: WorkgroupArray[f32, 64],
+):
+    # Fuses the PLE post-norm with the scaled residual add that ends the
+    # per-layer-embedding block (one dispatch, no separate ple_norm buffer):
+    #   x_io = (x_io + rmsnorm(src) * (1 + w)) * scale
+    row: u32 = wid.x
+    li: u32 = lid.x
+    n_rows: u32 = dims[0]
+    row_len: u32 = dims[1]
+
+    acc: f32 = 0.0
+    if row < n_rows:
+        for j in range(li, row_len, 64):
+            v: f32 = src[row * row_len + j]
+            acc += v * v
+    partial[li] = acc
+    barrier()
+    s: u32 = 32
+    while s > 0:
+        if li < s:
+            partial[li] = partial[li] + partial[li + s]
+        barrier()
+        s = s / 2
+    inv: f32 = 1.0 / sqrt(partial[0] / f32(row_len) + 1e-6)
+    scale: f32 = fparams[0]
+    if row < n_rows:
+        for j in range(li, row_len, 64):
+            idx: u32 = row * row_len + j
+            x_io[idx] = (x_io[idx] + src[idx] * inv * (1.0 + w[j])) * scale
+
+
+@kernel(workgroup_size=(64,))
 def softcap(
     gid: Builtin.global_invocation_id,
     x_io: StorageBuffer[f32, "read_write"],   # [n] logits
@@ -432,6 +472,7 @@ KERNELS = {
     "attention_fused_g4": attention_fused_g4,
     "attention_fused_g4_sg": attention_fused_g4_sg,
     "rmsnorm_add_norm_wg": rmsnorm_add_norm_wg,
+    "rmsnorm_add_scale_wg": rmsnorm_add_scale_wg,
     "rmsnorm_ns_wg": rmsnorm_ns_wg,
     "softcap": softcap,
     "add_scale": add_scale,

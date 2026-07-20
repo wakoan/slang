@@ -478,12 +478,11 @@ class Gemma4GPU:
                                  b["scores"], b["attn"], scores_d),
                 "mv_o": self._bg(self._kn["matvec_wg"], w[p + "self_attn.o_proj.weight"],
                                  b["attn"], b["attn_proj"], d[f"mv_o_{tag}"]),
-                "norm_pa_add": self._bg(self._kn["rmsnorm_add_wg"], b["attn_proj"],
-                                        w[p + "post_attention_layernorm.weight"],
-                                        b["x"], d["norm_h"]),
-                "norm_pf": self._bg(self._kn["rmsnorm_wg"], b["x"],
-                                    w[p + "pre_feedforward_layernorm.weight"],
-                                    b["xn"], d["norm_h"]),
+                # fused post-attention add-norm + pre-FFN norm (one dispatch)
+                "norm_pa_pf": self._bg("rmsnorm_add_norm_wg", b["attn_proj"],
+                                       w[p + "post_attention_layernorm.weight"],
+                                       w[p + "pre_feedforward_layernorm.weight"],
+                                       b["x"], b["xn"], d["norm_h"]),
                 "mv_gateup": self._bg(self._kn["matvec_wg"], w[p + "mlp.gateup_proj.weight"],
                                       b["xn"], gu, d[f"mv_gateup_{wtag}"]),
                 "geglu": self._bg("geglu", (gu, 0, inter * 4), (gu, inter * 4, inter * 4),
@@ -591,9 +590,8 @@ class Gemma4GPU:
             run(self._kn["attention_fused_g4"], bg["attn"], nh * 64, label="attn_fused",
                 grid=(nh, 1, 1))
             run(self._kn["matvec_wg"], bg["mv_o"], h, label="mv_o", grid=(h, 1, 1))
-            run(self._kn["rmsnorm_add_wg"], bg["norm_pa_add"], h, label="norm_post_add",
+            run("rmsnorm_add_norm_wg", bg["norm_pa_pf"], h, label="norm_add_norm",
                 grid=(1, 1, 1))
-            run(self._kn["rmsnorm_wg"], bg["norm_pf"], h, label="norm_pre_ff", grid=(1, 1, 1))
             run(self._kn["matvec_wg"], bg["mv_gateup"], 2 * inter, label="mv_gateup",
                 grid=(2 * inter, 1, 1))
             run("geglu", bg["geglu"], inter, label="geglu")

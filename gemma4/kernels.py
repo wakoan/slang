@@ -248,6 +248,66 @@ def rmsnorm_ns_wg(
 
 
 @kernel(workgroup_size=(64,))
+def rmsnorm_add_norm_wg(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    src: StorageBuffer[f32, "read"],          # [n_rows, row_len] branch output
+    w1: StorageBuffer[f32, "read"],           # [row_len] add-norm weight (w-1)
+    w2: StorageBuffer[f32, "read"],           # [row_len] second-norm weight (w-1)
+    x_io: StorageBuffer[f32, "read_write"],   # [n_rows, row_len] residual accumulator
+    x_out: StorageBuffer[f32, "read_write"],  # [n_rows, row_len] second-norm output
+    dims: StorageBuffer[u32, "read"],         # [n_rows, row_len]
+    partial: WorkgroupArray[f32, 64],
+):
+    # Fuses rmsnorm_add + rmsnorm (Gemma 4 post-attention residual add-norm
+    # then pre-FFN norm) in one workgroup, saving a dispatch and a re-read
+    # of the residual from VRAM:
+    #   x_io  += rmsnorm(src) * (1 + w1)
+    #   x_out  = rmsnorm(x_io) * (1 + w2)
+    row: u32 = wid.x
+    li: u32 = lid.x
+    n_rows: u32 = dims[0]
+    row_len: u32 = dims[1]
+
+    acc: f32 = 0.0
+    if row < n_rows:
+        for j in range(li, row_len, 64):
+            v: f32 = src[row * row_len + j]
+            acc += v * v
+    partial[li] = acc
+    barrier()
+    s: u32 = 32
+    while s > 0:
+        if li < s:
+            partial[li] = partial[li] + partial[li + s]
+        barrier()
+        s = s / 2
+    inv1: f32 = 1.0 / sqrt(partial[0] / f32(row_len) + 1e-6)
+    barrier()  # all lanes read partial[0] before it is overwritten below
+
+    acc2: f32 = 0.0
+    if row < n_rows:
+        for j in range(li, row_len, 64):
+            idx: u32 = row * row_len + j
+            v2: f32 = x_io[idx] + src[idx] * inv1 * (1.0 + w1[j])
+            x_io[idx] = v2
+            acc2 += v2 * v2
+    partial[li] = acc2
+    barrier()
+    s = 32
+    while s > 0:
+        if li < s:
+            partial[li] = partial[li] + partial[li + s]
+        barrier()
+        s = s / 2
+    inv2: f32 = 1.0 / sqrt(partial[0] / f32(row_len) + 1e-6)
+    if row < n_rows:
+        for j in range(li, row_len, 64):
+            idx2: u32 = row * row_len + j
+            x_out[idx2] = x_io[idx2] * inv2 * (1.0 + w2[j])
+
+
+@kernel(workgroup_size=(64,))
 def softcap(
     gid: Builtin.global_invocation_id,
     x_io: StorageBuffer[f32, "read_write"],   # [n] logits
@@ -371,6 +431,7 @@ KERNELS = {
     "rope_pl": rope_pl,
     "attention_fused_g4": attention_fused_g4,
     "attention_fused_g4_sg": attention_fused_g4_sg,
+    "rmsnorm_add_norm_wg": rmsnorm_add_norm_wg,
     "rmsnorm_ns_wg": rmsnorm_ns_wg,
     "softcap": softcap,
     "add_scale": add_scale,

@@ -91,6 +91,29 @@ class TestRmsNormNoScale:
         np.testing.assert_allclose(res[1], rms_norm_noscale(x), rtol=1e-4, atol=1e-5)
 
 
+class TestRmsNormAddNorm:
+    def test_matches_two_separate_norms(self, device):
+        from gemma3.reference import rms_norm
+
+        n = 1536
+        src = rng.standard_normal(n, dtype=np.float32)
+        x = rng.standard_normal(n, dtype=np.float32)
+        w1 = rng.standard_normal(n, dtype=np.float32) * 0.1
+        w2 = rng.standard_normal(n, dtype=np.float32) * 0.1
+        xn = np.zeros(n, dtype=np.float32)
+        res = run_kernel(
+            device, K4.rmsnorm_add_norm_wg,
+            [(src, False), (w1, False), (w2, False),
+             (x.copy(), True), (xn, True), (u32(1, n), False)],
+            (1, 1, 1),
+        )
+        # kernel uses (1 + w) like the separate rmsnorm kernels it replaces
+        x_after = x + rms_norm(src, w1)
+        xn_after = rms_norm(x_after, w2)
+        np.testing.assert_allclose(res[3], x_after, rtol=1e-4, atol=1e-5)
+        np.testing.assert_allclose(res[4], xn_after, rtol=1e-4, atol=1e-5)
+
+
 class TestSoftcap:
     def test_matches_numpy(self, device):
         n = 1000

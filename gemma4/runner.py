@@ -231,8 +231,17 @@ class Gemma4GPU:
             "ple_g": fbuf(ple_h), "ple_h": fbuf(ple_h),
             "ple_proj": fbuf(h), "ple_norm": fbuf(h),
         }
-        self.b["token"] = self.device.create_buffer(size=4, usage=upd)
+        self.b["token"] = self.device.create_buffer(
+            size=4, usage=upd | wgpu.BufferUsage.COPY_SRC)
         self.b["ple_tok"] = self.device.create_buffer(size=ple_n * 4, usage=upd)
+        # GPU argmax state: greedy decode reads back a 4-byte token instead
+        # of the 1MB logits (softcap is argmax-invariant and skipped)
+        N_ARGMAX_WGS = 128
+        self.b["part_val"] = fbuf(N_ARGMAX_WGS)
+        self.b["part_idx"] = fbuf(N_ARGMAX_WGS)
+        self.b["out_tokens"] = fbuf(max_seq)
+        self.b["counter"] = self.device.create_buffer(size=4, usage=upd)
+        self._n_argmax_wgs = N_ARGMAX_WGS
         # KV caches only for layers that own K/V; shared layers alias these
         self.k_cache = {s.index: fbuf(max_seq * s.head_dim)
                         for s in cfg.layers if not s.kv_shared}
@@ -264,6 +273,8 @@ class Gemma4GPU:
             "mv_ple_gate": ubuf(ple_h, h),
             "mv_ple_proj": ubuf(h, ple_h),
             "softcap": ubuf(cfg.vocab_size),
+            "argmax1": ubuf(cfg.vocab_size, 128),
+            "argmax2": ubuf(128),
             # dynamic (rewritten each step)
             "kv_append_s": dynbuf(2), "kv_append_f": dynbuf(2),
             "scores_sliding": dynbuf(5), "scores_full": dynbuf(5),
@@ -336,6 +347,11 @@ class Gemma4GPU:
         ]
         self.bg_softcap = self._bg(
             "softcap", b["logits"], self.fp["softcap"], d["softcap"])
+        self.bg_argmax1 = self._bg(
+            "argmax_stage1", b["logits"], b["part_val"], b["part_idx"], d["argmax1"])
+        self.bg_argmax2 = self._bg(
+            "argmax_stage2", b["part_val"], b["part_idx"], b["token"],
+            b["out_tokens"], b["counter"], d["argmax2"])
 
         if self.ple:
             self.bg_ple_ctx = self._bg(
@@ -455,7 +471,7 @@ class Gemma4GPU:
             row = bf16_to_f32(self._ple_raw[token_id]) * np.float32(cfg.ple_scale)
             q.write_buffer(self.b["ple_tok"], 0, row.tobytes())
 
-    def _encode_forward(self, run, want_logits: bool) -> None:
+    def _encode_forward(self, run, want_logits: bool, argmax: bool = False) -> None:
         """Encode one full decoder forward pass via the given run() callback."""
         cfg = self.cfg
         nh, h = cfg.num_heads, cfg.hidden_size
@@ -507,14 +523,24 @@ class Gemma4GPU:
                 run("rmsnorm_wg", bg["norm_ple"], h, label="norm_ple", grid=(1, 1, 1))
                 run("add_scale", bg["add_scale"], h, label="add_scale")
 
-        if want_logits:
+        if want_logits or argmax:
             run("rmsnorm_wg", self.bg_final_norm, h, label="norm_final", grid=(1, 1, 1))
             for rows, bg in self.bg_logits_chunks:
                 run(self._kn["matvec_wg"], bg, rows, label="mv_logits", grid=(rows, 1, 1))
+        if argmax:  # softcap is argmax-invariant — skip it on this path
+            run("argmax_stage1", self.bg_argmax1, self._n_argmax_wgs * 64,
+                label="argmax", grid=(self._n_argmax_wgs, 1, 1))
+            run("argmax_stage2", self.bg_argmax2, 64, label="argmax", grid=(1, 1, 1))
+        elif want_logits:
             run("softcap", self.bg_softcap, cfg.vocab_size, label="softcap")
 
-    def step(self, token_id: int, pos: int, want_logits: bool = True) -> np.ndarray | None:
-        """Run one decoder forward pass on the GPU for `token_id` at `pos`."""
+    def step(self, token_id: int, pos: int, want_logits: bool = True,
+             argmax: bool = False) -> np.ndarray | int | None:
+        """Run one decoder forward pass on the GPU for `token_id` at `pos`.
+
+        argmax=True runs the two-stage GPU argmax and returns the winning
+        token id (a 4-byte readback instead of the 1MB logits).
+        """
         if pos >= self.max_seq:
             raise ValueError(f"position {pos} exceeds max_seq {self.max_seq}")
         kv_len = pos + 1
@@ -546,7 +572,7 @@ class Gemma4GPU:
             if self.profile:
                 cp.end()
 
-        self._encode_forward(run, want_logits)
+        self._encode_forward(run, want_logits and not argmax, argmax)
 
         if self.profile:
             enc.resolve_query_set(self._qs, 0, len(pass_labels) * 2,
@@ -558,7 +584,10 @@ class Gemma4GPU:
         t2 = time.perf_counter()
 
         logits = None
-        if want_logits:
+        if argmax:
+            raw = self.device.queue.read_buffer(self.b["token"])
+            logits = int(np.frombuffer(raw, dtype=np.uint32)[0])
+        elif want_logits:
             raw = self.device.queue.read_buffer(self.b["logits"])
             logits = np.frombuffer(raw, dtype=np.float32).copy()
         t3 = time.perf_counter()
@@ -630,8 +659,30 @@ class Gemma4GPU:
         """Generate token ids (without prompt). temperature<=0 → greedy.
 
         CPU-driven per-step decode: the PLE gather for each generated token
-        happens host-side, so tokens round-trip through the CPU.
+        happens host-side, so tokens round-trip through the CPU. Greedy
+        decode picks on-GPU (two-stage argmax) and reads back 4 bytes.
         """
+        if temperature <= 0.0:
+            self.device.queue.write_buffer(
+                self.b["counter"], 0, np.zeros(1, dtype=np.uint32).tobytes())
+            next_id = None
+            for pos, tid in enumerate(prompt_ids):
+                last = pos == len(prompt_ids) - 1
+                res = self.step(tid, pos, want_logits=False, argmax=last)
+                if last:
+                    next_id = res
+            out: list[int] = []
+            pos = len(prompt_ids)
+            while len(out) < max_new_tokens:
+                out.append(next_id)
+                if on_token is not None:
+                    on_token(next_id)
+                if next_id in self.cfg.eos_token_ids or pos >= self.max_seq:
+                    break
+                next_id = self.step(next_id, pos, want_logits=False, argmax=True)
+                pos += 1
+            return out
+
         rng = np.random.default_rng(seed)
         logits = None
         for pos, tid in enumerate(prompt_ids):

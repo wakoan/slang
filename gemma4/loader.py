@@ -44,7 +44,8 @@ class SafetensorsIndex:
         info = self._info[name]
         start, end = info["data_offsets"]
         buf = self._data[self._base + start : self._base + end]
-        dtype = {"BF16": np.uint16, "F16": np.uint16, "F32": np.float32}[info["dtype"]]
+        dtype = {"BF16": np.uint16, "F16": np.uint16, "F32": np.float32,
+                 "U8": np.uint8, "I8": np.int8}[info["dtype"]]
         return buf.view(dtype).reshape(info["shape"])
 
     def tensor(self, name: str, dtype: str = "f32") -> np.ndarray:

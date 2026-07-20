@@ -47,9 +47,10 @@ wgsl = translate(my_func)
 
 ## Performance notes (gemma4 runner, M4 Pro)
 
-- 33 tok/s greedy f16 (resident), GPU-bound: ~30ms forward, big matvecs at 170-240GB/s, f16 bandwidth ceiling ≈ 60 tok/s. History: 17 f32 → 22.6 f16 → 32.6 GPU argmax (killed the 23ms/step logits readback) → 33.0 resident.
-- Falsified for E2B (measure before re-trying): subgroup `_sg` kernels are a net loss on the 1536-24576-wide rows (31.5 vs 33.0 tok/s; norms 36 vs 20µs) — they won on gemma3's 640-wide rows. `use_subgroups` is hard-off in gemma4/runner.py.
-- Remaining leads: ~10ms/step is ~680 serialized small dispatches (norms ~20-35µs each) — fusion candidates: PLE chain 5→2-3 dispatches, kv-prepare (knorm+vnorm+rope_k+2×append) 5→1; skinny matvecs (mv_down/mv_o) reload x per row — multi-row tiling would cut cache traffic.
+- 38 tok/s greedy f16 (resident), GPU-bound and near the f16 bandwidth floor: matvecs are ~75% of decode time at ~235 GB/s (mv_gateup), ~86% of the ~273 GB/s peak; ceiling ≈ 58 tok/s. History: 17 f32 → 22.6 f16 → 32.6 GPU argmax (killed the 23ms/step logits readback) → 33.0 resident → 34.0 fused post-attn add-norm+pre-FFN norm → 38.0 vec4 matvec.
+- The matvec is `matvec_wg_packed_v4` (workgroup-per-row, 64 threads, vec4<u32>+2×vec4<f32> loads = 8 f16/iter). All E2B matvec n_in are divisible by 8. Norm fusions live in `rmsnorm_add_norm_wg` (post-attn add-norm + pre-FFN norm) and `rmsnorm_add_scale_wg` (PLE post-norm + scaled residual add).
+- Falsified for E2B (measure before re-trying): (1) subgroup `_sg` kernels — net loss on the wide rows (31.5 vs 33.0 tok/s); `use_subgroups` hard-off. (2) 128-thread matvec vs 64 — slower (36 vs 38 tok/s: extra reduction level costs more than any bandwidth gain; 64 threads already saturate). (3) norm+trivial-elementwise fusion (PLE add_scale) — speed-neutral (real work is the reduction, not the dispatch).
+- Remaining leads (diminishing without quantization): matvecs at 86% of peak leave ~14% there; norm_input could fold into the previous layer's PLE tail (~1 tok/s, cross-layer coupling). The real lever below the f16 floor is weight quantization — the reference WebGPU bundle (webml-community/gemma-4-webgpu-kernels, Xenova) runs the QAT-mobile checkpoint at 4-bit attn / 2-bit MLP, cutting weight bandwidth ~4-8× (a separate checkpoint + quantized-matmul project).
 
 ## Backends
 

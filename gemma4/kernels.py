@@ -17,6 +17,7 @@ from py_shader_lang_wgpu.types import (
     Builtin,
     StorageBuffer,
     WorkgroupArray,
+    f16,
     f32,
     u32,
 )
@@ -290,6 +291,66 @@ def combine_scaled(
     x_out[i] = (a_in[i] + b_in[i]) * fparams[0]
 
 
+@kernel(workgroup_size=(1,))
+def step_setup_g4(
+    gid: Builtin.global_invocation_id,
+    pos_buf: StorageBuffer[u32, "read_write"],  # [1] this step's position
+    kv_s: StorageBuffer[u32, "read_write"],     # [vec_len, pos] sliding layers
+    kv_f: StorageBuffer[u32, "read_write"],     # [vec_len, pos] full layers
+    sc_slide: StorageBuffer[u32, "read_write"], # [nh, hd, kv_len, start, max_seq]
+    sc_full: StorageBuffer[u32, "read_write"],
+    rope_l: StorageBuffer[f32, "read_write"],   # [theta, pos]
+    rope_g: StorageBuffer[f32, "read_write"],
+    cfg_c: StorageBuffer[u32, "read"],          # [sliding_window]
+):
+    # Computes all position-derived step parameters on-GPU so a decode
+    # chain never round-trips to the CPU. Increments pos for the next step.
+    if gid.x > 0:
+        return
+    pos: u32 = pos_buf[0]
+    kv_len: u32 = pos + 1
+    window: u32 = cfg_c[0]
+
+    kv_s[1] = pos
+    kv_f[1] = pos
+    sc_slide[2] = kv_len
+    if kv_len > window:
+        sc_slide[3] = kv_len - window
+    else:
+        sc_slide[3] = 0
+    sc_full[2] = kv_len
+    rope_l[1] = f32(pos)
+    rope_g[1] = f32(pos)
+    pos_buf[0] = pos + 1
+
+
+@kernel(workgroup_size=(64,))
+def ple_gather_f16(
+    gid: Builtin.global_invocation_id,
+    token: StorageBuffer[u32, "read"],          # [1] current token id
+    table_lo: StorageBuffer[f16, "read"],       # rows [0, split)
+    table_hi: StorageBuffer[f16, "read"],       # rows [split, vocab)
+    out: StorageBuffer[f32, "read_write"],      # [row_len] scaled PLE row
+    fparams: StorageBuffer[f32, "read"],        # [scale] = sqrt(256)
+    dims: StorageBuffer[u32, "read"],           # [row_len, split]
+):
+    # On-GPU replacement for the CPU-side per-token PLE table gather. The
+    # f16 table is 4.7GB — beyond the 4.29GB max storage binding — so it
+    # ships as two half-tables and the row is picked by token range.
+    i: u32 = gid.x
+    row_len: u32 = dims[0]
+    split: u32 = dims[1]
+    if i >= row_len:
+        return
+    t: u32 = token[0]
+    v: f32 = 0.0
+    if t < split:
+        v = f32(table_lo[t * row_len + i])
+    else:
+        v = f32(table_hi[(t - split) * row_len + i])
+    out[i] = v * fparams[0]
+
+
 KERNELS = {
     # unchanged gemma3 kernels
     "embed_scale": embed_scale,
@@ -314,4 +375,6 @@ KERNELS = {
     "softcap": softcap,
     "add_scale": add_scale,
     "combine_scaled": combine_scaled,
+    "step_setup_g4": step_setup_g4,
+    "ple_gather_f16": ple_gather_f16,
 }

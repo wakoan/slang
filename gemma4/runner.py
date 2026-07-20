@@ -59,7 +59,8 @@ class Gemma4GPU:
 
     def __init__(self, config: Gemma4Config, index: SafetensorsIndex,
                  max_seq: int = 1024, profile: bool = False,
-                 dtype: str = "f16", ple: bool = True) -> None:
+                 dtype: str = "f16", ple: bool = True,
+                 resident: bool = True) -> None:
         self.cfg = config
         self.idx = index
         self.max_seq = max_seq
@@ -70,10 +71,16 @@ class Gemma4GPU:
             dtype = "f32"  # graceful fallback
         self.dtype = dtype
         self.ple = ple  # False isolates the non-PLE pipeline for verification
+        # GPU-resident greedy decode needs the PLE table on-GPU as f16
+        # (+4.7GB) and the f16 gather kernel; f32 mode stays CPU-driven.
+        self.resident = resident and ple and dtype == "f16"
         embed_bytes = config.vocab_size * config.hidden_size * 4
+        half_table = (config.vocab_size // 2) * config.num_layers \
+            * config.hidden_size_per_layer_input * 2
+        big = max(embed_bytes, half_table if self.resident else 0, 1 << 28)
         limits = {
-            "max-buffer-size": max(embed_bytes, 1 << 28),
-            "max-storage-buffer-binding-size": max(embed_bytes, 1 << 28),
+            "max-buffer-size": big,
+            "max-storage-buffer-binding-size": big,
         }
         features = []
         self._sg_feature = "subgroup" in adapter.features
@@ -125,10 +132,12 @@ class Gemma4GPU:
             )
             self._pipelines[name] = (pipeline, layout)
 
-        # Subgroup kernels assume subgroup_size >= 32; verify on this device.
+        # Measured on M4 Pro (resident decode, 200 tokens): the 32-thread
+        # _sg kernels are a net LOSS for E2B's long rows (31.5 vs 33.0
+        # tok/s; norm_post_add 36 vs 20µs, mv_down 174 vs 145µs) — unlike
+        # gemma3's 640-wide rows where they won. Keep them off; the
+        # variants stay in the registry for future selective use.
         self.use_subgroups = False
-        if self._sg_feature:
-            self.use_subgroups = self._probe_subgroup_size() >= 32
 
         # resolved kernel names per call-site family
         f16 = self.dtype == "f16"
@@ -220,6 +229,27 @@ class Gemma4GPU:
         #: CPU-side mmap view of the 4.7GB PLE table for per-token gathers
         self._ple_raw = index.raw(PREFIX + "embed_tokens_per_layer.weight")
 
+        if self.resident:
+            # PLE table on-GPU as f16 for the resident decode chain. 4.7GB
+            # exceeds the 4.29GB max storage binding, so it ships as two
+            # half-tables; ple_gather_f16 picks the half by token range.
+            split = cfg.vocab_size // 2
+            row_len = cfg.num_layers * cfg.hidden_size_per_layer_input
+            self._ple_split = split
+            self._ple_table = []
+            for r0, r1 in ((0, split), (split, cfg.vocab_size)):
+                buf = self.device.create_buffer(
+                    size=(r1 - r0) * row_len * 2,
+                    usage=st | wgpu.BufferUsage.COPY_DST)
+                CH = 8192  # rows per upload chunk (~147MB f16)
+                for r in range(r0, r1, CH):
+                    rows = bf16_to_f32(self._ple_raw[r:min(r + CH, r1)])
+                    self.device.queue.write_buffer(
+                        buf, (r - r0) * row_len * 2,
+                        rows.astype(np.float16).tobytes())
+                    self.device.queue.submit([])  # flush staging per chunk
+                self._ple_table.append(buf)
+
         # --- scratch buffers (sized at per-family maxima) ---
         nh = cfg.num_heads
         hd_max = max(s.head_dim for s in cfg.layers)          # 512
@@ -255,6 +285,7 @@ class Gemma4GPU:
         self.b["part_idx"] = fbuf(N_ARGMAX_WGS)
         self.b["out_tokens"] = fbuf(max_seq)
         self.b["counter"] = self.device.create_buffer(size=4, usage=upd)
+        self.b["pos"] = self.device.create_buffer(size=4, usage=upd)
         self._n_argmax_wgs = N_ARGMAX_WGS
         # KV caches only for layers that own K/V; shared layers alias these
         self.k_cache = {s.index: fbuf(max_seq * s.head_dim)
@@ -289,6 +320,7 @@ class Gemma4GPU:
             "softcap": ubuf(cfg.vocab_size),
             "argmax1": ubuf(cfg.vocab_size, 128),
             "argmax2": ubuf(128),
+            "setup_cfg": ubuf(cfg.sliding_window),
             # dynamic (rewritten each step)
             "kv_append_s": dynbuf(2), "kv_append_f": dynbuf(2),
             "scores_sliding": dynbuf(5), "scores_full": dynbuf(5),
@@ -312,7 +344,11 @@ class Gemma4GPU:
         self.fp = {
             "softcap": fubuf(cfg.final_logit_softcapping),
             "combine": fubuf(2.0 ** -0.5),
+            "ple_scale": fubuf(cfg.ple_scale),
         }
+        if self.resident:
+            self.d["ple_gather"] = ubuf(
+                cfg.num_layers * cfg.hidden_size_per_layer_input, self._ple_split)
 
         LC = 32768  # logits matvec: chunked under the 65535-workgroup cap
         self._logits_chunks = [(s, min(LC, cfg.vocab_size - s))
@@ -393,6 +429,15 @@ class Gemma4GPU:
         self.bg_argmax2 = self._bg(
             "argmax_stage2", b["part_val"], b["part_idx"], b["token"],
             b["out_tokens"], b["counter"], d["argmax2"])
+        if self.resident:
+            self.bg_setup = self._bg(
+                "step_setup_g4", b["pos"], d["kv_append_s"], d["kv_append_f"],
+                d["scores_sliding"], d["scores_full"], d["rope_local"],
+                d["rope_global"], d["setup_cfg"])
+            self.bg_ple_gather = self._bg(
+                "ple_gather_f16", b["token"], self._ple_table[0],
+                self._ple_table[1], b["ple_tok"], self.fp["ple_scale"],
+                d["ple_gather"])
 
         if self.ple:
             self.bg_ple_ctx = self._bg(
@@ -694,6 +739,97 @@ class Gemma4GPU:
         probs /= probs.sum()
         return int(rng.choice(len(probs), p=probs))
 
+    def _generate_resident(self, prompt_ids: list[int], max_new_tokens: int,
+                           on_token, chunk: int = 64) -> list[int]:
+        """Greedy decode fully on-GPU: step params, PLE gather, token
+        feedback, and argmax never leave the device; the CPU checks for
+        EOS once per chunk."""
+        q = self.device.queue
+        # prefill all but the last prompt token (no logits needed)
+        for pos, tid in enumerate(prompt_ids[:-1]):
+            self.step(tid, pos, want_logits=False)
+
+        # seed resident state: the last prompt token produces generation[0].
+        # _write_step_params also fills the static dims fields (head dims,
+        # rope thetas, max_seq) that step_setup_g4 never touches.
+        start_pos = len(prompt_ids) - 1
+        self._write_step_params(prompt_ids[-1], start_pos)
+        q.write_buffer(self.b["pos"], 0,
+                       np.array([start_pos], dtype=np.uint32).tobytes())
+        q.write_buffer(self.b["counter"], 0, np.zeros(1, dtype=np.uint32).tobytes())
+
+        cfg = self.cfg
+        emitted = 0
+        out: list[int] = []
+        produced = 0
+        budget = min(max_new_tokens, self.max_seq - start_pos)
+
+        def encode_chunk(k: int):
+            enc = self.device.create_command_encoder()
+            cp = enc.begin_compute_pass()
+
+            def run(name, bg, n_threads, wg=64, label=None, grid=None):
+                pipeline, _ = self._pipelines[name]
+                cp.set_pipeline(pipeline)
+                cp.set_bind_group(0, bg)
+                if grid is not None:
+                    cp.dispatch_workgroups(*grid)
+                else:
+                    cp.dispatch_workgroups((n_threads + wg - 1) // wg, 1, 1)
+
+            ple_n = cfg.num_layers * cfg.hidden_size_per_layer_input
+            for _ in range(k):
+                run("step_setup_g4", self.bg_setup, 1, grid=(1, 1, 1))
+                run("ple_gather_f16", self.bg_ple_gather, ple_n)
+                self._encode_forward(run, want_logits=False, argmax=True)
+            cp.end()
+            return enc.finish()
+
+        # Chunk sizes ramp 8→chunk so short answers don't pay for a full
+        # chunk of speculative forward passes. Encoding is pipelined: while
+        # the GPU runs chunk N, the CPU encodes chunk N+1.
+        sizes: list[int] = []
+        c, left = min(8, chunk), budget
+        while left > 0:
+            k = min(c, left)
+            sizes.append(k)
+            left -= k
+            c = min(c * 2, chunk)
+
+        t0 = time.perf_counter()
+        cmd = encode_chunk(sizes[0])
+        t1 = time.perf_counter()
+        self._prof_phases["encode"] += t1 - t0
+        q.submit([cmd])
+
+        for i, k in enumerate(sizes):
+            t1 = time.perf_counter()
+            next_cmd = encode_chunk(sizes[i + 1]) if i + 1 < len(sizes) else None
+            t2 = time.perf_counter()
+            produced += k
+            raw = q.read_buffer(self.b["out_tokens"], size=produced * 4)
+            toks = np.frombuffer(raw, dtype=np.uint32)
+            t3 = time.perf_counter()
+            ph = self._prof_phases
+            ph["encode"] += t2 - t1
+            ph["chunk_submit_readback"] += t3 - t2
+            self._prof_steps.append((start_pos + produced, (t3 - t1) / k, True))
+
+            stop = False
+            for tid in toks[emitted:]:
+                tid = int(tid)
+                out.append(tid)
+                if on_token is not None:
+                    on_token(tid)
+                emitted += 1
+                if tid in cfg.eos_token_ids:
+                    stop = True
+                    break
+            if stop or next_cmd is None:
+                break
+            q.submit([next_cmd])
+        return out
+
     def generate(self, prompt_ids: list[int], max_new_tokens: int = 64,
                  on_token=None, temperature: float = 0.0, top_k: int = 64,
                  seed: int | None = None) -> list[int]:
@@ -703,6 +839,11 @@ class Gemma4GPU:
         happens host-side, so tokens round-trip through the CPU. Greedy
         decode picks on-GPU (two-stage argmax) and reads back 4 bytes.
         """
+        if temperature <= 0.0 and self.resident and not self.profile:
+            # fully GPU-resident chunks (per-kernel profiling needs the
+            # per-step path, so profile mode falls through)
+            return self._generate_resident(prompt_ids, max_new_tokens, on_token)
+
         if temperature <= 0.0:
             self.device.queue.write_buffer(
                 self.b["counter"], 0, np.zeros(1, dtype=np.uint32).tobytes())

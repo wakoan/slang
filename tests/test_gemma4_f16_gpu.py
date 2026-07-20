@@ -55,6 +55,18 @@ def test_argmax_matches_reference(model):
     assert flips <= 1  # f16 weights: allow at most one flip over the prompt
 
 
+def test_resident_matches_per_step(model):
+    cfg, idx, gpu = model
+    assert gpu.resident  # f16 default: GPU-resident chunks with on-GPU PLE
+    out_resident = gpu.generate(PROMPT_IDS, max_new_tokens=24)
+    gpu.resident = False
+    try:
+        out_per_step = gpu.generate(PROMPT_IDS, max_new_tokens=24)
+    finally:
+        gpu.resident = True
+    assert out_resident == out_per_step  # f16 PLE table must not flip tokens
+
+
 def test_factual_completion_greedy(model):
     from tokenizers import Tokenizer
 

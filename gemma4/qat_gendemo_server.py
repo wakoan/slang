@@ -23,9 +23,10 @@ DEFAULT_MODEL_DIR = ROOT / "models" / "gemma-4-E2B-qat"
 
 
 def build_kernels_json() -> str:
-    from .qat_kernels import KERNELS
+    from .qat_kernels import BROWSER_EXTRA_KERNELS, KERNELS
+    allk = {**KERNELS, **BROWSER_EXTRA_KERNELS}  # extras: int8/dot4I8Packed experiment
     out = {name: {"wgsl": k.wgsl, "workgroup_size": list(k.workgroup_size)}
-           for name, k in KERNELS.items()}
+           for name, k in allk.items()}
     return json.dumps(out)
 
 

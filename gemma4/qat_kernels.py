@@ -1828,3 +1828,115 @@ KERNELS.update({
     "qat_embed_2bit": qat_embed_2bit,
     "qat_ple_gather_4bit": qat_ple_gather_4bit,
 })
+
+
+# ---------------------------------------------------------------------------
+# Browser-only experiment: int8 activations + dot4I8Packed (hardware int dot).
+# Kept OUT of KERNELS (qat_runner's naga may reject the `requires` directive;
+# these need int8-quantized activations the runner doesn't produce). Served to
+# the browser via qat_gendemo_server.BROWSER_EXTRA. Dawn/Apple emits the real
+# hardware packed-int-dot instruction (wgpu-native only emulates it).
+# ---------------------------------------------------------------------------
+
+@kernel(workgroup_size=(256,))
+def quant_i8(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    x_in: StorageBuffer[f32, "read"],            # [n]
+    xq_out: StorageBuffer[u32, "read_write"],    # [n/4] four int8 per u32
+    scale_out: StorageBuffer[f32, "read_write"], # [1] per-vector scale
+    dims: StorageBuffer[u32, "read"],            # [n] (n % 4 == 0)
+    smax: WorkgroupArray[f32, 256],
+):
+    # Dynamic per-vector symmetric int8 quantization: scale = max|x|/127,
+    # xq = round(x/scale) clamped to [-127,127], packed 4 per u32 (byte order).
+    li: u32 = lid.x
+    n: u32 = dims[0]
+    m: f32 = 0.0
+    for j in range(li, n, 256):
+        m = max(m, abs(x_in[j]))
+    smax[li] = m
+    barrier()
+    s: u32 = 128
+    while s > 0:
+        if li < s:
+            smax[li] = max(smax[li], smax[li + s])
+        barrier()
+        s = s / 2
+    scale: f32 = smax[0] / 127.0
+    inv: f32 = 0.0
+    if scale > 0.0:
+        inv = 1.0 / scale
+    if li == 0:
+        scale_out[0] = scale
+    n4: u32 = n / 4
+    for j in range(li, n4, 256):
+        b: u32 = 4 * j
+        v0: i32 = i32(clamp(round(x_in[b] * inv), -127.0, 127.0))
+        v1: i32 = i32(clamp(round(x_in[b + 1] * inv), -127.0, 127.0))
+        v2: i32 = i32(clamp(round(x_in[b + 2] * inv), -127.0, 127.0))
+        v3: i32 = i32(clamp(round(x_in[b + 3] * inv), -127.0, 127.0))
+        xq_out[j] = (u32(v0) & 255) | ((u32(v1) & 255) << 8) | \
+                    ((u32(v2) & 255) << 16) | ((u32(v3) & 255) << 24)
+
+
+@kernel(workgroup_size=(64,))
+def matvec_dq2_i8(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    w_packed: StorageBuffer[u32, "read"],     # [n_out, n_in/16] int2
+    xq: StorageBuffer[u32, "read"],           # [n_in/4] int8 packed activations
+    wscale: StorageBuffer[f32, "read"],       # [n_out] per-row weight scale
+    actscale: StorageBuffer[f32, "read"],     # [1] activation scale
+    y_out: StorageBuffer[f32, "read_write"],  # [n_out]
+    dims: StorageBuffer[u32, "read"],         # [n_out, n_in]
+    partial: WorkgroupArray[i32, 64],
+):
+    # int2 weights x int8 activations via dot4I8Packed: expand 4 int2 crumbs to
+    # a packed-int8 u32, hardware-dot with 4 packed int8 activations, sum in i32,
+    # then one f32 scale (weight per-row * activation) at the end.
+    r: u32 = wid.x
+    li: u32 = lid.x
+    n_out: u32 = dims[0]
+    n_in: u32 = dims[1]
+    n16: u32 = n_in / 16
+    acc: i32 = 0
+    if r < n_out:
+        for j in range(li, n16, 64):
+            p: u32 = w_packed[r * n16 + j]
+            w0: u32 = (u32(i32(p & 3) - 2) & 255) | \
+                      ((u32(i32((p >> 2) & 3) - 2) & 255) << 8) | \
+                      ((u32(i32((p >> 4) & 3) - 2) & 255) << 16) | \
+                      ((u32(i32((p >> 6) & 3) - 2) & 255) << 24)
+            acc += dot4I8Packed(w0, xq[4 * j])
+            w1: u32 = (u32(i32((p >> 8) & 3) - 2) & 255) | \
+                      ((u32(i32((p >> 10) & 3) - 2) & 255) << 8) | \
+                      ((u32(i32((p >> 12) & 3) - 2) & 255) << 16) | \
+                      ((u32(i32((p >> 14) & 3) - 2) & 255) << 24)
+            acc += dot4I8Packed(w1, xq[4 * j + 1])
+            w2: u32 = (u32(i32((p >> 16) & 3) - 2) & 255) | \
+                      ((u32(i32((p >> 18) & 3) - 2) & 255) << 8) | \
+                      ((u32(i32((p >> 20) & 3) - 2) & 255) << 16) | \
+                      ((u32(i32((p >> 22) & 3) - 2) & 255) << 24)
+            acc += dot4I8Packed(w2, xq[4 * j + 2])
+            w3: u32 = (u32(i32((p >> 24) & 3) - 2) & 255) | \
+                      ((u32(i32((p >> 26) & 3) - 2) & 255) << 8) | \
+                      ((u32(i32((p >> 28) & 3) - 2) & 255) << 16) | \
+                      ((u32(i32((p >> 30) & 3) - 2) & 255) << 24)
+            acc += dot4I8Packed(w3, xq[4 * j + 3])
+    partial[li] = acc
+    barrier()
+    s: u32 = 32
+    while s > 0:
+        if li < s:
+            partial[li] = partial[li] + partial[li + s]
+        barrier()
+        s = s / 2
+    if li == 0 and r < n_out:
+        y_out[r] = f32(partial[0]) * wscale[r] * actscale[0]
+
+
+BROWSER_EXTRA_KERNELS = {
+    "quant_i8": quant_i8,
+    "matvec_dq2_i8": matvec_dq2_i8,
+}

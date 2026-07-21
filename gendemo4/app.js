@@ -16,6 +16,9 @@ const ui = {
 const N_ARGMAX_WGS = 128;
 const MAX_SEQ = 512;
 const CHUNK = 16;
+// Experiment: int8 activations + dot4I8Packed for the wide (2-bit) down_proj.
+// Toggle to A/B against the current matvec_dq2_blk2. See qat_kernels int8 block.
+const USE_INT8_DOWN = true;
 
 let G = null;
 const status = (m) => { ui.status.textContent = m; };
@@ -228,6 +231,9 @@ async function init() {
     token: fbuf(1), pos: fbuf(1), counter: fbuf(1),
     outTokens: fbuf(MAX_SEQ), pleTok: fbuf(pleN),
     partVal: fbuf(N_ARGMAX_WGS), partIdx: fbuf(N_ARGMAX_WGS),
+    ffhQ: device.createBuffer({   // int8-packed ffh (interMax bytes), + scale
+      size: interMax, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+    actScale: fbuf(1),
   };
   const kCache = {}, vCache = {};
   for (const s of specs) if (!s.kv_shared) {
@@ -290,6 +296,13 @@ async function init() {
       down: dR.kind === "dq2"
         ? bg("matvec_dq2_blk2", W[dR.w], B.ffh, W[dR.scale], B.mlpOut, dimsFor(dR))
         : mvBg(dR, B.ffh, B.mlpOut),
+      // int8 experiment: quantize ffh then dot4I8Packed down (dq2 layers only)
+      quantDown: dR.kind === "dq2"
+        ? bg("quant_i8", B.ffh, B.ffhQ, B.actScale, (mvDims[`n${dR.n_in}`] ||= ubuf(dR.n_in)))
+        : null,
+      downI8: dR.kind === "dq2"
+        ? bg("matvec_dq2_i8", W[dR.w], B.ffhQ, W[dR.scale], B.actScale, B.mlpOut, dimsFor(dR))
+        : null,
       normPffAdd: bg("rmsnorm_add_wg", B.mlpOut, W[`L${L}.norm_pff`], B.x, D.normH),
       pleGateup: bg("mv_geglu_f16", W[pgR.w], B.x, [B.pleIn, L * pleBytes, pleBytes],
                     B.pleH, dimsFor(pgR)),
@@ -356,7 +369,12 @@ function encodeForward(pass, wantLogits) {
     mv(L.oR, L.o);
     run("rmsnorm_add_norm_wg", L.normPaPf, 1);
     run(gateupKernel(L.gR.kind), L.gateup, gateupGrid(L.gR));
-    run(L.dR.kind === "dq2" ? "matvec_dq2_blk2" : "matvec_dq4_blk2", L.down, L.dR.n_out / 2);
+    if (USE_INT8_DOWN && L.dR.kind === "dq2") {
+      run("quant_i8", L.quantDown, 1);            // ffh -> int8 + scale
+      run("matvec_dq2_i8", L.downI8, L.dR.n_out); // 1 row/wg, hardware int dot
+    } else {
+      run(L.dR.kind === "dq2" ? "matvec_dq2_blk2" : "matvec_dq4_blk2", L.down, L.dR.n_out / 2);
+    }
     run("rmsnorm_add_wg", L.normPffAdd, 1);
     run("mv_geglu_f16", L.pleGateup, pleH);
     mv(L.ppR, L.pleProj);

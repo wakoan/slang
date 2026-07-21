@@ -139,6 +139,10 @@ _SUBGROUP_FNS = {
     "subgroupElect", "subgroupBallot", "subgroupBarrier",
 }
 
+# Calls that require `requires packed_4x8_integer_dot_product;`
+_PACKED_DOT_FNS = {"dot4I8Packed", "dot4U8Packed",
+                   "pack4xI8", "pack4xU8", "unpack4xI8", "unpack4xU8"}
+
 
 class TranslationError(Exception):
     pass
@@ -319,6 +323,17 @@ class _WGSLTranslator:
         )
         if uses_subgroups:
             self._emit("enable subgroups;")
+            self._emit()
+
+        # dot4I8Packed / dot4U8Packed need the packed-dot language feature
+        # (Dawn/Chrome enforces the `requires` directive; naga is lenient)
+        uses_packed_dot = any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+            and n.func.id in _PACKED_DOT_FNS
+            for sn in scan_nodes for n in ast.walk(sn)
+        )
+        if uses_packed_dot:
+            self._emit("requires packed_4x8_integer_dot_product;")
             self._emit()
 
         # Emit @group/@binding declarations

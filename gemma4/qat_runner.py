@@ -276,11 +276,11 @@ class Gemma4QATGPU:
                 "f16": "matvec_wg_packed_v4"}[rec["kind"]]
 
     def _gateup_kernel(self, rec: dict) -> str:
-        # dq2 (wide 2-bit layers) uses the output-blocked variant (2 rows/wg).
-        return "mv_gateup_geglu_dq2_blk2" if rec["kind"] == "dq2" else "mv_gateup_geglu_dq4"
+        # dq2 (wide 2-bit layers) uses the output-blocked variant (4 rows/wg).
+        return "mv_gateup_geglu_dq2_blk4" if rec["kind"] == "dq2" else "mv_gateup_geglu_dq4"
 
     def _gateup_grid(self, rec: dict) -> int:
-        return rec["n_out"] // 2 if rec["kind"] == "dq2" else rec["n_out"]
+        return rec["n_out"] // 4 if rec["kind"] == "dq2" else rec["n_out"]
 
     def _gateup_bg(self, gate: dict, up: dict):
         # Fused gate+up+geglu. gate/up share kind (both 2-bit L15-34, 4-bit L0-14).
@@ -318,7 +318,7 @@ class Gemma4QATGPU:
                                  w["embed_scale"], b["x"], self.fp["embed_scale"], d["embed"])
         self.bg_final_norm = self._bg("rmsnorm_wg", b["x"], w["norm"], b["xn"], d["norm_h"])
         self.bg_logits = self._bg(
-            "matvec_dq2_blk8", w["embed"], b["xn"], w["embed_scale"], b["logits"],
+            "matvec_dq2_blk16", w["embed"], b["xn"], w["embed_scale"], b["logits"],
             self._mvdims[(cfg.vocab_size, cfg.hidden_size)])
         self.bg_softcap = self._bg("softcap", b["logits"], self.fp["softcap"], d["softcap"])
         self.bg_argmax1 = self._bg("argmax_stage1", b["logits"], b["part_val"],
@@ -478,8 +478,8 @@ class Gemma4QATGPU:
             run("rmsnorm_add_scale_wg", bg["ple_norm_add"], h, label="norm_ple_add", grid=(1, 1, 1))
 
         run("rmsnorm_wg", self.bg_final_norm, h, label="norm_final", grid=(1, 1, 1))
-        run("matvec_dq2_blk8", self.bg_logits, cfg.vocab_size // 8, label="mv_logits",
-            grid=(cfg.vocab_size // 8, 1, 1))
+        run("matvec_dq2_blk16", self.bg_logits, cfg.vocab_size // 16, label="mv_logits",
+            grid=(cfg.vocab_size // 16, 1, 1))
         if argmax:
             run("argmax_stage1", self.bg_argmax1, self._n_argmax * 64,
                 label="argmax", grid=(self._n_argmax, 1, 1))

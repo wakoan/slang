@@ -368,7 +368,12 @@ class Gemma4QATGPU:
                                        w[p + "pre_feedforward_layernorm.weight"],
                                        b["x"], b["xn"], d["norm_h"]),
                 "gateup": self._gateup_bg(self.lin[p + "gate"], self.lin[p + "up"]),
-                "down": self._mv_bg(self.lin[p + "down"], b["ffh"], b["mlp_out"]),
+                "down": (self._bg(
+                    "matvec_dq2_blk2", self.lin[p + "down"]["w"], b["ffh"],
+                    self.lin[p + "down"]["scale"], b["mlp_out"],
+                    self._mvdims[(self.lin[p + "down"]["n_out"], self.lin[p + "down"]["n_in"])])
+                    if self.lin[p + "down"]["kind"] == "dq2"
+                    else self._mv_bg(self.lin[p + "down"], b["ffh"], b["mlp_out"])),
                 # post-FFN residual add-norm: x += rmsnorm(mlp_out) * (1 + w)
                 "norm_pff_add": self._bg("rmsnorm_add_wg", b["mlp_out"],
                                          w[p + "post_feedforward_layernorm.weight"],
@@ -465,7 +470,12 @@ class Gemma4QATGPU:
             gk = self._gateup_kernel(self.lin[f"{PREFIX}layers.{spec.index}.gate"])
             run(gk, bg["gateup"], spec.intermediate, label="mv_gateup",
                 grid=(spec.intermediate, 1, 1))
-            mv(self.lin[f"{PREFIX}layers.{spec.index}.down"], bg["down"], "mv_down")
+            down_rec = self.lin[f"{PREFIX}layers.{spec.index}.down"]
+            if down_rec["kind"] == "dq2":
+                run("matvec_dq2_blk2", bg["down"], down_rec["n_out"] // 2,
+                    label="mv_down", grid=(down_rec["n_out"] // 2, 1, 1))
+            else:
+                mv(down_rec, bg["down"], "mv_down")
             run("rmsnorm_add_wg", bg["norm_pff_add"], h, label="norm_post_add", grid=(1, 1, 1))
             run("mv_geglu_f16", bg["ple_gateup"], ple_h, label="mv_ple", grid=(ple_h, 1, 1))
             mv(self.lin[f"{PREFIX}layers.{spec.index}.ple_proj"], bg["ple_proj"], "mv_ple")

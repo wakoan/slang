@@ -178,6 +178,80 @@ def matvec_dq2(
 
 
 @kernel(workgroup_size=(64,))
+def matvec_dq2_blk2(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    w_packed: StorageBuffer[u32, "read"],     # [n_out, n_in/16] (16 int2/u32)
+    x_in: StorageBuffer[f32, "read"],         # [n_in]
+    scale: StorageBuffer[f32, "read"],        # [n_out] per-row weight scale
+    y_out: StorageBuffer[f32, "read_write"],  # [n_out]
+    dims: StorageBuffer[u32, "read"],         # [n_out, n_in] (n_out even)
+    p0: WorkgroupArray[f32, 64],
+    p1: WorkgroupArray[f32, 64],
+):
+    # Output-blocked matvec: one workgroup computes two adjacent rows, reading
+    # each x element once for both weight rows. Tests whether gate+up's win came
+    # from amortizing input reads via output blocking (vs from fusing geglu).
+    r0: u32 = 2 * wid.x
+    r1: u32 = 2 * wid.x + 1
+    li: u32 = lid.x
+    n_out: u32 = dims[0]
+    n_in: u32 = dims[1]
+    n16: u32 = n_in / 16
+    a0: f32 = 0.0
+    a1: f32 = 0.0
+    for j in range(li, n16, 64):
+        p: u32 = w_packed[r0 * n16 + j]
+        q: u32 = w_packed[r1 * n16 + j]
+        b: u32 = 16 * j
+        a0 += f32(i32(p & 3) - 2) * x_in[b]
+        a1 += f32(i32(q & 3) - 2) * x_in[b]
+        a0 += f32(i32((p >> 2) & 3) - 2) * x_in[b + 1]
+        a1 += f32(i32((q >> 2) & 3) - 2) * x_in[b + 1]
+        a0 += f32(i32((p >> 4) & 3) - 2) * x_in[b + 2]
+        a1 += f32(i32((q >> 4) & 3) - 2) * x_in[b + 2]
+        a0 += f32(i32((p >> 6) & 3) - 2) * x_in[b + 3]
+        a1 += f32(i32((q >> 6) & 3) - 2) * x_in[b + 3]
+        a0 += f32(i32((p >> 8) & 3) - 2) * x_in[b + 4]
+        a1 += f32(i32((q >> 8) & 3) - 2) * x_in[b + 4]
+        a0 += f32(i32((p >> 10) & 3) - 2) * x_in[b + 5]
+        a1 += f32(i32((q >> 10) & 3) - 2) * x_in[b + 5]
+        a0 += f32(i32((p >> 12) & 3) - 2) * x_in[b + 6]
+        a1 += f32(i32((q >> 12) & 3) - 2) * x_in[b + 6]
+        a0 += f32(i32((p >> 14) & 3) - 2) * x_in[b + 7]
+        a1 += f32(i32((q >> 14) & 3) - 2) * x_in[b + 7]
+        a0 += f32(i32((p >> 16) & 3) - 2) * x_in[b + 8]
+        a1 += f32(i32((q >> 16) & 3) - 2) * x_in[b + 8]
+        a0 += f32(i32((p >> 18) & 3) - 2) * x_in[b + 9]
+        a1 += f32(i32((q >> 18) & 3) - 2) * x_in[b + 9]
+        a0 += f32(i32((p >> 20) & 3) - 2) * x_in[b + 10]
+        a1 += f32(i32((q >> 20) & 3) - 2) * x_in[b + 10]
+        a0 += f32(i32((p >> 22) & 3) - 2) * x_in[b + 11]
+        a1 += f32(i32((q >> 22) & 3) - 2) * x_in[b + 11]
+        a0 += f32(i32((p >> 24) & 3) - 2) * x_in[b + 12]
+        a1 += f32(i32((q >> 24) & 3) - 2) * x_in[b + 12]
+        a0 += f32(i32((p >> 26) & 3) - 2) * x_in[b + 13]
+        a1 += f32(i32((q >> 26) & 3) - 2) * x_in[b + 13]
+        a0 += f32(i32((p >> 28) & 3) - 2) * x_in[b + 14]
+        a1 += f32(i32((q >> 28) & 3) - 2) * x_in[b + 14]
+        a0 += f32(i32((p >> 30) & 3) - 2) * x_in[b + 15]
+        a1 += f32(i32((q >> 30) & 3) - 2) * x_in[b + 15]
+    p0[li] = a0
+    p1[li] = a1
+    barrier()
+    s: u32 = 32
+    while s > 0:
+        if li < s:
+            p0[li] = p0[li] + p0[li + s]
+            p1[li] = p1[li] + p1[li + s]
+        barrier()
+        s = s / 2
+    if li == 0:
+        y_out[r0] = p0[0] * scale[r0]
+        y_out[r1] = p1[0] * scale[r1]
+
+
+@kernel(workgroup_size=(64,))
 def mv_gateup_geglu_dq2(
     wid: Builtin.workgroup_id,
     lid: Builtin.local_invocation_id,
@@ -374,6 +448,7 @@ KERNELS = {name: K4.KERNELS[name] for name in _REUSE}
 KERNELS.update({
     "matvec_dq4": matvec_dq4,
     "matvec_dq2": matvec_dq2,
+    "matvec_dq2_blk2": matvec_dq2_blk2,
     "mv_gateup_geglu_dq2": mv_gateup_geglu_dq2,
     "mv_gateup_geglu_dq4": mv_gateup_geglu_dq4,
     "mv_geglu_f16": mv_geglu_f16,

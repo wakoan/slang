@@ -276,7 +276,11 @@ class Gemma4QATGPU:
                 "f16": "matvec_wg_packed_v4"}[rec["kind"]]
 
     def _gateup_kernel(self, rec: dict) -> str:
-        return "mv_gateup_geglu_dq2" if rec["kind"] == "dq2" else "mv_gateup_geglu_dq4"
+        # dq2 (wide 2-bit layers) uses the output-blocked variant (2 rows/wg).
+        return "mv_gateup_geglu_dq2_blk2" if rec["kind"] == "dq2" else "mv_gateup_geglu_dq4"
+
+    def _gateup_grid(self, rec: dict) -> int:
+        return rec["n_out"] // 2 if rec["kind"] == "dq2" else rec["n_out"]
 
     def _gateup_bg(self, gate: dict, up: dict):
         # Fused gate+up+geglu. gate/up share kind (both 2-bit L15-34, 4-bit L0-14).
@@ -458,9 +462,9 @@ class Gemma4QATGPU:
             run("attention_fused_g4", bg["attn"], nh * 64, label="attn", grid=(nh, 1, 1))
             mv(self.lin[f"{PREFIX}layers.{spec.index}.o"], bg["o"], "mv_o")
             run("rmsnorm_add_norm_wg", bg["norm_pa_pf"], h, label="norm_add_norm", grid=(1, 1, 1))
-            gk = self._gateup_kernel(self.lin[f"{PREFIX}layers.{spec.index}.gate"])
-            run(gk, bg["gateup"], spec.intermediate, label="mv_gateup",
-                grid=(spec.intermediate, 1, 1))
+            gate_rec = self.lin[f"{PREFIX}layers.{spec.index}.gate"]
+            run(self._gateup_kernel(gate_rec), bg["gateup"], 0, label="mv_gateup",
+                grid=(self._gateup_grid(gate_rec), 1, 1))
             down_rec = self.lin[f"{PREFIX}layers.{spec.index}.down"]
             if down_rec["kind"] == "dq2":
                 run("matvec_dq2_blk2", bg["down"], down_rec["n_out"] // 2,

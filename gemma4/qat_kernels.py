@@ -647,6 +647,123 @@ def mv_geglu_f16(
         y_out[r] = gelu(partial[0]) * up_in[r]
 
 
+@kernel(workgroup_size=(64,))
+def mv_gateup_geglu_dq2_blk2(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    gate_w: StorageBuffer[u32, "read"],       # [n_out, n_in/16] int2 gate
+    up_w: StorageBuffer[u32, "read"],         # [n_out, n_in/16] int2 up
+    x_in: StorageBuffer[f32, "read"],         # [n_in]
+    gscale: StorageBuffer[f32, "read"],       # [n_out]
+    uscale: StorageBuffer[f32, "read"],       # [n_out]
+    y_out: StorageBuffer[f32, "read_write"],  # [n_out] = geglu(gate, up)
+    dims: StorageBuffer[u32, "read"],         # [n_out, n_in] (n_out % 2 == 0)
+    pg0: WorkgroupArray[f32, 64],
+    pu0: WorkgroupArray[f32, 64],
+    pg1: WorkgroupArray[f32, 64],
+    pu1: WorkgroupArray[f32, 64],
+):
+    # Output-blocked fused gate+up+geglu: 2 rows/workgroup, x read once
+    # per element for all 4 weight rows (gate+up x 2).
+    r0: u32 = 2 * wid.x + 0
+    r1: u32 = 2 * wid.x + 1
+    li: u32 = lid.x
+    n_out: u32 = dims[0]
+    n_in: u32 = dims[1]
+    n16: u32 = n_in / 16
+    g0: f32 = 0.0
+    u0: f32 = 0.0
+    g1: f32 = 0.0
+    u1: f32 = 0.0
+    for j in range(li, n16, 64):
+        gw0: u32 = gate_w[r0 * n16 + j]
+        uw0: u32 = up_w[r0 * n16 + j]
+        gw1: u32 = gate_w[r1 * n16 + j]
+        uw1: u32 = up_w[r1 * n16 + j]
+        b: u32 = 16 * j
+        g0 += f32(i32(gw0 & 3) - 2) * x_in[b]
+        u0 += f32(i32(uw0 & 3) - 2) * x_in[b]
+        g1 += f32(i32(gw1 & 3) - 2) * x_in[b]
+        u1 += f32(i32(uw1 & 3) - 2) * x_in[b]
+        g0 += f32(i32((gw0 >> 2) & 3) - 2) * x_in[b + 1]
+        u0 += f32(i32((uw0 >> 2) & 3) - 2) * x_in[b + 1]
+        g1 += f32(i32((gw1 >> 2) & 3) - 2) * x_in[b + 1]
+        u1 += f32(i32((uw1 >> 2) & 3) - 2) * x_in[b + 1]
+        g0 += f32(i32((gw0 >> 4) & 3) - 2) * x_in[b + 2]
+        u0 += f32(i32((uw0 >> 4) & 3) - 2) * x_in[b + 2]
+        g1 += f32(i32((gw1 >> 4) & 3) - 2) * x_in[b + 2]
+        u1 += f32(i32((uw1 >> 4) & 3) - 2) * x_in[b + 2]
+        g0 += f32(i32((gw0 >> 6) & 3) - 2) * x_in[b + 3]
+        u0 += f32(i32((uw0 >> 6) & 3) - 2) * x_in[b + 3]
+        g1 += f32(i32((gw1 >> 6) & 3) - 2) * x_in[b + 3]
+        u1 += f32(i32((uw1 >> 6) & 3) - 2) * x_in[b + 3]
+        g0 += f32(i32((gw0 >> 8) & 3) - 2) * x_in[b + 4]
+        u0 += f32(i32((uw0 >> 8) & 3) - 2) * x_in[b + 4]
+        g1 += f32(i32((gw1 >> 8) & 3) - 2) * x_in[b + 4]
+        u1 += f32(i32((uw1 >> 8) & 3) - 2) * x_in[b + 4]
+        g0 += f32(i32((gw0 >> 10) & 3) - 2) * x_in[b + 5]
+        u0 += f32(i32((uw0 >> 10) & 3) - 2) * x_in[b + 5]
+        g1 += f32(i32((gw1 >> 10) & 3) - 2) * x_in[b + 5]
+        u1 += f32(i32((uw1 >> 10) & 3) - 2) * x_in[b + 5]
+        g0 += f32(i32((gw0 >> 12) & 3) - 2) * x_in[b + 6]
+        u0 += f32(i32((uw0 >> 12) & 3) - 2) * x_in[b + 6]
+        g1 += f32(i32((gw1 >> 12) & 3) - 2) * x_in[b + 6]
+        u1 += f32(i32((uw1 >> 12) & 3) - 2) * x_in[b + 6]
+        g0 += f32(i32((gw0 >> 14) & 3) - 2) * x_in[b + 7]
+        u0 += f32(i32((uw0 >> 14) & 3) - 2) * x_in[b + 7]
+        g1 += f32(i32((gw1 >> 14) & 3) - 2) * x_in[b + 7]
+        u1 += f32(i32((uw1 >> 14) & 3) - 2) * x_in[b + 7]
+        g0 += f32(i32((gw0 >> 16) & 3) - 2) * x_in[b + 8]
+        u0 += f32(i32((uw0 >> 16) & 3) - 2) * x_in[b + 8]
+        g1 += f32(i32((gw1 >> 16) & 3) - 2) * x_in[b + 8]
+        u1 += f32(i32((uw1 >> 16) & 3) - 2) * x_in[b + 8]
+        g0 += f32(i32((gw0 >> 18) & 3) - 2) * x_in[b + 9]
+        u0 += f32(i32((uw0 >> 18) & 3) - 2) * x_in[b + 9]
+        g1 += f32(i32((gw1 >> 18) & 3) - 2) * x_in[b + 9]
+        u1 += f32(i32((uw1 >> 18) & 3) - 2) * x_in[b + 9]
+        g0 += f32(i32((gw0 >> 20) & 3) - 2) * x_in[b + 10]
+        u0 += f32(i32((uw0 >> 20) & 3) - 2) * x_in[b + 10]
+        g1 += f32(i32((gw1 >> 20) & 3) - 2) * x_in[b + 10]
+        u1 += f32(i32((uw1 >> 20) & 3) - 2) * x_in[b + 10]
+        g0 += f32(i32((gw0 >> 22) & 3) - 2) * x_in[b + 11]
+        u0 += f32(i32((uw0 >> 22) & 3) - 2) * x_in[b + 11]
+        g1 += f32(i32((gw1 >> 22) & 3) - 2) * x_in[b + 11]
+        u1 += f32(i32((uw1 >> 22) & 3) - 2) * x_in[b + 11]
+        g0 += f32(i32((gw0 >> 24) & 3) - 2) * x_in[b + 12]
+        u0 += f32(i32((uw0 >> 24) & 3) - 2) * x_in[b + 12]
+        g1 += f32(i32((gw1 >> 24) & 3) - 2) * x_in[b + 12]
+        u1 += f32(i32((uw1 >> 24) & 3) - 2) * x_in[b + 12]
+        g0 += f32(i32((gw0 >> 26) & 3) - 2) * x_in[b + 13]
+        u0 += f32(i32((uw0 >> 26) & 3) - 2) * x_in[b + 13]
+        g1 += f32(i32((gw1 >> 26) & 3) - 2) * x_in[b + 13]
+        u1 += f32(i32((uw1 >> 26) & 3) - 2) * x_in[b + 13]
+        g0 += f32(i32((gw0 >> 28) & 3) - 2) * x_in[b + 14]
+        u0 += f32(i32((uw0 >> 28) & 3) - 2) * x_in[b + 14]
+        g1 += f32(i32((gw1 >> 28) & 3) - 2) * x_in[b + 14]
+        u1 += f32(i32((uw1 >> 28) & 3) - 2) * x_in[b + 14]
+        g0 += f32(i32((gw0 >> 30) & 3) - 2) * x_in[b + 15]
+        u0 += f32(i32((uw0 >> 30) & 3) - 2) * x_in[b + 15]
+        g1 += f32(i32((gw1 >> 30) & 3) - 2) * x_in[b + 15]
+        u1 += f32(i32((uw1 >> 30) & 3) - 2) * x_in[b + 15]
+    pg0[li] = g0
+    pu0[li] = u0
+    pg1[li] = g1
+    pu1[li] = u1
+    barrier()
+    s: u32 = 32
+    while s > 0:
+        if li < s:
+            pg0[li] = pg0[li] + pg0[li + s]
+            pu0[li] = pu0[li] + pu0[li + s]
+            pg1[li] = pg1[li] + pg1[li + s]
+            pu1[li] = pu1[li] + pu1[li + s]
+        barrier()
+        s = s / 2
+    if li == 0:
+        y_out[r0] = gelu(pg0[0] * gscale[r0]) * (pu0[0] * uscale[r0])
+        y_out[r1] = gelu(pg1[0] * gscale[r1]) * (pu1[0] * uscale[r1])
+
+
 # Registry for the QAT runner: reusable base gemma4 kernels (norms, rope,
 # attention, geglu, argmax, resident-decode helpers, f16 matvec for 8-bit /
 # unquantized modules) plus the QAT-specific dequant matmuls and gathers.
@@ -663,6 +780,7 @@ KERNELS.update({
     "matvec_dq2_blk2": matvec_dq2_blk2,
     "matvec_dq2_blk8": matvec_dq2_blk8,
     "mv_gateup_geglu_dq2": mv_gateup_geglu_dq2,
+    "mv_gateup_geglu_dq2_blk2": mv_gateup_geglu_dq2_blk2,
     "mv_gateup_geglu_dq4": mv_gateup_geglu_dq4,
     "mv_geglu_f16": mv_geglu_f16,
     "qat_embed_2bit": qat_embed_2bit,

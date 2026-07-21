@@ -299,7 +299,7 @@ async function init() {
     return o;
   });
 
-  G = { device, cfg, pipelines, B, D, W, layers, nh, h, pleH, pleN, nLayers, vocab,
+  G = { device, cfg, pipelines, B, D, W, layers, staging, nh, h, pleH, pleN, nLayers, vocab,
         bgEmbed, bgFinalNorm, bgLogits, bgArgmax1, bgArgmax2, bgSetup,
         bgPleGather, bgPleCtx, bgPleCtxNorm, bgPleCombine };
   status("ready — Gemma 4 E2B QAT loaded, all shaders compiled from the DSL");

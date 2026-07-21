@@ -48,14 +48,14 @@ async function init() {
   // --- feature probe: what does this browser expose? (gates the subgroup-matrix path) ---
   const feats = [...adapter.features];
   const hasSgMat = feats.includes("chromium-experimental-subgroup-matrix");
+  const wgslFeats = navigator.gpu.wgslLanguageFeatures
+    ? [...navigator.gpu.wgslLanguageFeatures] : [];
   console.log("[gpu] adapter features:", feats.sort());
+  console.log("[gpu] wgslLanguageFeatures:", wgslFeats.sort());
   console.log("[gpu] subgroup-matrix:", hasSgMat,
               "| subgroups:", feats.includes("subgroups"),
               "| shader-f16:", feats.includes("shader-f16"));
-  if (hasSgMat && adapter.requestAdapterInfo) {
-    console.log("[gpu] subgroupMatrixConfigs:",
-                adapter.info?.subgroupMatrixConfigs ?? "(none reported)");
-  }
+  console.log("[gpu] subgroupMatrixConfigs:", adapter.info?.subgroupMatrixConfigs ?? "(none)");
   window.__gpuFeatures = feats; // inspect in console: __gpuFeatures
   const maxTensor = manifest.tensors.reduce((m, t) => Math.max(m, t.byteLength), 0);
   const need = Math.max(maxTensor, 1 << 28); // ~1.17GB PLE table drives this

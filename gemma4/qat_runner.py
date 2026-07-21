@@ -272,7 +272,7 @@ class Gemma4QATGPU:
 
     def _mv_kernel(self, rec: dict) -> str:
         # scalar dq beats vec4-with-dynamic-index (wv[c] spills on Apple GPUs)
-        return {"dq4": "matvec_dq4", "dq2": "matvec_dq2",
+        return {"dq4": "matvec_dq4_blk2", "dq2": "matvec_dq2",
                 "f16": "matvec_wg_packed_v4"}[rec["kind"]]
 
     def _gateup_kernel(self, rec: dict) -> str:
@@ -432,8 +432,9 @@ class Gemma4QATGPU:
         ple_n = cfg.num_layers * ple_h
 
         def mv(rec, bg, label):
-            run(self._mv_kernel(rec), bg, rec["n_out"], label=label,
-                grid=(rec["n_out"], 1, 1))
+            k = self._mv_kernel(rec)
+            n = rec["n_out"] // 2 if k.endswith("_blk2") else rec["n_out"]
+            run(k, bg, n, label=label, grid=(n, 1, 1))
 
         run("qat_embed_2bit", self.bg_embed, h, label="embed")
         run("matvec_wg_packed_v4", self.bg_ple_ctx, self._ple_model_proj_nout,

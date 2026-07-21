@@ -764,6 +764,62 @@ def mv_gateup_geglu_dq2_blk2(
         y_out[r1] = gelu(pg1[0] * gscale[r1]) * (pu1[0] * uscale[r1])
 
 
+@kernel(workgroup_size=(64,))
+def matvec_dq4_blk2(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    w_packed: StorageBuffer[u32, "read"],     # [n_out, n_in/8] (8 int4/u32)
+    x_in: StorageBuffer[f32, "read"],         # [n_in]
+    scale: StorageBuffer[f32, "read"],        # [n_out]
+    y_out: StorageBuffer[f32, "read_write"],  # [n_out]
+    dims: StorageBuffer[u32, "read"],         # [n_out, n_in] (n_out % 2 == 0)
+    q0: WorkgroupArray[f32, 64],
+    q1: WorkgroupArray[f32, 64],
+):
+    # Output-blocked int4 matvec: 2 rows/workgroup, x read once per element.
+    r0: u32 = 2 * wid.x + 0
+    r1: u32 = 2 * wid.x + 1
+    li: u32 = lid.x
+    n_out: u32 = dims[0]
+    n_in: u32 = dims[1]
+    n8: u32 = n_in / 8
+    a0: f32 = 0.0
+    a1: f32 = 0.0
+    for j in range(li, n8, 64):
+        p0: u32 = w_packed[r0 * n8 + j]
+        p1: u32 = w_packed[r1 * n8 + j]
+        b: u32 = 8 * j
+        a0 += f32(i32(p0 & 15) - 8) * x_in[b]
+        a1 += f32(i32(p1 & 15) - 8) * x_in[b]
+        a0 += f32(i32((p0 >> 4) & 15) - 8) * x_in[b + 1]
+        a1 += f32(i32((p1 >> 4) & 15) - 8) * x_in[b + 1]
+        a0 += f32(i32((p0 >> 8) & 15) - 8) * x_in[b + 2]
+        a1 += f32(i32((p1 >> 8) & 15) - 8) * x_in[b + 2]
+        a0 += f32(i32((p0 >> 12) & 15) - 8) * x_in[b + 3]
+        a1 += f32(i32((p1 >> 12) & 15) - 8) * x_in[b + 3]
+        a0 += f32(i32((p0 >> 16) & 15) - 8) * x_in[b + 4]
+        a1 += f32(i32((p1 >> 16) & 15) - 8) * x_in[b + 4]
+        a0 += f32(i32((p0 >> 20) & 15) - 8) * x_in[b + 5]
+        a1 += f32(i32((p1 >> 20) & 15) - 8) * x_in[b + 5]
+        a0 += f32(i32((p0 >> 24) & 15) - 8) * x_in[b + 6]
+        a1 += f32(i32((p1 >> 24) & 15) - 8) * x_in[b + 6]
+        a0 += f32(i32((p0 >> 28) & 15) - 8) * x_in[b + 7]
+        a1 += f32(i32((p1 >> 28) & 15) - 8) * x_in[b + 7]
+    q0[li] = a0
+    q1[li] = a1
+    barrier()
+    s: u32 = 32
+    while s > 0:
+        if li < s:
+            q0[li] = q0[li] + q0[li + s]
+            q1[li] = q1[li] + q1[li + s]
+        barrier()
+        s = s / 2
+    if li == 0:
+        y_out[r0] = q0[0] * scale[r0]
+        y_out[r1] = q1[0] * scale[r1]
+
+
 # Registry for the QAT runner: reusable base gemma4 kernels (norms, rope,
 # attention, geglu, argmax, resident-decode helpers, f16 matvec for 8-bit /
 # unquantized modules) plus the QAT-specific dequant matmuls and gathers.
@@ -776,6 +832,7 @@ _REUSE = (
 KERNELS = {name: K4.KERNELS[name] for name in _REUSE}
 KERNELS.update({
     "matvec_dq4": matvec_dq4,
+    "matvec_dq4_blk2": matvec_dq4_blk2,
     "matvec_dq2": matvec_dq2,
     "matvec_dq2_blk2": matvec_dq2_blk2,
     "matvec_dq2_blk8": matvec_dq2_blk8,

@@ -16,9 +16,11 @@ const ui = {
 const N_ARGMAX_WGS = 128;
 const MAX_SEQ = 512;
 const CHUNK = 16;
-// Experiment: int8 activations + dot4I8Packed for the wide (2-bit) down_proj.
-// Toggle to A/B against the current matvec_dq2_blk2. See qat_kernels int8 block.
-const USE_INT8_DOWN = true;
+// FALSIFIED experiment (kept as toggle): int8 activations + dot4I8Packed for the
+// wide (2-bit) down_proj. Neutral end-to-end in the browser (67.4 → 67.4) — the
+// dq matmuls are load-issue-bound (why output-blocking won), and dot4I8Packed only
+// speeds the dot compute we're not bound on, and can't shrink weight traffic.
+const USE_INT8_DOWN = false;
 
 let G = null;
 const status = (m) => { ui.status.textContent = m; };

@@ -264,11 +264,9 @@ class Gemma4QATGPU:
                 self._mvdims[key] = ub(*key)
         self._mvdims[(self._ple_model_proj_nout, h)] = ub(self._ple_model_proj_nout, h)
 
-        LC = 32768
-        self._logits_chunks = [(s, min(LC, cfg.vocab_size - s))
-                               for s in range(0, cfg.vocab_size, LC)]
-        for _, rows in self._logits_chunks:
-            self._mvdims.setdefault((rows, h), ub(rows, h))
+        # tied 2-bit logits: full vocab in one output-blocked (8 rows/wg) dispatch
+        assert cfg.vocab_size % 8 == 0
+        self._mvdims.setdefault((cfg.vocab_size, h), ub(cfg.vocab_size, h))
 
     # -- matvec dispatch -------------------------------------------------- #
 
@@ -315,16 +313,9 @@ class Gemma4QATGPU:
         self.bg_embed = self._bg("qat_embed_2bit", b["token"], w["embed"],
                                  w["embed_scale"], b["x"], self.fp["embed_scale"], d["embed"])
         self.bg_final_norm = self._bg("rmsnorm_wg", b["x"], w["norm"], b["xn"], d["norm_h"])
-        er_bytes = (cfg.hidden_size // 16) * 4  # u32 per row for 2-bit embed
-        self.bg_logits = []
-        for start, rows in self._logits_chunks:
-            self.bg_logits.append((rows, self._bg(
-                "matvec_dq2",
-                (w["embed"], start * er_bytes, rows * er_bytes),
-                b["xn"],
-                (w["embed_scale"], start * 4, rows * 4),
-                (b["logits"], start * 4, rows * 4),
-                self._mvdims[(rows, cfg.hidden_size)])))
+        self.bg_logits = self._bg(
+            "matvec_dq2_blk8", w["embed"], b["xn"], w["embed_scale"], b["logits"],
+            self._mvdims[(cfg.vocab_size, cfg.hidden_size)])
         self.bg_softcap = self._bg("softcap", b["logits"], self.fp["softcap"], d["softcap"])
         self.bg_argmax1 = self._bg("argmax_stage1", b["logits"], b["part_val"],
                                    b["part_idx"], d["argmax1"])
@@ -482,8 +473,8 @@ class Gemma4QATGPU:
             run("rmsnorm_add_scale_wg", bg["ple_norm_add"], h, label="norm_ple_add", grid=(1, 1, 1))
 
         run("rmsnorm_wg", self.bg_final_norm, h, label="norm_final", grid=(1, 1, 1))
-        for rows, bg in self.bg_logits:
-            run("matvec_dq2", bg, rows, label="mv_logits", grid=(rows, 1, 1))
+        run("matvec_dq2_blk8", self.bg_logits, cfg.vocab_size // 8, label="mv_logits",
+            grid=(cfg.vocab_size // 8, 1, 1))
         if argmax:
             run("argmax_stage1", self.bg_argmax1, self._n_argmax * 64,
                 label="argmax", grid=(self._n_argmax, 1, 1))

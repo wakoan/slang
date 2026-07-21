@@ -252,6 +252,218 @@ def matvec_dq2_blk2(
 
 
 @kernel(workgroup_size=(64,))
+def matvec_dq2_blk8(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    w_packed: StorageBuffer[u32, "read"],     # [n_out, n_in/16]
+    x_in: StorageBuffer[f32, "read"],         # [n_in]
+    scale: StorageBuffer[f32, "read"],        # [n_out]
+    y_out: StorageBuffer[f32, "read_write"],  # [n_out]
+    dims: StorageBuffer[u32, "read"],         # [n_out, n_in] (n_out % 8 == 0)
+    q0: WorkgroupArray[f32, 64],
+    q1: WorkgroupArray[f32, 64],
+    q2: WorkgroupArray[f32, 64],
+    q3: WorkgroupArray[f32, 64],
+    q4: WorkgroupArray[f32, 64],
+    q5: WorkgroupArray[f32, 64],
+    q6: WorkgroupArray[f32, 64],
+    q7: WorkgroupArray[f32, 64],
+):
+    # Output-blocked 8 rows/workgroup: each x element is read once and
+    # reused across 8 weight rows — amortizes the shared-input read (the
+    # decode bottleneck). Used for the 262144-row tied logits matvec.
+    r0: u32 = 8 * wid.x + 0
+    r1: u32 = 8 * wid.x + 1
+    r2: u32 = 8 * wid.x + 2
+    r3: u32 = 8 * wid.x + 3
+    r4: u32 = 8 * wid.x + 4
+    r5: u32 = 8 * wid.x + 5
+    r6: u32 = 8 * wid.x + 6
+    r7: u32 = 8 * wid.x + 7
+    li: u32 = lid.x
+    n_out: u32 = dims[0]
+    n_in: u32 = dims[1]
+    n16: u32 = n_in / 16
+    a0: f32 = 0.0
+    a1: f32 = 0.0
+    a2: f32 = 0.0
+    a3: f32 = 0.0
+    a4: f32 = 0.0
+    a5: f32 = 0.0
+    a6: f32 = 0.0
+    a7: f32 = 0.0
+    for j in range(li, n16, 64):
+        p0: u32 = w_packed[r0 * n16 + j]
+        p1: u32 = w_packed[r1 * n16 + j]
+        p2: u32 = w_packed[r2 * n16 + j]
+        p3: u32 = w_packed[r3 * n16 + j]
+        p4: u32 = w_packed[r4 * n16 + j]
+        p5: u32 = w_packed[r5 * n16 + j]
+        p6: u32 = w_packed[r6 * n16 + j]
+        p7: u32 = w_packed[r7 * n16 + j]
+        b: u32 = 16 * j
+        a0 += f32(i32(p0 & 3) - 2) * x_in[b]
+        a1 += f32(i32(p1 & 3) - 2) * x_in[b]
+        a2 += f32(i32(p2 & 3) - 2) * x_in[b]
+        a3 += f32(i32(p3 & 3) - 2) * x_in[b]
+        a4 += f32(i32(p4 & 3) - 2) * x_in[b]
+        a5 += f32(i32(p5 & 3) - 2) * x_in[b]
+        a6 += f32(i32(p6 & 3) - 2) * x_in[b]
+        a7 += f32(i32(p7 & 3) - 2) * x_in[b]
+        a0 += f32(i32((p0 >> 2) & 3) - 2) * x_in[b + 1]
+        a1 += f32(i32((p1 >> 2) & 3) - 2) * x_in[b + 1]
+        a2 += f32(i32((p2 >> 2) & 3) - 2) * x_in[b + 1]
+        a3 += f32(i32((p3 >> 2) & 3) - 2) * x_in[b + 1]
+        a4 += f32(i32((p4 >> 2) & 3) - 2) * x_in[b + 1]
+        a5 += f32(i32((p5 >> 2) & 3) - 2) * x_in[b + 1]
+        a6 += f32(i32((p6 >> 2) & 3) - 2) * x_in[b + 1]
+        a7 += f32(i32((p7 >> 2) & 3) - 2) * x_in[b + 1]
+        a0 += f32(i32((p0 >> 4) & 3) - 2) * x_in[b + 2]
+        a1 += f32(i32((p1 >> 4) & 3) - 2) * x_in[b + 2]
+        a2 += f32(i32((p2 >> 4) & 3) - 2) * x_in[b + 2]
+        a3 += f32(i32((p3 >> 4) & 3) - 2) * x_in[b + 2]
+        a4 += f32(i32((p4 >> 4) & 3) - 2) * x_in[b + 2]
+        a5 += f32(i32((p5 >> 4) & 3) - 2) * x_in[b + 2]
+        a6 += f32(i32((p6 >> 4) & 3) - 2) * x_in[b + 2]
+        a7 += f32(i32((p7 >> 4) & 3) - 2) * x_in[b + 2]
+        a0 += f32(i32((p0 >> 6) & 3) - 2) * x_in[b + 3]
+        a1 += f32(i32((p1 >> 6) & 3) - 2) * x_in[b + 3]
+        a2 += f32(i32((p2 >> 6) & 3) - 2) * x_in[b + 3]
+        a3 += f32(i32((p3 >> 6) & 3) - 2) * x_in[b + 3]
+        a4 += f32(i32((p4 >> 6) & 3) - 2) * x_in[b + 3]
+        a5 += f32(i32((p5 >> 6) & 3) - 2) * x_in[b + 3]
+        a6 += f32(i32((p6 >> 6) & 3) - 2) * x_in[b + 3]
+        a7 += f32(i32((p7 >> 6) & 3) - 2) * x_in[b + 3]
+        a0 += f32(i32((p0 >> 8) & 3) - 2) * x_in[b + 4]
+        a1 += f32(i32((p1 >> 8) & 3) - 2) * x_in[b + 4]
+        a2 += f32(i32((p2 >> 8) & 3) - 2) * x_in[b + 4]
+        a3 += f32(i32((p3 >> 8) & 3) - 2) * x_in[b + 4]
+        a4 += f32(i32((p4 >> 8) & 3) - 2) * x_in[b + 4]
+        a5 += f32(i32((p5 >> 8) & 3) - 2) * x_in[b + 4]
+        a6 += f32(i32((p6 >> 8) & 3) - 2) * x_in[b + 4]
+        a7 += f32(i32((p7 >> 8) & 3) - 2) * x_in[b + 4]
+        a0 += f32(i32((p0 >> 10) & 3) - 2) * x_in[b + 5]
+        a1 += f32(i32((p1 >> 10) & 3) - 2) * x_in[b + 5]
+        a2 += f32(i32((p2 >> 10) & 3) - 2) * x_in[b + 5]
+        a3 += f32(i32((p3 >> 10) & 3) - 2) * x_in[b + 5]
+        a4 += f32(i32((p4 >> 10) & 3) - 2) * x_in[b + 5]
+        a5 += f32(i32((p5 >> 10) & 3) - 2) * x_in[b + 5]
+        a6 += f32(i32((p6 >> 10) & 3) - 2) * x_in[b + 5]
+        a7 += f32(i32((p7 >> 10) & 3) - 2) * x_in[b + 5]
+        a0 += f32(i32((p0 >> 12) & 3) - 2) * x_in[b + 6]
+        a1 += f32(i32((p1 >> 12) & 3) - 2) * x_in[b + 6]
+        a2 += f32(i32((p2 >> 12) & 3) - 2) * x_in[b + 6]
+        a3 += f32(i32((p3 >> 12) & 3) - 2) * x_in[b + 6]
+        a4 += f32(i32((p4 >> 12) & 3) - 2) * x_in[b + 6]
+        a5 += f32(i32((p5 >> 12) & 3) - 2) * x_in[b + 6]
+        a6 += f32(i32((p6 >> 12) & 3) - 2) * x_in[b + 6]
+        a7 += f32(i32((p7 >> 12) & 3) - 2) * x_in[b + 6]
+        a0 += f32(i32((p0 >> 14) & 3) - 2) * x_in[b + 7]
+        a1 += f32(i32((p1 >> 14) & 3) - 2) * x_in[b + 7]
+        a2 += f32(i32((p2 >> 14) & 3) - 2) * x_in[b + 7]
+        a3 += f32(i32((p3 >> 14) & 3) - 2) * x_in[b + 7]
+        a4 += f32(i32((p4 >> 14) & 3) - 2) * x_in[b + 7]
+        a5 += f32(i32((p5 >> 14) & 3) - 2) * x_in[b + 7]
+        a6 += f32(i32((p6 >> 14) & 3) - 2) * x_in[b + 7]
+        a7 += f32(i32((p7 >> 14) & 3) - 2) * x_in[b + 7]
+        a0 += f32(i32((p0 >> 16) & 3) - 2) * x_in[b + 8]
+        a1 += f32(i32((p1 >> 16) & 3) - 2) * x_in[b + 8]
+        a2 += f32(i32((p2 >> 16) & 3) - 2) * x_in[b + 8]
+        a3 += f32(i32((p3 >> 16) & 3) - 2) * x_in[b + 8]
+        a4 += f32(i32((p4 >> 16) & 3) - 2) * x_in[b + 8]
+        a5 += f32(i32((p5 >> 16) & 3) - 2) * x_in[b + 8]
+        a6 += f32(i32((p6 >> 16) & 3) - 2) * x_in[b + 8]
+        a7 += f32(i32((p7 >> 16) & 3) - 2) * x_in[b + 8]
+        a0 += f32(i32((p0 >> 18) & 3) - 2) * x_in[b + 9]
+        a1 += f32(i32((p1 >> 18) & 3) - 2) * x_in[b + 9]
+        a2 += f32(i32((p2 >> 18) & 3) - 2) * x_in[b + 9]
+        a3 += f32(i32((p3 >> 18) & 3) - 2) * x_in[b + 9]
+        a4 += f32(i32((p4 >> 18) & 3) - 2) * x_in[b + 9]
+        a5 += f32(i32((p5 >> 18) & 3) - 2) * x_in[b + 9]
+        a6 += f32(i32((p6 >> 18) & 3) - 2) * x_in[b + 9]
+        a7 += f32(i32((p7 >> 18) & 3) - 2) * x_in[b + 9]
+        a0 += f32(i32((p0 >> 20) & 3) - 2) * x_in[b + 10]
+        a1 += f32(i32((p1 >> 20) & 3) - 2) * x_in[b + 10]
+        a2 += f32(i32((p2 >> 20) & 3) - 2) * x_in[b + 10]
+        a3 += f32(i32((p3 >> 20) & 3) - 2) * x_in[b + 10]
+        a4 += f32(i32((p4 >> 20) & 3) - 2) * x_in[b + 10]
+        a5 += f32(i32((p5 >> 20) & 3) - 2) * x_in[b + 10]
+        a6 += f32(i32((p6 >> 20) & 3) - 2) * x_in[b + 10]
+        a7 += f32(i32((p7 >> 20) & 3) - 2) * x_in[b + 10]
+        a0 += f32(i32((p0 >> 22) & 3) - 2) * x_in[b + 11]
+        a1 += f32(i32((p1 >> 22) & 3) - 2) * x_in[b + 11]
+        a2 += f32(i32((p2 >> 22) & 3) - 2) * x_in[b + 11]
+        a3 += f32(i32((p3 >> 22) & 3) - 2) * x_in[b + 11]
+        a4 += f32(i32((p4 >> 22) & 3) - 2) * x_in[b + 11]
+        a5 += f32(i32((p5 >> 22) & 3) - 2) * x_in[b + 11]
+        a6 += f32(i32((p6 >> 22) & 3) - 2) * x_in[b + 11]
+        a7 += f32(i32((p7 >> 22) & 3) - 2) * x_in[b + 11]
+        a0 += f32(i32((p0 >> 24) & 3) - 2) * x_in[b + 12]
+        a1 += f32(i32((p1 >> 24) & 3) - 2) * x_in[b + 12]
+        a2 += f32(i32((p2 >> 24) & 3) - 2) * x_in[b + 12]
+        a3 += f32(i32((p3 >> 24) & 3) - 2) * x_in[b + 12]
+        a4 += f32(i32((p4 >> 24) & 3) - 2) * x_in[b + 12]
+        a5 += f32(i32((p5 >> 24) & 3) - 2) * x_in[b + 12]
+        a6 += f32(i32((p6 >> 24) & 3) - 2) * x_in[b + 12]
+        a7 += f32(i32((p7 >> 24) & 3) - 2) * x_in[b + 12]
+        a0 += f32(i32((p0 >> 26) & 3) - 2) * x_in[b + 13]
+        a1 += f32(i32((p1 >> 26) & 3) - 2) * x_in[b + 13]
+        a2 += f32(i32((p2 >> 26) & 3) - 2) * x_in[b + 13]
+        a3 += f32(i32((p3 >> 26) & 3) - 2) * x_in[b + 13]
+        a4 += f32(i32((p4 >> 26) & 3) - 2) * x_in[b + 13]
+        a5 += f32(i32((p5 >> 26) & 3) - 2) * x_in[b + 13]
+        a6 += f32(i32((p6 >> 26) & 3) - 2) * x_in[b + 13]
+        a7 += f32(i32((p7 >> 26) & 3) - 2) * x_in[b + 13]
+        a0 += f32(i32((p0 >> 28) & 3) - 2) * x_in[b + 14]
+        a1 += f32(i32((p1 >> 28) & 3) - 2) * x_in[b + 14]
+        a2 += f32(i32((p2 >> 28) & 3) - 2) * x_in[b + 14]
+        a3 += f32(i32((p3 >> 28) & 3) - 2) * x_in[b + 14]
+        a4 += f32(i32((p4 >> 28) & 3) - 2) * x_in[b + 14]
+        a5 += f32(i32((p5 >> 28) & 3) - 2) * x_in[b + 14]
+        a6 += f32(i32((p6 >> 28) & 3) - 2) * x_in[b + 14]
+        a7 += f32(i32((p7 >> 28) & 3) - 2) * x_in[b + 14]
+        a0 += f32(i32((p0 >> 30) & 3) - 2) * x_in[b + 15]
+        a1 += f32(i32((p1 >> 30) & 3) - 2) * x_in[b + 15]
+        a2 += f32(i32((p2 >> 30) & 3) - 2) * x_in[b + 15]
+        a3 += f32(i32((p3 >> 30) & 3) - 2) * x_in[b + 15]
+        a4 += f32(i32((p4 >> 30) & 3) - 2) * x_in[b + 15]
+        a5 += f32(i32((p5 >> 30) & 3) - 2) * x_in[b + 15]
+        a6 += f32(i32((p6 >> 30) & 3) - 2) * x_in[b + 15]
+        a7 += f32(i32((p7 >> 30) & 3) - 2) * x_in[b + 15]
+    q0[li] = a0
+    q1[li] = a1
+    q2[li] = a2
+    q3[li] = a3
+    q4[li] = a4
+    q5[li] = a5
+    q6[li] = a6
+    q7[li] = a7
+    barrier()
+    s: u32 = 32
+    while s > 0:
+        if li < s:
+            q0[li] = q0[li] + q0[li + s]
+            q1[li] = q1[li] + q1[li + s]
+            q2[li] = q2[li] + q2[li + s]
+            q3[li] = q3[li] + q3[li + s]
+            q4[li] = q4[li] + q4[li + s]
+            q5[li] = q5[li] + q5[li + s]
+            q6[li] = q6[li] + q6[li + s]
+            q7[li] = q7[li] + q7[li + s]
+        barrier()
+        s = s / 2
+    if li == 0:
+        y_out[r0] = q0[0] * scale[r0]
+        y_out[r1] = q1[0] * scale[r1]
+        y_out[r2] = q2[0] * scale[r2]
+        y_out[r3] = q3[0] * scale[r3]
+        y_out[r4] = q4[0] * scale[r4]
+        y_out[r5] = q5[0] * scale[r5]
+        y_out[r6] = q6[0] * scale[r6]
+        y_out[r7] = q7[0] * scale[r7]
+
+
+@kernel(workgroup_size=(64,))
 def mv_gateup_geglu_dq2(
     wid: Builtin.workgroup_id,
     lid: Builtin.local_invocation_id,
@@ -449,6 +661,7 @@ KERNELS.update({
     "matvec_dq4": matvec_dq4,
     "matvec_dq2": matvec_dq2,
     "matvec_dq2_blk2": matvec_dq2_blk2,
+    "matvec_dq2_blk8": matvec_dq2_blk8,
     "mv_gateup_geglu_dq2": mv_gateup_geglu_dq2,
     "mv_gateup_geglu_dq4": mv_gateup_geglu_dq4,
     "mv_geglu_f16": mv_geglu_f16,

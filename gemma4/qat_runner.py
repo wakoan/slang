@@ -277,6 +277,16 @@ class Gemma4QATGPU:
         return {"dq4": "matvec_dq4", "dq2": "matvec_dq2",
                 "f16": "matvec_wg_packed_v4"}[rec["kind"]]
 
+    def _gateup_kernel(self, rec: dict) -> str:
+        return "mv_gateup_geglu_dq2" if rec["kind"] == "dq2" else "mv_gateup_geglu_dq4"
+
+    def _gateup_bg(self, gate: dict, up: dict):
+        # Fused gate+up+geglu. gate/up share kind (both 2-bit L15-34, 4-bit L0-14).
+        assert gate["kind"] == up["kind"] and gate["kind"] in ("dq2", "dq4")
+        dims = self._mvdims[(gate["n_out"], gate["n_in"])]
+        return self._bg(self._gateup_kernel(gate), gate["w"], up["w"], self.b["xn"],
+                        gate["scale"], up["scale"], self.b["ffh"], dims)
+
     def _mv_bg(self, rec: dict, x_buf, y_buf, wview=None, sview=None, dims=None):
         w = wview if wview is not None else rec["w"]
         dims = dims if dims is not None else self._mvdims[(rec["n_out"], rec["n_in"])]
@@ -357,20 +367,18 @@ class Gemma4QATGPU:
                                        w[p + "post_attention_layernorm.weight"],
                                        w[p + "pre_feedforward_layernorm.weight"],
                                        b["x"], b["xn"], d["norm_h"]),
-                "gate": self._mv_bg(self.lin[p + "gate"], b["xn"], b["gate"]),
-                "up": self._mv_bg(self.lin[p + "up"], b["xn"], b["up"]),
-                "geglu": self._bg("geglu", b["gate"], b["up"], b["ffh"],
-                                  self._geglu_dims(spec.intermediate)),
+                "gateup": self._gateup_bg(self.lin[p + "gate"], self.lin[p + "up"]),
                 "down": self._mv_bg(self.lin[p + "down"], b["ffh"], b["mlp_out"]),
                 # post-FFN residual add-norm: x += rmsnorm(mlp_out) * (1 + w)
                 "norm_pff_add": self._bg("rmsnorm_add_wg", b["mlp_out"],
                                          w[p + "post_feedforward_layernorm.weight"],
                                          b["x"], d["norm_h"]),
-                # PLE block
-                "ple_gate": self._mv_bg(self.lin[p + "ple_gate"], b["x"], b["ple_g"]),
-                "ple_geglu": self._bg("geglu", b["ple_g"],
-                                      (b["ple_in"], L * ple_bytes, ple_bytes),
-                                      b["ple_h"], d["geglu_ple"]),
+                # PLE block: fused gate matmul + geglu (up operand = ple_in slice)
+                "ple_gateup": self._bg(
+                    "mv_geglu_f16", self.lin[p + "ple_gate"]["w"], b["x"],
+                    (b["ple_in"], L * ple_bytes, ple_bytes), b["ple_h"],
+                    self._mvdims[(self.lin[p + "ple_gate"]["n_out"],
+                                  self.lin[p + "ple_gate"]["n_in"])]),
                 "ple_proj": self._mv_bg(self.lin[p + "ple_proj"], b["ple_h"], b["ple_proj"]),
                 "ple_norm_add": self._bg("rmsnorm_add_scale_wg", b["ple_proj"],
                                          w[p + "post_per_layer_input_norm.weight"],
@@ -454,13 +462,12 @@ class Gemma4QATGPU:
             run("attention_fused_g4", bg["attn"], nh * 64, label="attn", grid=(nh, 1, 1))
             mv(self.lin[f"{PREFIX}layers.{spec.index}.o"], bg["o"], "mv_o")
             run("rmsnorm_add_norm_wg", bg["norm_pa_pf"], h, label="norm_add_norm", grid=(1, 1, 1))
-            mv(self.lin[f"{PREFIX}layers.{spec.index}.gate"], bg["gate"], "mv_gateup")
-            mv(self.lin[f"{PREFIX}layers.{spec.index}.up"], bg["up"], "mv_gateup")
-            run("geglu", bg["geglu"], spec.intermediate, label="geglu")
+            gk = self._gateup_kernel(self.lin[f"{PREFIX}layers.{spec.index}.gate"])
+            run(gk, bg["gateup"], spec.intermediate, label="mv_gateup",
+                grid=(spec.intermediate, 1, 1))
             mv(self.lin[f"{PREFIX}layers.{spec.index}.down"], bg["down"], "mv_down")
             run("rmsnorm_add_wg", bg["norm_pff_add"], h, label="norm_post_add", grid=(1, 1, 1))
-            mv(self.lin[f"{PREFIX}layers.{spec.index}.ple_gate"], bg["ple_gate"], "mv_ple")
-            run("geglu", bg["ple_geglu"], ple_h, label="geglu")
+            run("mv_geglu_f16", bg["ple_gateup"], ple_h, label="mv_ple", grid=(ple_h, 1, 1))
             mv(self.lin[f"{PREFIX}layers.{spec.index}.ple_proj"], bg["ple_proj"], "mv_ple")
             run("rmsnorm_add_scale_wg", bg["ple_norm_add"], h, label="norm_ple_add", grid=(1, 1, 1))
 

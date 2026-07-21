@@ -592,9 +592,13 @@ class _WGSLTranslator:
         op_t = type(node.op)
         if op_t in _BITWISE_OPS:
             # WGSL forbids mixing bitwise/shift with other operators without
-            # parentheses, so these are always self-parenthesised.
+            # parentheses (strict per spec; naga is lenient, Dawn is not), so
+            # these are self-parenthesised AND their operands are rendered at
+            # unary precedence so any arith/shift operand wraps too
+            # (e.g. `w >> 2 * k` → `(w >> (2 * k))`).
             sym = _BITWISE_OPS[op_t]
-            return f"({self._expr(node.left)} {sym} {self._expr(node.right)})"
+            return (f"({self._expr(node.left, _P_UNARY)} {sym} "
+                    f"{self._expr(node.right, _P_UNARY)})")
         if op_t not in _ARITH_OPS:
             raise TranslationError(f"Unsupported operator: {op_t.__name__}")
         sym, myprec = _ARITH_OPS[op_t]

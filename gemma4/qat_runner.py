@@ -277,10 +277,10 @@ class Gemma4QATGPU:
 
     def _gateup_kernel(self, rec: dict) -> str:
         # dq2 (wide 2-bit layers) uses the output-blocked variant (4 rows/wg).
-        return "mv_gateup_geglu_dq2_blk4" if rec["kind"] == "dq2" else "mv_gateup_geglu_dq4"
+        return "mv_gateup_geglu_dq2_blk8" if rec["kind"] == "dq2" else "mv_gateup_geglu_dq4"
 
     def _gateup_grid(self, rec: dict) -> int:
-        return rec["n_out"] // 4 if rec["kind"] == "dq2" else rec["n_out"]
+        return rec["n_out"] // 8 if rec["kind"] == "dq2" else rec["n_out"]
 
     def _gateup_bg(self, gate: dict, up: dict):
         # Fused gate+up+geglu. gate/up share kind (both 2-bit L15-34, 4-bit L0-14).

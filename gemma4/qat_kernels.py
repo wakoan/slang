@@ -1936,7 +1936,187 @@ def matvec_dq2_i8(
         y_out[r] = f32(partial[0]) * wscale[r] * actscale[0]
 
 
+
+# --- 256-thread norm variants (browser: better single-workgroup occupancy) ---
+
+@kernel(workgroup_size=(256,))
+def rmsnorm_wg_t256(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    x_in: StorageBuffer[f32, "read"],         # [n_rows, row_len]
+    w: StorageBuffer[f32, "read"],            # [row_len]
+    x_out: StorageBuffer[f32, "read_write"],  # [n_rows, row_len]
+    dims: StorageBuffer[u32, "read"],         # [n_rows, row_len]
+    partial: WorkgroupArray[f32, 256],
+):
+    # One workgroup per row: phase 1 reduces sum-of-squares in shared
+    # memory, phase 2 has all 64 threads write the normalised row.
+    row: u32 = wid.x
+    li: u32 = lid.x
+    n_rows: u32 = dims[0]
+    row_len: u32 = dims[1]
+
+    acc: f32 = 0.0
+    if row < n_rows:
+        for j in range(li, row_len, 256):
+            v: f32 = x_in[row * row_len + j]
+            acc += v * v
+    partial[li] = acc
+    barrier()
+
+    s: u32 = 128
+    while s > 0:
+        if li < s:
+            partial[li] = partial[li] + partial[li + s]
+        barrier()
+        s = s / 2
+
+    inv: f32 = 1.0 / sqrt(partial[0] / f32(row_len) + 1e-6)
+    if row < n_rows:
+        for j in range(li, row_len, 256):
+            x_out[row * row_len + j] = x_in[row * row_len + j] * inv * (1.0 + w[j])
+
+@kernel(workgroup_size=(256,))
+def rmsnorm_add_wg_t256(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    x_in: StorageBuffer[f32, "read"],         # [n_rows, row_len] block output
+    w: StorageBuffer[f32, "read"],            # [row_len] norm weight
+    x_io: StorageBuffer[f32, "read_write"],   # [n_rows, row_len] residual accumulator
+    dims: StorageBuffer[u32, "read"],         # [n_rows, row_len]
+    partial: WorkgroupArray[f32, 256],
+):
+    # Fused post-norm + residual add: x_io += rmsnorm(x_in) * (1 + w)
+    row: u32 = wid.x
+    li: u32 = lid.x
+    n_rows: u32 = dims[0]
+    row_len: u32 = dims[1]
+
+    acc: f32 = 0.0
+    if row < n_rows:
+        for j in range(li, row_len, 256):
+            v: f32 = x_in[row * row_len + j]
+            acc += v * v
+    partial[li] = acc
+    barrier()
+
+    s: u32 = 128
+    while s > 0:
+        if li < s:
+            partial[li] = partial[li] + partial[li + s]
+        barrier()
+        s = s / 2
+
+    inv: f32 = 1.0 / sqrt(partial[0] / f32(row_len) + 1e-6)
+    if row < n_rows:
+        for j in range(li, row_len, 256):
+            idx: u32 = row * row_len + j
+            x_io[idx] = x_io[idx] + x_in[idx] * inv * (1.0 + w[j])
+
+@kernel(workgroup_size=(256,))
+def rmsnorm_add_norm_wg_t256(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    src: StorageBuffer[f32, "read"],          # [n_rows, row_len] branch output
+    w1: StorageBuffer[f32, "read"],           # [row_len] add-norm weight (w-1)
+    w2: StorageBuffer[f32, "read"],           # [row_len] second-norm weight (w-1)
+    x_io: StorageBuffer[f32, "read_write"],   # [n_rows, row_len] residual accumulator
+    x_out: StorageBuffer[f32, "read_write"],  # [n_rows, row_len] second-norm output
+    dims: StorageBuffer[u32, "read"],         # [n_rows, row_len]
+    partial: WorkgroupArray[f32, 256],
+):
+    # Fuses rmsnorm_add + rmsnorm (Gemma 4 post-attention residual add-norm
+    # then pre-FFN norm) in one workgroup, saving a dispatch and a re-read
+    # of the residual from VRAM:
+    #   x_io  += rmsnorm(src) * (1 + w1)
+    #   x_out  = rmsnorm(x_io) * (1 + w2)
+    row: u32 = wid.x
+    li: u32 = lid.x
+    n_rows: u32 = dims[0]
+    row_len: u32 = dims[1]
+
+    acc: f32 = 0.0
+    if row < n_rows:
+        for j in range(li, row_len, 256):
+            v: f32 = src[row * row_len + j]
+            acc += v * v
+    partial[li] = acc
+    barrier()
+    s: u32 = 128
+    while s > 0:
+        if li < s:
+            partial[li] = partial[li] + partial[li + s]
+        barrier()
+        s = s / 2
+    inv1: f32 = 1.0 / sqrt(partial[0] / f32(row_len) + 1e-6)
+    barrier()  # all lanes read partial[0] before it is overwritten below
+
+    acc2: f32 = 0.0
+    if row < n_rows:
+        for j in range(li, row_len, 256):
+            idx: u32 = row * row_len + j
+            v2: f32 = x_io[idx] + src[idx] * inv1 * (1.0 + w1[j])
+            x_io[idx] = v2
+            acc2 += v2 * v2
+    partial[li] = acc2
+    barrier()
+    s = 128
+    while s > 0:
+        if li < s:
+            partial[li] = partial[li] + partial[li + s]
+        barrier()
+        s = s / 2
+    inv2: f32 = 1.0 / sqrt(partial[0] / f32(row_len) + 1e-6)
+    if row < n_rows:
+        for j in range(li, row_len, 256):
+            idx2: u32 = row * row_len + j
+            x_out[idx2] = x_io[idx2] * inv2 * (1.0 + w2[j])
+
+@kernel(workgroup_size=(256,))
+def rmsnorm_add_scale_wg_t256(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    src: StorageBuffer[f32, "read"],          # [n_rows, row_len] PLE projection
+    w: StorageBuffer[f32, "read"],            # [row_len] norm weight (w-1)
+    x_io: StorageBuffer[f32, "read_write"],   # [n_rows, row_len] residual accumulator
+    fparams: StorageBuffer[f32, "read"],      # [scale] = learned layer_scalar
+    dims: StorageBuffer[u32, "read"],         # [n_rows, row_len]
+    partial: WorkgroupArray[f32, 256],
+):
+    # Fuses the PLE post-norm with the scaled residual add that ends the
+    # per-layer-embedding block (one dispatch, no separate ple_norm buffer):
+    #   x_io = (x_io + rmsnorm(src) * (1 + w)) * scale
+    row: u32 = wid.x
+    li: u32 = lid.x
+    n_rows: u32 = dims[0]
+    row_len: u32 = dims[1]
+
+    acc: f32 = 0.0
+    if row < n_rows:
+        for j in range(li, row_len, 256):
+            v: f32 = src[row * row_len + j]
+            acc += v * v
+    partial[li] = acc
+    barrier()
+    s: u32 = 128
+    while s > 0:
+        if li < s:
+            partial[li] = partial[li] + partial[li + s]
+        barrier()
+        s = s / 2
+    inv: f32 = 1.0 / sqrt(partial[0] / f32(row_len) + 1e-6)
+    scale: f32 = fparams[0]
+    if row < n_rows:
+        for j in range(li, row_len, 256):
+            idx: u32 = row * row_len + j
+            x_io[idx] = (x_io[idx] + src[idx] * inv * (1.0 + w[j])) * scale
+
+
 BROWSER_EXTRA_KERNELS = {
+    "rmsnorm_wg_t256": rmsnorm_wg_t256,
+    "rmsnorm_add_wg_t256": rmsnorm_add_wg_t256,
+    "rmsnorm_add_norm_wg_t256": rmsnorm_add_norm_wg_t256,
+    "rmsnorm_add_scale_wg_t256": rmsnorm_add_scale_wg_t256,
     "quant_i8": quant_i8,
     "matvec_dq2_i8": matvec_dq2_i8,
 }

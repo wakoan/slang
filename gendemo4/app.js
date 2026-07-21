@@ -21,6 +21,13 @@ const CHUNK = 16;
 // dq matmuls are load-issue-bound (why output-blocking won), and dot4I8Packed only
 // speeds the dot compute we're not bound on, and can't shrink weight traffic.
 const USE_INT8_DOWN = false;
+// Experiment: 256-thread norms (grid=1 single-workgroup norms are ~24% of the
+// browser profile; 4x threads hide their memory latency). A/B via this toggle.
+const USE_T256_NORMS = true;
+const K_RMS = USE_T256_NORMS ? "rmsnorm_wg_t256" : "rmsnorm_wg";
+const K_RMS_ADD_NORM = USE_T256_NORMS ? "rmsnorm_add_norm_wg_t256" : "rmsnorm_add_norm_wg";
+const K_RMS_ADD = USE_T256_NORMS ? "rmsnorm_add_wg_t256" : "rmsnorm_add_wg";
+const K_RMS_ADD_SCALE = USE_T256_NORMS ? "rmsnorm_add_scale_wg_t256" : "rmsnorm_add_scale_wg";
 
 let G = null;
 const status = (m) => { ui.status.textContent = m; };
@@ -264,7 +271,7 @@ async function init() {
     : bg(mvKernel(rec.kind), W[rec.w], xBuf, W[rec.scale], yBuf, dimsFor(rec));
 
   const bgEmbed = bg("qat_embed_2bit", B.token, W.embed, W.embed_scale, B.x, FP.embed_scale, D.embed);
-  const bgFinalNorm = bg("rmsnorm_wg", B.x, W.norm, B.xn, D.normH);
+  const bgFinalNorm = bg(K_RMS, B.x, W.norm, B.xn, D.normH);
   const bgLogits = bg("matvec_dq2_blk16", W.embed, B.xn, W.embed_scale, B.logits, D.mvVocab);
   const bgArgmax1 = bg("argmax_stage1", B.logits, B.partVal, B.partIdx, D.argmax1);
   const bgArgmax2 = bg("argmax_stage2", B.partVal, B.partIdx, B.token, B.outTokens, B.counter, D.argmax2);
@@ -273,7 +280,7 @@ async function init() {
   const bgPleGather = bg("qat_ple_gather_4bit", B.token, W.ple_table, W.ple_table_scale,
                          B.pleTok, FP.ple_scale, D.pleGather);
   const bgPleCtx = bg("matvec_wg_packed_v4", W.ple_model_proj, B.x, B.pleCtx, D.mvPleCtx);
-  const bgPleCtxNorm = bg("rmsnorm_wg", B.pleCtx, W.ple_proj_norm, B.pleCtxN, D.normPleRows);
+  const bgPleCtxNorm = bg(K_RMS, B.pleCtx, W.ple_proj_norm, B.pleCtxN, D.normPleRows);
   const bgPleCombine = bg("combine_scaled", B.pleCtxN, B.pleTok, B.pleIn, FP.combine, D.combine);
   const pleBytes = pleH * 4;
 
@@ -286,14 +293,14 @@ async function init() {
     const pgR = lins[`L${L}.ple_gate`], ppR = lins[`L${L}.ple_proj`];
     const o = {
       spec: s, qR, oR, gR, dR, ppR, pgR,
-      norm1: bg("rmsnorm_wg", B.x, W[`L${L}.norm_in`], B.xn, D.normH),
+      norm1: bg(K_RMS, B.x, W[`L${L}.norm_in`], B.xn, D.normH),
       q: mvBg(qR, B.xn, B.q),
-      qnorm: bg("rmsnorm_wg", B.q, W[`L${L}.q_norm`], B.qn, D[`normQ_${tag}`]),
+      qnorm: bg(K_RMS, B.q, W[`L${L}.q_norm`], B.qn, D[`normQ_${tag}`]),
       ropeQ: bg("rope_pl", B.qn, ropeF, D[`ropeQ_${tag}`]),
       attn: bg("attention_fused_g4", B.qn, kCache[s.kv_source], vCache[s.kv_source],
                B.scores, B.attn, scD),
       o: mvBg(oR, B.attn, B.attnProj),
-      normPaPf: bg("rmsnorm_add_norm_wg", B.attnProj, W[`L${L}.norm_pa`], W[`L${L}.norm_pf`],
+      normPaPf: bg(K_RMS_ADD_NORM, B.attnProj, W[`L${L}.norm_pa`], W[`L${L}.norm_pf`],
                    B.x, B.xn, D.normH),
       gateup: bg(gateupKernel(gR.kind), W[gR.w], W[uR.w], B.xn, W[gR.scale], W[uR.scale],
                  B.ffh, dimsFor(gR)),
@@ -307,18 +314,18 @@ async function init() {
       downI8: dR.kind === "dq2"
         ? bg("matvec_dq2_i8", W[dR.w], B.ffhQ, W[dR.scale], B.actScale, B.mlpOut, dimsFor(dR))
         : null,
-      normPffAdd: bg("rmsnorm_add_wg", B.mlpOut, W[`L${L}.norm_pff`], B.x, D.normH),
+      normPffAdd: bg(K_RMS_ADD, B.mlpOut, W[`L${L}.norm_pff`], B.x, D.normH),
       pleGateup: bg("mv_geglu_f16", W[pgR.w], B.x, [B.pleIn, L * pleBytes, pleBytes],
                     B.pleH, dimsFor(pgR)),
       pleProj: mvBg(ppR, B.pleH, B.pleProj),
-      pleNormAdd: bg("rmsnorm_add_scale_wg", B.pleProj, W[`L${L}.ple_norm`], B.x,
+      pleNormAdd: bg(K_RMS_ADD_SCALE, B.pleProj, W[`L${L}.ple_norm`], B.x,
                      W[`L${L}.layer_scalar`], D.normH),
     };
     if (!s.kv_shared) {
       const kR = lins[`L${L}.k`], vR = lins[`L${L}.v`];
       o.kR = kR; o.vR = vR;
       o.k = mvBg(kR, B.xn, B.k);
-      o.knorm = bg("rmsnorm_wg", B.k, W[`L${L}.k_norm`], B.kn, D[`normK_${tag}`]);
+      o.knorm = bg(K_RMS, B.k, W[`L${L}.k_norm`], B.kn, D[`normK_${tag}`]);
       o.ropeK = bg("rope_pl", B.kn, ropeF, D[`ropeK_${tag}`]);
       o.v = mvBg(vR, B.xn, B.v);
       o.vnorm = bg("rmsnorm_ns_wg", B.v, B.vn, D[`normK_${tag}`]);
@@ -431,19 +438,19 @@ function encodeForwardWith(run, wantLogits) {
 
   run("qat_embed_2bit", G.bgEmbed, ceilDiv(h, 64));
   run("matvec_wg_packed_v4", G.bgPleCtx, cfg.ple_model_proj_nout);
-  run("rmsnorm_wg", G.bgPleCtxNorm, nLayers);
+  run(K_RMS, G.bgPleCtxNorm, nLayers);
   run("qat_ple_gather_4bit", G.bgPleGather, ceilDiv(pleN, 64));
   run("combine_scaled", G.bgPleCombine, ceilDiv(pleN, 64));
 
   for (const L of layers) {
     const s = L.spec, hd = s.head_dim;
-    run("rmsnorm_wg", L.norm1, 1);
+    run(K_RMS, L.norm1, 1);
     mv(L.qR, L.q);
-    run("rmsnorm_wg", L.qnorm, nh);
+    run(K_RMS, L.qnorm, nh);
     run("rope_pl", L.ropeQ, ceilDiv(nh * hd / 2, 64));
     if (!s.kv_shared) {
       mv(L.kR, L.k);
-      run("rmsnorm_wg", L.knorm, 1);
+      run(K_RMS, L.knorm, 1);
       run("rope_pl", L.ropeK, ceilDiv(hd / 2, 64));
       mv(L.vR, L.v);
       run("rmsnorm_ns_wg", L.vnorm, 1);
@@ -452,7 +459,7 @@ function encodeForwardWith(run, wantLogits) {
     }
     run("attention_fused_g4", L.attn, nh);
     mv(L.oR, L.o);
-    run("rmsnorm_add_norm_wg", L.normPaPf, 1);
+    run(K_RMS_ADD_NORM, L.normPaPf, 1);
     run(gateupKernel(L.gR.kind), L.gateup, gateupGrid(L.gR));
     if (USE_INT8_DOWN && L.dR.kind === "dq2") {
       run("quant_i8", L.quantDown, 1);            // ffh -> int8 + scale
@@ -460,13 +467,13 @@ function encodeForwardWith(run, wantLogits) {
     } else {
       run(L.dR.kind === "dq2" ? "matvec_dq2_blk2" : "matvec_dq4_blk2", L.down, L.dR.n_out / 2);
     }
-    run("rmsnorm_add_wg", L.normPffAdd, 1);
+    run(K_RMS_ADD, L.normPffAdd, 1);
     run("mv_geglu_f16", L.pleGateup, pleH);
     mv(L.ppR, L.pleProj);
-    run("rmsnorm_add_scale_wg", L.pleNormAdd, 1);
+    run(K_RMS_ADD_SCALE, L.pleNormAdd, 1);
   }
   if (wantLogits) {
-    run("rmsnorm_wg", G.bgFinalNorm, 1);
+    run(K_RMS, G.bgFinalNorm, 1);
     run("matvec_dq2_blk16", G.bgLogits, vocab / 16);
   }
 }

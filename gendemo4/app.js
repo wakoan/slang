@@ -28,6 +28,10 @@ const K_RMS = USE_T256_NORMS ? "rmsnorm_wg_t256" : "rmsnorm_wg";
 const K_RMS_ADD_NORM = USE_T256_NORMS ? "rmsnorm_add_norm_wg_t256" : "rmsnorm_add_norm_wg";
 const K_RMS_ADD = USE_T256_NORMS ? "rmsnorm_add_wg_t256" : "rmsnorm_add_wg";
 const K_RMS_ADD_SCALE = USE_T256_NORMS ? "rmsnorm_add_scale_wg_t256" : "rmsnorm_add_scale_wg";
+// Experiment: flash-decoding attention (attention_fused_g4 runs grid=nh=8,
+// occupancy-starved; split KV across nh*S workgroups + online-softmax combine).
+const USE_FLASH_ATTN = true;
+const FLASH_S = 8;
 
 let G = null;
 const status = (m) => { ui.status.textContent = m; };
@@ -215,6 +219,8 @@ async function init() {
     normK_s: ubuf(1, hdS), normK_f: ubuf(1, hdF),
     ropeQ_s: ubuf(nh, hdS, cutS), ropeQ_f: ubuf(nh, hdF, cutF),
     ropeK_s: ubuf(1, hdS, cutS), ropeK_f: ubuf(1, hdF, cutF),
+    sbuf: ubuf(FLASH_S),
+    flCombine_s: ubuf(nh, hdS, FLASH_S), flCombine_f: ubuf(nh, hdF, FLASH_S),
   };
   // kv_append bind groups read the same buffers step_setup_g4 / writeStepParams write
   D.kvAppend_s = D.kvAppendS; D.kvAppend_f = D.kvAppendF;
@@ -245,6 +251,7 @@ async function init() {
     ffhQ: device.createBuffer({   // int8-packed ffh (interMax bytes), + scale
       size: interMax, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
     actScale: fbuf(1),
+    flM: fbuf(nh * FLASH_S), flL: fbuf(nh * FLASH_S), flO: fbuf(nh * FLASH_S * hdMax),
   };
   const kCache = {}, vCache = {};
   for (const s of specs) if (!s.kv_shared) {
@@ -299,6 +306,9 @@ async function init() {
       ropeQ: bg("rope_pl", B.qn, ropeF, D[`ropeQ_${tag}`]),
       attn: bg("attention_fused_g4", B.qn, kCache[s.kv_source], vCache[s.kv_source],
                B.scores, B.attn, scD),
+      attnP: bg("attn_flash_partial", B.qn, kCache[s.kv_source], vCache[s.kv_source],
+                B.flM, B.flL, B.flO, scD, D.sbuf),
+      attnC: bg("attn_flash_combine", B.flM, B.flL, B.flO, B.attn, D[`flCombine_${tag}`]),
       o: mvBg(oR, B.attn, B.attnProj),
       normPaPf: bg(K_RMS_ADD_NORM, B.attnProj, W[`L${L}.norm_pa`], W[`L${L}.norm_pf`],
                    B.x, B.xn, D.normH),
@@ -381,13 +391,13 @@ async function profileDecode(prompt = "Write a detailed story about a dragon.", 
   for (let step = 0; step < nSteps + 2; step++) {
     const enc = device.createCommandEncoder();
     const labels = [];
-    const runP = (name, group, wgs) => {
+    const runP = (name, group, x, y = 1) => {
       const i = labels.length * 2;
       const pass = enc.beginComputePass({ timestampWrites: {
         querySet: qs, beginningOfPassWriteIndex: i, endOfPassWriteIndex: i + 1 } });
       pass.setPipeline(G.pipelines[name].pipeline);
       pass.setBindGroup(0, group);
-      pass.dispatchWorkgroups(wgs);
+      pass.dispatchWorkgroups(x, y);
       pass.end();
       labels.push(name);
     };
@@ -424,10 +434,10 @@ async function profileDecode(prompt = "Write a detailed story about a dragon.", 
 
 function encodeForward(pass, wantLogits) {
   const { pipelines } = G;
-  encodeForwardWith((name, group, wgs) => {
+  encodeForwardWith((name, group, x, y = 1) => {
     pass.setPipeline(pipelines[name].pipeline);
     pass.setBindGroup(0, group);
-    pass.dispatchWorkgroups(wgs);
+    pass.dispatchWorkgroups(x, y);
   }, wantLogits);
 }
 
@@ -457,7 +467,12 @@ function encodeForwardWith(run, wantLogits) {
       run("kv_append", L.appK, ceilDiv(hd, 64));
       run("kv_append", L.appV, ceilDiv(hd, 64));
     }
-    run("attention_fused_g4", L.attn, nh);
+    if (USE_FLASH_ATTN) {
+      run("attn_flash_partial", L.attnP, nh, FLASH_S);
+      run("attn_flash_combine", L.attnC, nh);
+    } else {
+      run("attention_fused_g4", L.attn, nh);
+    }
     mv(L.oR, L.o);
     run(K_RMS_ADD_NORM, L.normPaPf, 1);
     run(gateupKernel(L.gR.kind), L.gateup, gateupGrid(L.gR));
@@ -524,10 +539,10 @@ async function generate(promptIds, maxNew, onText) {
     const k = Math.min(CHUNK, budget - produced);
     const enc = device.createCommandEncoder();
     const pass = enc.beginComputePass();
-    const run = (name, group, wgs) => {
+    const run = (name, group, x, y = 1) => {
       pass.setPipeline(G.pipelines[name].pipeline);
       pass.setBindGroup(0, group);
-      pass.dispatchWorkgroups(wgs);
+      pass.dispatchWorkgroups(x, y);
     };
     for (let i = 0; i < k; i++) {
       run("step_setup_g4", G.bgSetup, 1);

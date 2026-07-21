@@ -2120,3 +2120,114 @@ BROWSER_EXTRA_KERNELS = {
     "quant_i8": quant_i8,
     "matvec_dq2_i8": matvec_dq2_i8,
 }
+
+
+# --- flash-decoding attention (browser: attention runs grid=nh=8, occupancy-
+# starved; split KV across nh*S workgroups + online-softmax combine). Neutral in
+# wgpu-py but the browser rewards occupancy. dims = step_setup-updated [nh,hd,
+# kv_len,start,max_seq]; S passed separately so it stays step_setup-compatible.
+@kernel(workgroup_size=(64,))
+def attn_flash_partial(
+    wid: Builtin.workgroup_id,                 # (head, split)
+    lid: Builtin.local_invocation_id,
+    q: StorageBuffer[f32, "read"],             # [nh, hd]
+    k_cache: StorageBuffer[f32, "read"],       # [max_seq, hd]
+    v_cache: StorageBuffer[f32, "read"],       # [max_seq, hd]
+    part_m: StorageBuffer[f32, "read_write"],  # [nh, S]
+    part_l: StorageBuffer[f32, "read_write"],  # [nh, S]
+    part_o: StorageBuffer[f32, "read_write"],  # [nh, S, hd]
+    dims: StorageBuffer[u32, "read"],          # [nh, hd, kv_len, start, max_seq]
+    sbuf: StorageBuffer[u32, "read"],          # [S]
+    smem: WorkgroupArray[f32, 64],
+    escore: WorkgroupArray[f32, 512],
+):
+    h: u32 = wid.x
+    s: u32 = wid.y
+    li: u32 = lid.x
+    head_dim: u32 = dims[1]
+    kv_len: u32 = dims[2]
+    start: u32 = dims[3]
+    S: u32 = sbuf[0]
+    idx: u32 = h * S + s
+    total: u32 = kv_len - start
+    per: u32 = (total + S - 1) / S
+    t0: u32 = start + s * per
+    t1: u32 = min(t0 + per, kv_len)
+    if t0 >= t1:
+        if li == 0:
+            part_m[idx] = -1e30
+            part_l[idx] = 0.0
+        for d in range(li, head_dim, 64):
+            part_o[idx * head_dim + d] = 0.0
+        return
+    m: f32 = -1e30
+    for t in range(t0 + li, t1, 64):
+        a: f32 = 0.0
+        for j in range(head_dim):
+            a += q[h * head_dim + j] * k_cache[t * head_dim + j]
+        escore[t - t0] = a
+        m = max(m, a)
+    smem[li] = m
+    barrier()
+    r: u32 = 32
+    while r > 0:
+        if li < r:
+            smem[li] = max(smem[li], smem[li + r])
+        barrier()
+        r = r / 2
+    mloc: f32 = smem[0]
+    barrier()
+    lsum: f32 = 0.0
+    for t in range(t0 + li, t1, 64):
+        e: f32 = exp(escore[t - t0] - mloc)
+        escore[t - t0] = e
+        lsum += e
+    smem[li] = lsum
+    barrier()
+    r = 32
+    while r > 0:
+        if li < r:
+            smem[li] = smem[li] + smem[li + r]
+        barrier()
+        r = r / 2
+    if li == 0:
+        part_m[idx] = mloc
+        part_l[idx] = smem[0]
+    barrier()
+    for d in range(li, head_dim, 64):
+        acc: f32 = 0.0
+        for t in range(t0, t1):
+            acc += escore[t - t0] * v_cache[t * head_dim + d]
+        part_o[idx * head_dim + d] = acc
+
+
+@kernel(workgroup_size=(64,))
+def attn_flash_combine(
+    wid: Builtin.workgroup_id,                 # (head,)
+    lid: Builtin.local_invocation_id,
+    part_m: StorageBuffer[f32, "read"],        # [nh, S]
+    part_l: StorageBuffer[f32, "read"],        # [nh, S]
+    part_o: StorageBuffer[f32, "read"],        # [nh, S, hd]
+    out_vec: StorageBuffer[f32, "read_write"], # [nh, hd]
+    dims: StorageBuffer[u32, "read"],          # [nh, head_dim, S]
+):
+    h: u32 = wid.x
+    li: u32 = lid.x
+    head_dim: u32 = dims[1]
+    S: u32 = dims[2]
+    M: f32 = -1e30
+    for s in range(S):
+        M = max(M, part_m[h * S + s])
+    denom: f32 = 0.0
+    for s in range(S):
+        denom += exp(part_m[h * S + s] - M) * part_l[h * S + s]
+    for d in range(li, head_dim, 64):
+        acc: f32 = 0.0
+        for s in range(S):
+            acc += exp(part_m[h * S + s] - M) * part_o[(h * S + s) * head_dim + d]
+        out_vec[h * head_dim + d] = acc / denom
+
+BROWSER_EXTRA_KERNELS.update({
+    "attn_flash_partial": attn_flash_partial,
+    "attn_flash_combine": attn_flash_combine,
+})

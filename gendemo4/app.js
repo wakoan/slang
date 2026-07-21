@@ -70,7 +70,9 @@ async function init() {
            `(PLE table). This machine's GPU can't hold it.`);
     throw new Error("limits");
   }
+  const canProfile = feats.includes("timestamp-query");
   const device = await adapter.requestDevice({
+    requiredFeatures: canProfile ? ["timestamp-query"] : [],
     requiredLimits: { maxBufferSize: need, maxStorageBufferBindingSize: need },
   });
   device.lost.then((i) => status(`GPU device lost: ${i.message}`));
@@ -326,23 +328,104 @@ async function init() {
     return o;
   });
 
-  G = { device, cfg, pipelines, B, D, W, layers, staging, nh, h, pleH, pleN, nLayers, vocab,
+  G = { device, cfg, pipelines, B, D, W, layers, staging, canProfile, nh, h, pleH, pleN, nLayers, vocab,
         bgEmbed, bgFinalNorm, bgLogits, bgArgmax1, bgArgmax2, bgSetup,
         bgPleGather, bgPleCtx, bgPleCtxNorm, bgPleCombine };
   status("ready — Gemma 4 E2B QAT loaded, all shaders compiled from the DSL");
   ui.bar.style.width = "100%";
   ui.button.disabled = false;
+  window.profileDecode = profileDecode;   // run in console: profileDecode()
+  if (canProfile) console.log("[profile] call profileDecode() in the console for a per-kernel GPU breakdown");
+}
+
+// ------------------------------------------------------- browser GPU profiler
+
+async function profileDecode(prompt = "Write a detailed story about a dragon.", nSteps = 40) {
+  if (!G) { console.warn("model not loaded yet"); return; }
+  if (!G.canProfile) { console.warn("timestamp-query not available"); return; }
+  const { device, B } = G;
+  const q = device.queue;
+  const tok = await fetch("/tokenize", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: prompt, chat: true }),
+  }).then((r) => r.json());
+  const promptIds = tok.ids;
+
+  // prefill (build KV) with the normal fused path
+  for (let pos = 0; pos < promptIds.length - 1; pos++) {
+    writeStepParams(promptIds[pos], pos);
+    const e = device.createCommandEncoder(); const p = e.beginComputePass();
+    encodeForward(p, false); p.end(); q.submit([e.finish()]);
+  }
+  const startPos = promptIds.length - 1;
+  writeStepParams(promptIds[startPos], startPos);
+  q.writeBuffer(B.pos, 0, new Uint32Array([startPos]));
+  q.writeBuffer(B.counter, 0, new Uint32Array([0]));
+
+  const MAXQ = 4096;
+  const qs = device.createQuerySet({ type: "timestamp", count: MAXQ });
+  const resolveBuf = device.createBuffer({
+    size: MAXQ * 8, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC });
+  const readBuf = device.createBuffer({
+    size: MAXQ * 8, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+  const agg = {};
+  console.log(`[profile] warming + timing ${nSteps} decode steps…`);
+  for (let step = 0; step < nSteps + 2; step++) {
+    const enc = device.createCommandEncoder();
+    const labels = [];
+    const runP = (name, group, wgs) => {
+      const i = labels.length * 2;
+      const pass = enc.beginComputePass({ timestampWrites: {
+        querySet: qs, beginningOfPassWriteIndex: i, endOfPassWriteIndex: i + 1 } });
+      pass.setPipeline(G.pipelines[name].pipeline);
+      pass.setBindGroup(0, group);
+      pass.dispatchWorkgroups(wgs);
+      pass.end();
+      labels.push(name);
+    };
+    runP("step_setup_g4", G.bgSetup, 1);
+    encodeForwardWith(runP, true);
+    runP("argmax_stage1", G.bgArgmax1, N_ARGMAX_WGS);
+    runP("argmax_stage2", G.bgArgmax2, 1);
+    const nPairs = labels.length;
+    enc.resolveQuerySet(qs, 0, nPairs * 2, resolveBuf, 0);
+    enc.copyBufferToBuffer(resolveBuf, 0, readBuf, 0, nPairs * 2 * 8);
+    q.submit([enc.finish()]);
+    await readBuf.mapAsync(GPUMapMode.READ, 0, nPairs * 2 * 8);
+    const ts = new BigInt64Array(readBuf.getMappedRange(0, nPairs * 2 * 8)).slice();
+    readBuf.unmap();
+    if (step < 2) continue; // warmup
+    for (let k = 0; k < nPairs; k++) {
+      const dt = Number(ts[2 * k + 1] - ts[2 * k]);
+      (agg[labels[k]] ||= { ns: 0, count: 0 });
+      agg[labels[k]].ns += dt; agg[labels[k]].count++;
+    }
+  }
+  const rows = Object.entries(agg)
+    .map(([l, v]) => ({ l, ms: v.ns / 1e6, count: v.count })).sort((a, b) => b.ms - a.ms);
+  const tot = rows.reduce((s, r) => s + r.ms, 0);
+  console.log(`=== browser GPU profile (${nSteps} steps) — ${(tot / nSteps).toFixed(3)} ms/token summed-passes ===`);
+  for (const r of rows) {
+    console.log(`${r.l.padEnd(22)} ${r.ms.toFixed(2).padStart(9)} ms  ${(100 * r.ms / tot).toFixed(1).padStart(5)}%  x${r.count / nSteps}`);
+  }
+  qs.destroy(); resolveBuf.destroy(); readBuf.destroy();
+  return rows;
 }
 
 // ---------------------------------------------------------- forward pass
 
 function encodeForward(pass, wantLogits) {
-  const { cfg, pipelines, layers, nh, h, pleH, pleN, nLayers, vocab } = G;
-  const run = (name, group, wgs) => {
+  const { pipelines } = G;
+  encodeForwardWith((name, group, wgs) => {
     pass.setPipeline(pipelines[name].pipeline);
     pass.setBindGroup(0, group);
     pass.dispatchWorkgroups(wgs);
-  };
+  }, wantLogits);
+}
+
+function encodeForwardWith(run, wantLogits) {
+  const { cfg, layers, nh, h, pleH, pleN, nLayers, vocab } = G;
   const mv = (rec, group) =>
     run(mvKernel(rec.kind), group, mvKernel(rec.kind).endsWith("_blk2") ? rec.n_out / 2 : rec.n_out);
 

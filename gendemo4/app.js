@@ -45,6 +45,18 @@ async function init() {
 
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
   if (!adapter) { status("No GPU adapter."); throw new Error("no adapter"); }
+  // --- feature probe: what does this browser expose? (gates the subgroup-matrix path) ---
+  const feats = [...adapter.features];
+  const hasSgMat = feats.includes("chromium-experimental-subgroup-matrix");
+  console.log("[gpu] adapter features:", feats.sort());
+  console.log("[gpu] subgroup-matrix:", hasSgMat,
+              "| subgroups:", feats.includes("subgroups"),
+              "| shader-f16:", feats.includes("shader-f16"));
+  if (hasSgMat && adapter.requestAdapterInfo) {
+    console.log("[gpu] subgroupMatrixConfigs:",
+                adapter.info?.subgroupMatrixConfigs ?? "(none reported)");
+  }
+  window.__gpuFeatures = feats; // inspect in console: __gpuFeatures
   const maxTensor = manifest.tensors.reduce((m, t) => Math.max(m, t.byteLength), 0);
   const need = Math.max(maxTensor, 1 << 28); // ~1.17GB PLE table drives this
   if (adapter.limits.maxStorageBufferBindingSize < maxTensor ||

@@ -126,17 +126,54 @@ class G4Runner:
         rb.unmap()
         return out
 
-    # ---- stage 1: embed gather (kernel 00) ----
-    def embed(self, token_id: int) -> np.ndarray:
-        H = self.cfg["H"]
-        ids = self.device.create_buffer_with_data(
+    def _ids_buf(self, token_id: int):
+        return self.device.create_buffer_with_data(
             data=np.array([token_id], np.uint32).tobytes(),
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
-        y = self._tmp(H * 4)
+
+    # ---- stage 1: embed gather (kernel 00) ----
+    def embed(self, token_id: int, out=None) -> object:
+        H = self.cfg["H"]
+        y = out if out is not None else self._tmp(H * 4)
         par = self._uniform(np.array([1, 0, 0, 0], np.uint32))
         self.dispatch("embed", _kernel("00_main"),
-                      [ids, self._bufs["embed_q"], self._bufs["embed_scale"], y, par], (1, 1, 1))
-        return self.read(y, H * 4).view(np.float32)
+                      [self._ids_buf(token_id), self._bufs["embed_q"],
+                       self._bufs["embed_scale"], y, par], (1, 1, 1))
+        return y
+
+    # ---- stage 2: PLE input (kernel 68 proj + kernel 01 gather + combine) ----
+    _COMBINE = """
+const D:u32=256u; const HINV:f32=%.9ef; const EPS:f32=1e-6; const RS2:f32=0.7071067811865476;
+@group(0) @binding(0) var<storage, read> ctx: array<f32>;
+@group(0) @binding(1) var<storage, read> ple: array<f32>;
+@group(0) @binding(2) var<storage, read> nw: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+var<workgroup> red: array<f32, D>;
+@compute @workgroup_size(D,1,1)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let row = wg.x; let tid = lid.x; let base = row*D + tid;
+  let c = ctx[base]*HINV;
+  red[tid] = c*c; workgroupBarrier();
+  var s:u32 = D/2u; loop { if (s==0u){break;} if (tid<s){red[tid]=red[tid]+red[tid+s];} s=s/2u; workgroupBarrier(); }
+  let rms = inverseSqrt(red[0]/f32(D)+EPS);
+  outp[base] = (c*rms*nw[tid] + ple[base])*RS2;
+}"""
+
+    def ple_input(self, token_id: int, embed_buf) -> object:
+        H, nL, d = self.cfg["H"], self.cfg["nL"], self.cfg["ple_d"]
+        ctx = self._tmp(nL * d * 4)
+        ple = self._tmp(nL * d * 4)
+        par0 = self._uniform(np.array([0, 0, 0, 0], np.float32))      # kernel 68: inScale/outScale
+        seq1 = self._uniform(np.array([1, 0, 0, 0], np.uint32))       # kernel 01: seq=1
+        self.dispatch("proj68", _kernel("68_reduce"),
+                      [embed_buf, self._bufs["pl_model_proj"], ctx, par0], (nL * d // 8, 1, 1))
+        self.dispatch("plegather", _kernel("01_main"),
+                      [self._ids_buf(token_id), self._bufs["ple_q"],
+                       self._bufs["ple_scale"], ple, seq1], (1, 1, 1))
+        out = self._tmp(nL * d * 4)
+        code = self._COMBINE % (H ** -0.5)
+        self.dispatch("combine", code, [ctx, ple, self._bufs["pl_proj_norm"], out], (nL, 1, 1))
+        return out
 
 
 if __name__ == "__main__":
@@ -145,7 +182,14 @@ if __name__ == "__main__":
     r = G4Runner()
     ref = ReferenceSRQ()
     tid = int(sys.argv[1]) if len(sys.argv) > 1 else 2
-    g = r.embed(tid)
+    eb = r.embed(tid)
+    g = r.read(eb, r.cfg["H"] * 4).view(np.float32)
     e = ref.embed(tid)
-    print(f"embed[{tid}]: gpu[:4]={g[:4].round(4)} ref[:4]={e[:4].round(4)} "
-          f"maxAbsDiff={np.abs(g - e).max():.3e}")
+    print(f"embed[{tid}]: maxAbsDiff={np.abs(g - e).max():.3e}")
+
+    pb = r.ple_input(tid, eb)
+    nL, d = r.cfg["nL"], r.cfg["ple_d"]
+    gp = r.read(pb, nL * d * 4).view(np.float32)
+    ep = ref.ple_input(tid, e).reshape(-1)
+    print(f"ple_input[{tid}]: gpu[:4]={gp[:4].round(4)} ref[:4]={ep[:4].round(4)} "
+          f"maxAbsDiff={np.abs(gp - ep).max():.3e}")

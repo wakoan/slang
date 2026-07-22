@@ -319,7 +319,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         return hidden
 
     # ---- stage 4: full forward ----
-    def forward(self, token_id: int, pos: int, hidden=None):
+    def forward(self, token_id: int, pos: int, hidden=None, argmax=None):
         H, nL, d, vocab = self.cfg["H"], self.cfg["nL"], self.cfg["ple_d"], self.cfg["vocab"]
         if not hasattr(self, "kc"):
             self.setup_caches()
@@ -339,6 +339,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         self.dispatch("logits", _kernel("33_srq"),
                       [normed, self._bufs["lmhead_blk"], self._bufs["lmhead_scale"], logits,
                        self._uniform(np.array([0, 0, 0, 0], np.float32))], (vocab // 128, 1, 1))
+        if argmax:
+            # GPU argmax (softcap is monotonic -> skipped): 34 -> 256 candidates -> 35 -> token
+            cv, ci = self._tmp(256 * 4), self._tmp(256 * 4)
+            self.dispatch("amax1", _kernel("34_main"), [logits, cv, ci], (256, 1, 1))
+            self.dispatch("amax2", _kernel("35_main"), [cv, ci, argmax], (1, 1, 1))
         self.queue.submit([self._enc.finish()])
         self._enc = None
         return logits
@@ -359,6 +364,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         out = []
         t0 = time.time()
         for _ in range(n_new):
+            # CPU argmax: in this CPU-driven loop the per-token sync dominates, so the
+            # 1MB readback beats GPU argmax's 2 extra dispatches (GPU argmax is for the
+            # future resident loop, where the token feeds back without a CPU sync).
             lg = self.read(self.forward(cur, pos, hidden), self.cfg["vocab"] * 4).view(np.float32)
             cur = int(np.argmax(lg)); pos += 1
             if cur == eos:

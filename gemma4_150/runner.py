@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,7 @@ REF_DIR = Path(__file__).resolve().parent.parent / "reference" / "webml_gemma4_k
 _BIND = re.compile(r"@group\(0\)\s*@binding\((\d+)\)\s*var<(storage|uniform)(?:,\s*(read|read_write))?>")
 
 
+@lru_cache(maxsize=None)
 def _kernel(name: str) -> str:
     return (REF_DIR / f"{name}.wgsl").read_text()
 
@@ -102,18 +104,21 @@ class G4Runner:
             self._pipes[key] = (pipe, layout)
         return self._pipes[key]
 
+    _enc = None
+
     def dispatch(self, key, code, buffers, grid):
         pipe, layout = self._pipe(key, code)
         bg = self.device.create_bind_group(layout=layout, entries=[
             {"binding": i, "resource": {"buffer": b, "offset": 0, "size": b.size}}
             for i, b in enumerate(buffers)])
-        enc = self.device.create_command_encoder()
+        enc = self._enc or self.device.create_command_encoder()
         cp = enc.begin_compute_pass()
         cp.set_pipeline(pipe)
         cp.set_bind_group(0, bg)
         cp.dispatch_workgroups(*grid)
         cp.end()
-        self.queue.submit([enc.finish()])
+        if self._enc is None:
+            self.queue.submit([enc.finish()])
 
     def read(self, buf, nbytes) -> np.ndarray:
         rb = self.device.create_buffer(
@@ -202,6 +207,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
         return cb, sb
 
+    @lru_cache(maxsize=None)
     def _patch(self, code, **consts):
         for k, val in consts.items():
             code = re.sub(rf"const {k}: (u32|f32) = [^;]+;",
@@ -318,6 +324,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         if not hasattr(self, "kc"):
             self.setup_caches()
         hidden = hidden if hidden is not None else self._tmp(H * 4)
+        logits = self._tmp(vocab * 4)
+        self._enc = self.device.create_command_encoder()   # batch the whole forward into one submit
         self.embed(token_id, out=hidden)
         ple = self.ple_input(token_id, hidden)
         for L in range(nL):
@@ -328,10 +336,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                       [hidden, self._bufs["final_norm"], normed, sa,
                        self._uniform(np.array([1, 0, 0, 0], np.uint32))], (1, 1, 1))
         # logits (kernel 33), lm_head act scales are 0 -> weight-only
-        logits = self._tmp(vocab * 4)
         self.dispatch("logits", _kernel("33_srq"),
                       [normed, self._bufs["lmhead_blk"], self._bufs["lmhead_scale"], logits,
                        self._uniform(np.array([0, 0, 0, 0], np.float32))], (vocab // 128, 1, 1))
+        self.queue.submit([self._enc.finish()])
+        self._enc = None
         return logits
 
     def logits_np(self, token_id, pos, hidden=None):

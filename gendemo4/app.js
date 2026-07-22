@@ -42,9 +42,11 @@ const ceilDiv = (n, d) => Math.ceil(n / d);
 // kernel/grid selection — mirrors qat_runner helpers
 const mvKernel = (kind) =>
   ({ dq4: "matvec_dq4_blk2", dq2: "matvec_dq2", f16: "matvec_wg_packed_v4" }[kind]);
+// wide (2-bit) gate/up: blk8 (subgroupAdd sg4 was slower, 59 vs 85 — falsified).
+// narrow (4-bit) gate/up: blk2 (was unblocked).
 const gateupKernel = (kind) =>
-  kind === "dq2" ? "mv_gateup_geglu_dq2_blk8" : "mv_gateup_geglu_dq4";
-const gateupGrid = (rec) => (rec.kind === "dq2" ? rec.n_out / 8 : rec.n_out);
+  kind === "dq2" ? "mv_gateup_geglu_dq2_blk8" : "mv_gateup_geglu_dq4_blk2";
+const gateupGrid = (rec) => rec.n_out / (rec.kind === "dq2" ? 8 : 2);
 
 // ---------------------------------------------------------------- init
 
@@ -84,8 +86,12 @@ async function init() {
     throw new Error("limits");
   }
   const canProfile = feats.includes("timestamp-query");
+  const wantFeatures = [];
+  if (canProfile) wantFeatures.push("timestamp-query");
+  if (feats.includes("subgroups")) wantFeatures.push("subgroups");   // subgroupAdd kernels
+  if (feats.includes("shader-f16")) wantFeatures.push("shader-f16"); // native f16 kernels
   const device = await adapter.requestDevice({
-    requiredFeatures: canProfile ? ["timestamp-query"] : [],
+    requiredFeatures: wantFeatures,
     requiredLimits: { maxBufferSize: need, maxStorageBufferBindingSize: need },
   });
   device.lost.then((i) => status(`GPU device lost: ${i.message}`));

@@ -2375,8 +2375,274 @@ def matvec_dq2_blk2_t256(
         y_out[r0] = p0[0] * scale[r0]
         y_out[r1] = p1[0] * scale[r1]
 
+@kernel(workgroup_size=(32,))
+def mv_gateup_geglu_dq2_sg4(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    gate_w: StorageBuffer[u32, "read"],
+    up_w: StorageBuffer[u32, "read"],
+    x_in: StorageBuffer[f32, "read"],
+    gscale: StorageBuffer[f32, "read"],
+    uscale: StorageBuffer[f32, "read"],
+    y_out: StorageBuffer[f32, "read_write"],
+    dims: StorageBuffer[u32, "read"],
+):
+    # 4 rows/wg, subgroupAdd reduction (no shared memory, no barriers).
+    r0: u32 = 4 * wid.x + 0
+    r1: u32 = 4 * wid.x + 1
+    r2: u32 = 4 * wid.x + 2
+    r3: u32 = 4 * wid.x + 3
+    li: u32 = lid.x
+    n_in: u32 = dims[1]
+    n16: u32 = n_in / 16
+    g0: f32 = 0.0
+    u0: f32 = 0.0
+    g1: f32 = 0.0
+    u1: f32 = 0.0
+    g2: f32 = 0.0
+    u2: f32 = 0.0
+    g3: f32 = 0.0
+    u3: f32 = 0.0
+    for j in range(li, n16, 32):
+        gw0: u32 = gate_w[r0 * n16 + j]
+        uw0: u32 = up_w[r0 * n16 + j]
+        gw1: u32 = gate_w[r1 * n16 + j]
+        uw1: u32 = up_w[r1 * n16 + j]
+        gw2: u32 = gate_w[r2 * n16 + j]
+        uw2: u32 = up_w[r2 * n16 + j]
+        gw3: u32 = gate_w[r3 * n16 + j]
+        uw3: u32 = up_w[r3 * n16 + j]
+        b: u32 = 16 * j
+        g0 += f32(i32(gw0 & 3) - 2) * x_in[b]
+        u0 += f32(i32(uw0 & 3) - 2) * x_in[b]
+        g1 += f32(i32(gw1 & 3) - 2) * x_in[b]
+        u1 += f32(i32(uw1 & 3) - 2) * x_in[b]
+        g2 += f32(i32(gw2 & 3) - 2) * x_in[b]
+        u2 += f32(i32(uw2 & 3) - 2) * x_in[b]
+        g3 += f32(i32(gw3 & 3) - 2) * x_in[b]
+        u3 += f32(i32(uw3 & 3) - 2) * x_in[b]
+        g0 += f32(i32((gw0 >> 2) & 3) - 2) * x_in[b + 1]
+        u0 += f32(i32((uw0 >> 2) & 3) - 2) * x_in[b + 1]
+        g1 += f32(i32((gw1 >> 2) & 3) - 2) * x_in[b + 1]
+        u1 += f32(i32((uw1 >> 2) & 3) - 2) * x_in[b + 1]
+        g2 += f32(i32((gw2 >> 2) & 3) - 2) * x_in[b + 1]
+        u2 += f32(i32((uw2 >> 2) & 3) - 2) * x_in[b + 1]
+        g3 += f32(i32((gw3 >> 2) & 3) - 2) * x_in[b + 1]
+        u3 += f32(i32((uw3 >> 2) & 3) - 2) * x_in[b + 1]
+        g0 += f32(i32((gw0 >> 4) & 3) - 2) * x_in[b + 2]
+        u0 += f32(i32((uw0 >> 4) & 3) - 2) * x_in[b + 2]
+        g1 += f32(i32((gw1 >> 4) & 3) - 2) * x_in[b + 2]
+        u1 += f32(i32((uw1 >> 4) & 3) - 2) * x_in[b + 2]
+        g2 += f32(i32((gw2 >> 4) & 3) - 2) * x_in[b + 2]
+        u2 += f32(i32((uw2 >> 4) & 3) - 2) * x_in[b + 2]
+        g3 += f32(i32((gw3 >> 4) & 3) - 2) * x_in[b + 2]
+        u3 += f32(i32((uw3 >> 4) & 3) - 2) * x_in[b + 2]
+        g0 += f32(i32((gw0 >> 6) & 3) - 2) * x_in[b + 3]
+        u0 += f32(i32((uw0 >> 6) & 3) - 2) * x_in[b + 3]
+        g1 += f32(i32((gw1 >> 6) & 3) - 2) * x_in[b + 3]
+        u1 += f32(i32((uw1 >> 6) & 3) - 2) * x_in[b + 3]
+        g2 += f32(i32((gw2 >> 6) & 3) - 2) * x_in[b + 3]
+        u2 += f32(i32((uw2 >> 6) & 3) - 2) * x_in[b + 3]
+        g3 += f32(i32((gw3 >> 6) & 3) - 2) * x_in[b + 3]
+        u3 += f32(i32((uw3 >> 6) & 3) - 2) * x_in[b + 3]
+        g0 += f32(i32((gw0 >> 8) & 3) - 2) * x_in[b + 4]
+        u0 += f32(i32((uw0 >> 8) & 3) - 2) * x_in[b + 4]
+        g1 += f32(i32((gw1 >> 8) & 3) - 2) * x_in[b + 4]
+        u1 += f32(i32((uw1 >> 8) & 3) - 2) * x_in[b + 4]
+        g2 += f32(i32((gw2 >> 8) & 3) - 2) * x_in[b + 4]
+        u2 += f32(i32((uw2 >> 8) & 3) - 2) * x_in[b + 4]
+        g3 += f32(i32((gw3 >> 8) & 3) - 2) * x_in[b + 4]
+        u3 += f32(i32((uw3 >> 8) & 3) - 2) * x_in[b + 4]
+        g0 += f32(i32((gw0 >> 10) & 3) - 2) * x_in[b + 5]
+        u0 += f32(i32((uw0 >> 10) & 3) - 2) * x_in[b + 5]
+        g1 += f32(i32((gw1 >> 10) & 3) - 2) * x_in[b + 5]
+        u1 += f32(i32((uw1 >> 10) & 3) - 2) * x_in[b + 5]
+        g2 += f32(i32((gw2 >> 10) & 3) - 2) * x_in[b + 5]
+        u2 += f32(i32((uw2 >> 10) & 3) - 2) * x_in[b + 5]
+        g3 += f32(i32((gw3 >> 10) & 3) - 2) * x_in[b + 5]
+        u3 += f32(i32((uw3 >> 10) & 3) - 2) * x_in[b + 5]
+        g0 += f32(i32((gw0 >> 12) & 3) - 2) * x_in[b + 6]
+        u0 += f32(i32((uw0 >> 12) & 3) - 2) * x_in[b + 6]
+        g1 += f32(i32((gw1 >> 12) & 3) - 2) * x_in[b + 6]
+        u1 += f32(i32((uw1 >> 12) & 3) - 2) * x_in[b + 6]
+        g2 += f32(i32((gw2 >> 12) & 3) - 2) * x_in[b + 6]
+        u2 += f32(i32((uw2 >> 12) & 3) - 2) * x_in[b + 6]
+        g3 += f32(i32((gw3 >> 12) & 3) - 2) * x_in[b + 6]
+        u3 += f32(i32((uw3 >> 12) & 3) - 2) * x_in[b + 6]
+        g0 += f32(i32((gw0 >> 14) & 3) - 2) * x_in[b + 7]
+        u0 += f32(i32((uw0 >> 14) & 3) - 2) * x_in[b + 7]
+        g1 += f32(i32((gw1 >> 14) & 3) - 2) * x_in[b + 7]
+        u1 += f32(i32((uw1 >> 14) & 3) - 2) * x_in[b + 7]
+        g2 += f32(i32((gw2 >> 14) & 3) - 2) * x_in[b + 7]
+        u2 += f32(i32((uw2 >> 14) & 3) - 2) * x_in[b + 7]
+        g3 += f32(i32((gw3 >> 14) & 3) - 2) * x_in[b + 7]
+        u3 += f32(i32((uw3 >> 14) & 3) - 2) * x_in[b + 7]
+        g0 += f32(i32((gw0 >> 16) & 3) - 2) * x_in[b + 8]
+        u0 += f32(i32((uw0 >> 16) & 3) - 2) * x_in[b + 8]
+        g1 += f32(i32((gw1 >> 16) & 3) - 2) * x_in[b + 8]
+        u1 += f32(i32((uw1 >> 16) & 3) - 2) * x_in[b + 8]
+        g2 += f32(i32((gw2 >> 16) & 3) - 2) * x_in[b + 8]
+        u2 += f32(i32((uw2 >> 16) & 3) - 2) * x_in[b + 8]
+        g3 += f32(i32((gw3 >> 16) & 3) - 2) * x_in[b + 8]
+        u3 += f32(i32((uw3 >> 16) & 3) - 2) * x_in[b + 8]
+        g0 += f32(i32((gw0 >> 18) & 3) - 2) * x_in[b + 9]
+        u0 += f32(i32((uw0 >> 18) & 3) - 2) * x_in[b + 9]
+        g1 += f32(i32((gw1 >> 18) & 3) - 2) * x_in[b + 9]
+        u1 += f32(i32((uw1 >> 18) & 3) - 2) * x_in[b + 9]
+        g2 += f32(i32((gw2 >> 18) & 3) - 2) * x_in[b + 9]
+        u2 += f32(i32((uw2 >> 18) & 3) - 2) * x_in[b + 9]
+        g3 += f32(i32((gw3 >> 18) & 3) - 2) * x_in[b + 9]
+        u3 += f32(i32((uw3 >> 18) & 3) - 2) * x_in[b + 9]
+        g0 += f32(i32((gw0 >> 20) & 3) - 2) * x_in[b + 10]
+        u0 += f32(i32((uw0 >> 20) & 3) - 2) * x_in[b + 10]
+        g1 += f32(i32((gw1 >> 20) & 3) - 2) * x_in[b + 10]
+        u1 += f32(i32((uw1 >> 20) & 3) - 2) * x_in[b + 10]
+        g2 += f32(i32((gw2 >> 20) & 3) - 2) * x_in[b + 10]
+        u2 += f32(i32((uw2 >> 20) & 3) - 2) * x_in[b + 10]
+        g3 += f32(i32((gw3 >> 20) & 3) - 2) * x_in[b + 10]
+        u3 += f32(i32((uw3 >> 20) & 3) - 2) * x_in[b + 10]
+        g0 += f32(i32((gw0 >> 22) & 3) - 2) * x_in[b + 11]
+        u0 += f32(i32((uw0 >> 22) & 3) - 2) * x_in[b + 11]
+        g1 += f32(i32((gw1 >> 22) & 3) - 2) * x_in[b + 11]
+        u1 += f32(i32((uw1 >> 22) & 3) - 2) * x_in[b + 11]
+        g2 += f32(i32((gw2 >> 22) & 3) - 2) * x_in[b + 11]
+        u2 += f32(i32((uw2 >> 22) & 3) - 2) * x_in[b + 11]
+        g3 += f32(i32((gw3 >> 22) & 3) - 2) * x_in[b + 11]
+        u3 += f32(i32((uw3 >> 22) & 3) - 2) * x_in[b + 11]
+        g0 += f32(i32((gw0 >> 24) & 3) - 2) * x_in[b + 12]
+        u0 += f32(i32((uw0 >> 24) & 3) - 2) * x_in[b + 12]
+        g1 += f32(i32((gw1 >> 24) & 3) - 2) * x_in[b + 12]
+        u1 += f32(i32((uw1 >> 24) & 3) - 2) * x_in[b + 12]
+        g2 += f32(i32((gw2 >> 24) & 3) - 2) * x_in[b + 12]
+        u2 += f32(i32((uw2 >> 24) & 3) - 2) * x_in[b + 12]
+        g3 += f32(i32((gw3 >> 24) & 3) - 2) * x_in[b + 12]
+        u3 += f32(i32((uw3 >> 24) & 3) - 2) * x_in[b + 12]
+        g0 += f32(i32((gw0 >> 26) & 3) - 2) * x_in[b + 13]
+        u0 += f32(i32((uw0 >> 26) & 3) - 2) * x_in[b + 13]
+        g1 += f32(i32((gw1 >> 26) & 3) - 2) * x_in[b + 13]
+        u1 += f32(i32((uw1 >> 26) & 3) - 2) * x_in[b + 13]
+        g2 += f32(i32((gw2 >> 26) & 3) - 2) * x_in[b + 13]
+        u2 += f32(i32((uw2 >> 26) & 3) - 2) * x_in[b + 13]
+        g3 += f32(i32((gw3 >> 26) & 3) - 2) * x_in[b + 13]
+        u3 += f32(i32((uw3 >> 26) & 3) - 2) * x_in[b + 13]
+        g0 += f32(i32((gw0 >> 28) & 3) - 2) * x_in[b + 14]
+        u0 += f32(i32((uw0 >> 28) & 3) - 2) * x_in[b + 14]
+        g1 += f32(i32((gw1 >> 28) & 3) - 2) * x_in[b + 14]
+        u1 += f32(i32((uw1 >> 28) & 3) - 2) * x_in[b + 14]
+        g2 += f32(i32((gw2 >> 28) & 3) - 2) * x_in[b + 14]
+        u2 += f32(i32((uw2 >> 28) & 3) - 2) * x_in[b + 14]
+        g3 += f32(i32((gw3 >> 28) & 3) - 2) * x_in[b + 14]
+        u3 += f32(i32((uw3 >> 28) & 3) - 2) * x_in[b + 14]
+        g0 += f32(i32((gw0 >> 30) & 3) - 2) * x_in[b + 15]
+        u0 += f32(i32((uw0 >> 30) & 3) - 2) * x_in[b + 15]
+        g1 += f32(i32((gw1 >> 30) & 3) - 2) * x_in[b + 15]
+        u1 += f32(i32((uw1 >> 30) & 3) - 2) * x_in[b + 15]
+        g2 += f32(i32((gw2 >> 30) & 3) - 2) * x_in[b + 15]
+        u2 += f32(i32((uw2 >> 30) & 3) - 2) * x_in[b + 15]
+        g3 += f32(i32((gw3 >> 30) & 3) - 2) * x_in[b + 15]
+        u3 += f32(i32((uw3 >> 30) & 3) - 2) * x_in[b + 15]
+    sg0: f32 = subgroupAdd(g0)
+    su0: f32 = subgroupAdd(u0)
+    sg1: f32 = subgroupAdd(g1)
+    su1: f32 = subgroupAdd(u1)
+    sg2: f32 = subgroupAdd(g2)
+    su2: f32 = subgroupAdd(u2)
+    sg3: f32 = subgroupAdd(g3)
+    su3: f32 = subgroupAdd(u3)
+    if li == 0:
+        y_out[r0] = gelu(sg0 * gscale[r0]) * (su0 * uscale[r0])
+        y_out[r1] = gelu(sg1 * gscale[r1]) * (su1 * uscale[r1])
+        y_out[r2] = gelu(sg2 * gscale[r2]) * (su2 * uscale[r2])
+        y_out[r3] = gelu(sg3 * gscale[r3]) * (su3 * uscale[r3])
+
+
+@kernel(workgroup_size=(64,))
+def mv_gateup_geglu_dq4_blk2(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    gate_w: StorageBuffer[u32, "read"],
+    up_w: StorageBuffer[u32, "read"],
+    x_in: StorageBuffer[f32, "read"],
+    gscale: StorageBuffer[f32, "read"],
+    uscale: StorageBuffer[f32, "read"],
+    y_out: StorageBuffer[f32, "read_write"],
+    dims: StorageBuffer[u32, "read"],
+    pg0: WorkgroupArray[f32, 64],
+    pu0: WorkgroupArray[f32, 64],
+    pg1: WorkgroupArray[f32, 64],
+    pu1: WorkgroupArray[f32, 64],
+):
+    # int4 gate+up+geglu, 2 rows/wg (amortize x read); nibble unpack.
+    r0: u32 = 2 * wid.x + 0
+    r1: u32 = 2 * wid.x + 1
+    li: u32 = lid.x
+    n_in: u32 = dims[1]
+    n8: u32 = n_in / 8
+    g0: f32 = 0.0
+    u0: f32 = 0.0
+    g1: f32 = 0.0
+    u1: f32 = 0.0
+    for j in range(li, n8, 64):
+        gw0: u32 = gate_w[r0 * n8 + j]
+        uw0: u32 = up_w[r0 * n8 + j]
+        gw1: u32 = gate_w[r1 * n8 + j]
+        uw1: u32 = up_w[r1 * n8 + j]
+        base: u32 = 8 * j
+        g0 += f32(i32(gw0 & 15) - 8) * x_in[base]
+        u0 += f32(i32(uw0 & 15) - 8) * x_in[base]
+        g1 += f32(i32(gw1 & 15) - 8) * x_in[base]
+        u1 += f32(i32(uw1 & 15) - 8) * x_in[base]
+        g0 += f32(i32((gw0 >> 4) & 15) - 8) * x_in[base + 1]
+        u0 += f32(i32((uw0 >> 4) & 15) - 8) * x_in[base + 1]
+        g1 += f32(i32((gw1 >> 4) & 15) - 8) * x_in[base + 1]
+        u1 += f32(i32((uw1 >> 4) & 15) - 8) * x_in[base + 1]
+        g0 += f32(i32((gw0 >> 8) & 15) - 8) * x_in[base + 2]
+        u0 += f32(i32((uw0 >> 8) & 15) - 8) * x_in[base + 2]
+        g1 += f32(i32((gw1 >> 8) & 15) - 8) * x_in[base + 2]
+        u1 += f32(i32((uw1 >> 8) & 15) - 8) * x_in[base + 2]
+        g0 += f32(i32((gw0 >> 12) & 15) - 8) * x_in[base + 3]
+        u0 += f32(i32((uw0 >> 12) & 15) - 8) * x_in[base + 3]
+        g1 += f32(i32((gw1 >> 12) & 15) - 8) * x_in[base + 3]
+        u1 += f32(i32((uw1 >> 12) & 15) - 8) * x_in[base + 3]
+        g0 += f32(i32((gw0 >> 16) & 15) - 8) * x_in[base + 4]
+        u0 += f32(i32((uw0 >> 16) & 15) - 8) * x_in[base + 4]
+        g1 += f32(i32((gw1 >> 16) & 15) - 8) * x_in[base + 4]
+        u1 += f32(i32((uw1 >> 16) & 15) - 8) * x_in[base + 4]
+        g0 += f32(i32((gw0 >> 20) & 15) - 8) * x_in[base + 5]
+        u0 += f32(i32((uw0 >> 20) & 15) - 8) * x_in[base + 5]
+        g1 += f32(i32((gw1 >> 20) & 15) - 8) * x_in[base + 5]
+        u1 += f32(i32((uw1 >> 20) & 15) - 8) * x_in[base + 5]
+        g0 += f32(i32((gw0 >> 24) & 15) - 8) * x_in[base + 6]
+        u0 += f32(i32((uw0 >> 24) & 15) - 8) * x_in[base + 6]
+        g1 += f32(i32((gw1 >> 24) & 15) - 8) * x_in[base + 6]
+        u1 += f32(i32((uw1 >> 24) & 15) - 8) * x_in[base + 6]
+        g0 += f32(i32((gw0 >> 28) & 15) - 8) * x_in[base + 7]
+        u0 += f32(i32((uw0 >> 28) & 15) - 8) * x_in[base + 7]
+        g1 += f32(i32((gw1 >> 28) & 15) - 8) * x_in[base + 7]
+        u1 += f32(i32((uw1 >> 28) & 15) - 8) * x_in[base + 7]
+    pg0[li] = g0
+    pu0[li] = u0
+    pg1[li] = g1
+    pu1[li] = u1
+    barrier()
+    s: u32 = 32
+    while s > 0:
+        if li < s:
+            pg0[li] = pg0[li] + pg0[li + s]
+            pu0[li] = pu0[li] + pu0[li + s]
+            pg1[li] = pg1[li] + pg1[li + s]
+            pu1[li] = pu1[li] + pu1[li + s]
+        barrier()
+        s = s / 2
+    if li == 0:
+        y_out[r0] = gelu(pg0[0] * gscale[r0]) * (pu0[0] * uscale[r0])
+        y_out[r1] = gelu(pg1[0] * gscale[r1]) * (pu1[0] * uscale[r1])
+
+
 
 BROWSER_EXTRA_KERNELS.update({
+    "mv_gateup_geglu_dq4_blk2": mv_gateup_geglu_dq4_blk2,
+    "mv_gateup_geglu_dq2_sg4": mv_gateup_geglu_dq2_sg4,
     "matvec_dq2_blk2_t128": matvec_dq2_blk2_t128,
     "matvec_dq2_blk2_t256": matvec_dq2_blk2_t256,
     "attn_flash_partial": attn_flash_partial,

@@ -338,6 +338,26 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         lg = self.forward(token_id, pos, hidden)
         return self.read(lg, self.cfg["vocab"] * 4).view(np.float32)
 
+    def generate(self, ids, n_new=20, eos=1):
+        """Greedy decode. Returns (new_ids, decode_tok_per_s)."""
+        import time
+        self.setup_caches()
+        hidden = self._tmp(self.cfg["H"] * 4)
+        pos = 0
+        for t in ids[:-1]:                       # prefill all but last
+            self.forward(t, pos, hidden); pos += 1
+        cur = ids[-1]
+        out = []
+        t0 = time.time()
+        for _ in range(n_new):
+            lg = self.read(self.forward(cur, pos, hidden), self.cfg["vocab"] * 4).view(np.float32)
+            cur = int(np.argmax(lg)); pos += 1
+            if cur == eos:
+                break
+            out.append(cur)
+        dt = time.time() - t0
+        return out, len(out) / dt if dt else 0.0
+
 
 if __name__ == "__main__":
     import sys

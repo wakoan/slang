@@ -354,7 +354,24 @@ async function init() {
   ui.bar.style.width = "100%";
   ui.button.disabled = false;
   window.profileDecode = profileDecode;   // run in console: profileDecode()
+  window.bench = benchDecode;             // headless/console benchmark: returns {tps,...}
+  window.__ready = true;
   if (canProfile) console.log("[profile] call profileDecode() in the console for a per-kernel GPU breakdown");
+}
+
+// Headless-friendly benchmark: run a fixed decode, return the tok/s the UI shows.
+async function benchDecode(prompt = "Write a detailed story about a dragon who learns to code.", nTokens = 128, runs = 2) {
+  if (!G) return { error: "not loaded" };
+  let best = 0, text = "";
+  for (let r = 0; r < runs; r++) {
+    let tps = 0;
+    const out = await generate((await fetch("/tokenize", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: prompt, chat: true }),
+    }).then((x) => x.json())).ids, nTokens, (t, n, rate) => { tps = rate; text = t; });
+    best = Math.max(best, tps);
+  }
+  return { tps: +best.toFixed(1), chars: text.length, sample: text.slice(0, 90) };
 }
 
 // ------------------------------------------------------- browser GPU profiler

@@ -302,10 +302,14 @@ class _WGSLTranslator:
     def _translate_fn(self, node: ast.FunctionDef) -> None:
         bindings, uniforms, builtins, wg_arrays = self._classify_params(node)
 
-        # f16 anywhere in the interface requires the enable directive
+        # f16 anywhere in the interface OR body (f16() casts) requires the directive
         dev_types = [t for d in self._device_fns
                      for t in d.annotations.values() if isinstance(t, WGSLType)]
-        if any("f16" in t.wgsl_name for _, _, _, t in bindings) or \
+        uses_f16_body = any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "f16"
+            for sn in [node] + [d.node for d in self._device_fns] for n in ast.walk(sn))
+        if uses_f16_body or \
+           any("f16" in t.wgsl_name for _, _, _, t in bindings) or \
            any("f16" in t.wgsl_name for _, _, _, t in uniforms) or \
            any("f16" in t.wgsl_name for _, t in wg_arrays) or \
            any("f16" in t.wgsl_name for t in dev_types):

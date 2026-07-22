@@ -15,7 +15,7 @@ const ui = {
 
 const N_ARGMAX_WGS = 128;
 const MAX_SEQ = 512;
-const CHUNK = 16;
+const CHUNK = 64;
 // FALSIFIED experiment (kept as toggle): int8 activations + dot4I8Packed for the
 // wide (2-bit) down_proj. Neutral end-to-end in the browser (67.4 → 67.4) — the
 // dq matmuls are load-issue-bound (why output-blocking won), and dot4I8Packed only

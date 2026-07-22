@@ -45,7 +45,7 @@ const mvKernel = (kind) =>
 // wide (2-bit) gate/up: blk8 (subgroupAdd sg4 was slower, 59 vs 85 — falsified).
 // narrow (4-bit) gate/up: blk2 (was unblocked).
 const gateupKernel = (kind) =>
-  kind === "dq2" ? "mv_gateup_geglu_dq2_blk8" : "mv_gateup_geglu_dq4_blk2";
+  kind === "dq2" ? "mv_gateup_geglu_dq2_blk8_f16" : "mv_gateup_geglu_dq4_blk2";
 const gateupGrid = (rec) => rec.n_out / (rec.kind === "dq2" ? 8 : 2);
 
 // ---------------------------------------------------------------- init

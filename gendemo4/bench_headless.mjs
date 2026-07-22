@@ -69,7 +69,8 @@ try {
     const st = await evalJS("document.getElementById('status')?.textContent");
     throw new Error("model not ready: " + JSON.stringify(st.result?.result?.value));
   }
-  const r = await evalJS(`bench(undefined, ${N_TOK})`, 300000);
+  const isProf = process.argv[3] === "profile";
+  const r = await evalJS(isProf ? `profileDecode(undefined, 40).then(rows=>rows.slice(0,12).map(x=>({k:x.l,ms:+x.ms.toFixed(1),pct:0})))` : `bench(undefined, ${N_TOK})`, 300000);
   if (r.result?.exceptionDetails) finish({ error: r.result.exceptionDetails.text || "eval exception" });
   finish(r.result?.result?.value ?? { error: "no result" });
 } catch (e) {

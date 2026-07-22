@@ -73,9 +73,38 @@ PLE block + embed (00/01_main gather) are separate. Weight layouts: row-major
 LSB-first; ZP=2^(bits-1). All decode kernels: `enable subgroups` (+`f16` where
 f16 buffers) and the 32-lane subgroupShuffleXor fallback for wide-subgroup GPUs.
 
+## Validated kernels (bit-exact vs numpy on REAL weights)
+
+Every stage runs the reference kernel unmodified in headless Chrome (CDP) on the
+localhost:8000 secure origin and compares to a numpy oracle. `prep_stageN.py`
+builds the buffers + oracle; `validate_stageN.mjs` runs + diffs.
+
+| Stage | Kernel(s) | What | Result |
+|---|---|---|---|
+| 1 | 69 + 70 | RMS+SRQ, fused qkv | bit-exact |
+| 2 | 74 | gate/up geglu | 0 mismatch / 6144 |
+| 3 | 75 | down + atomic norm-add | maxAbsDiff 0 |
+| 4 | 73 | o-proj + post-attn norm-add + pre-FFN norm | hidden/y2/sum2 all 0 |
+| 5 | 101 | flash-decode attention (q-norm+RoPE+softmax+V, atomic merge) | maxAbsDiff 0 (90 & 1500 keys) |
+| 6 | 33 | dense logits GEMV (2-bit block-major) | maxAbsDiff 0 (4096 real lm_head cols) |
+| 7 | 00 | embed gather (2-bit) | maxAbsDiff 0 |
+| 8 | 77 | PLE projection 256→1536 (int8) + norm-add + norm | hidden/y2/sum2 all 0 |
+| 9 | 76 | PLE input gate (int8) + GELU-LUT × PLE | maxAbsDiff 0 |
+| 10 | 01 | 4-bit PLE gather (8960, 35 groups) | maxAbsDiff 0 |
+
+**All novel kernel patterns are proven** — SRQ int8 activations, virtual-subgroup
+fused GEMVs, block-major dense GEMV, the two-chained-RMSNorm atomic last-arriver
+tail (73/75/77), flash-decode attention with same-dispatch atomic merge (101),
+int8 +128-biased unpack4x8unorm decode (76/77), and the packing/repacking
+(checkpoint u8 rows == kernel u32 nibble layout; block-major = [.,BLK,4] then
+transpose). Remaining kernels (68 dense proj hidden→8960, small norm/combine
+ops) are low-risk variants of the above.
+
 ## Status
 
-Foundation + full de-risk complete; the recipe is exact and the data loads. The
-remaining stages are a substantial multi-session build (an engine port), not a
-tweak — but every unknown is resolved, so it can be executed straight through
-with the reference kernels + the autonomous headless harness validating tok/s.
+Foundation + full kernel de-risk complete. The recipe is exact, the data loads,
+and 10 stages validate the reference kernels bit-exact on real weights. What
+remains is the **runner integration** (app.js orchestration: weight export in
+the kernels' layouts, KV cache, PLE input pipeline, the fused per-layer dispatch
+chain, GPU-resident chunked decode, tokenization) plus the headless tok/s
+harness — an execution build with no open unknowns.

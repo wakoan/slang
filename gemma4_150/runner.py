@@ -175,6 +175,123 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         self.dispatch("combine", code, [ctx, ple, self._bufs["pl_proj_norm"], out], (nL, 1, 1))
         return out
 
+    # ---- stage 3: one decoder layer ----
+    _VNORM = """
+const HD:u32=%du; const EPS:f32=1e-6;
+@group(0) @binding(0) var<storage, read> v: array<f32>;
+@group(0) @binding(1) var<storage, read_write> cache: array<f32>;
+@group(0) @binding(2) var<uniform> p: vec4<u32>;   // p.x = dstOffset
+var<workgroup> red: array<f32, HD>;
+@compute @workgroup_size(HD,1,1)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+  let tid = lid.x; let x = v[tid];
+  red[tid] = x*x; workgroupBarrier();
+  var s:u32 = HD/2u; loop { if(s==0u){break;} if(tid<s){red[tid]=red[tid]+red[tid+s];} s=s/2u; workgroupBarrier(); }
+  cache[p.x + tid] = x * inverseSqrt(red[0]/f32(HD)+EPS);
+}"""
+
+    def _rope(self, pos, theta, half, cutoff):
+        inv = 1.0 / theta ** (np.arange(half, dtype=np.float64) / half)
+        inv[cutoff:] = 0.0
+        ang = pos * inv
+        cb = self.device.create_buffer_with_data(
+            data=np.cos(ang).astype(np.float32).tobytes(),
+            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        sb = self.device.create_buffer_with_data(
+            data=np.sin(ang).astype(np.float32).tobytes(),
+            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        return cb, sb
+
+    def _patch(self, code, **consts):
+        for k, val in consts.items():
+            code = re.sub(rf"const {k}: (u32|f32) = [^;]+;",
+                          lambda m: f"const {k}: {m.group(1)} = {val}"
+                          + ("u" if m.group(1) == "u32" else "") + ";", code)
+        return code
+
+    def layer(self, L, pos, hidden, ple_in_L, kc, vc):
+        """Run decoder layer L (non-shared) in place on `hidden` (f32 [H])."""
+        s = self.man["layers"][L]
+        sc = s["scales"]
+        H, nH = self.cfg["H"], self.cfg["nH"]
+        hd, qd, inter = s["head_dim"], s["q_dim"], s["intermediate"]
+        half, cutoff = hd // 2, s["rope_cutoff"]
+        b = self._bufs
+        cb, sb = self._rope(pos, s["rope_theta"], half, cutoff)
+
+        # 69: input norm + srq -> a[H], sum_a
+        a = self._tmp(H * 4); suma = self._tmp(4)
+        self.dispatch("k69", _kernel("69_sg_sum"),
+                      [hidden, b[f"L{L}.in_norm"], a, suma,
+                       self._uniform(np.array([1, 0, np.float32(sc["qkv_in"]).view(np.uint32), 0], np.uint32))],
+                      (1, 1, 1))
+        # 70: qkv
+        outq, outk, outv = self._tmp(qd * 4), self._tmp(hd * 4), self._tmp(hd * 4)
+        k70 = self._patch(_kernel("70_srq"), Q_OUT=qd, Q_WGS=qd // 2,
+                          TOTAL_WGS=qd // 2 + 128 + 128, GRID_X=qd // 2 + 128 + 128)
+        par70 = self._uniform(np.array([sc["q_out"], sc["k_out"], sc["v_out"], 0], np.float32))
+        self.dispatch(f"k70_{qd}", k70,
+                      [a, b[f"L{L}.q_bits"], b[f"L{L}.k_bits"], b[f"L{L}.v_bits"],
+                       b[f"L{L}.qkv_scales"], suma, outq, outk, outv, par70], (qd // 2 + 256, 1, 1))
+        # 71: k norm+rope -> cache ; v norm -> cache
+        k71 = self._patch(_kernel("71_main"), HEAD_DIM=hd, HALF_DIM=half)
+        self.dispatch(f"k71_{hd}", k71,
+                      [outk, b[f"L{L}.k_norm"], cb, sb, kc,
+                       self._uniform(np.array([1, 1, pos * hd, 0], np.uint32))], (1, 1, 1))
+        self.dispatch(f"vnorm_{hd}", self._VNORM % hd,
+                      [outv, vc, self._uniform(np.array([pos * hd, 0, 0, 0], np.uint32))], (1, 1, 1))
+        # attention (patch HEAD_DIM/HALF/OUT_Q from 101 template)
+        att = self._patch(_kernel("101_srq"), HEAD_DIM=hd, HALF_DIM=half)
+        att = att.replace("const OUT_Q: f32 = 0.014886821620166302;",
+                          f"const OUT_Q: f32 = {sc['o_in']!r};")
+        partials = self._tmp((8 * 32 * (hd + 2) + 8) * 4, src=False)
+        self.queue.write_buffer(partials, 0, np.zeros(8 * 32 * (hd + 2) + 8, np.uint32).tobytes())
+        attn = self._tmp(qd * 4)
+        window = self.cfg["window"] if s["sliding"] else 0
+        parA = self._uniform(np.array([1, pos + 1, pos, nH, 1, window, 0, 0], np.uint32))
+        self.dispatch(f"att_{hd}", att, [outq, b[f"L{L}.q_norm"], cb, sb, kc, vc, partials, attn, parA],
+                      (nH, 32, 1))
+        # 73: o-proj + post-attn norm-add + pre-ffn norm  (updates hidden, emits y2 f16 + sum2)
+        k73 = self._patch(_kernel("73_sg_sum"), IN_FEATURES=qd, WORDS_PER_ROW=qd // 8)
+        pp73 = self._tmp((H + 1) * 4, src=False)
+        self.queue.write_buffer(pp73, 0, np.zeros(H + 1, np.uint32).tobytes())
+        y2, sum2 = self._tmp(H * 2), self._tmp(4)
+        par73 = self._uniform(np.array([sc["o_out"], sc["gate_in"], 0, 0], np.float32))
+        self.dispatch(f"k73_{qd}", k73, [attn, b[f"L{L}.o_bits"], b[f"L{L}.o_scale"], pp73,
+                      hidden, b[f"L{L}.o_w12"], y2, sum2, par73], (192, 1, 1))
+        # 74: gate/up geglu -> down input (f16)
+        k74 = self._patch(_kernel("74_sg_sum"), INTER=inter, GRID_X=inter // 8)
+        geglu = self._tmp(inter * 2)
+        par74 = self._uniform(np.array([sc["gate_out"], sc["up_out"], sc["down_in"], 0], np.float32))
+        self.dispatch(f"k74_{inter}", k74, [y2, b[f"L{L}.gate_bits"], b[f"L{L}.gate_scale"],
+                      b[f"L{L}.up_bits"], b[f"L{L}.up_scale"], sum2, geglu, b[f"L{L}.gelu_gate"], par74],
+                      (inter // 8, 1, 1))
+        # 75: down + post-ffn norm-add (updates hidden)
+        k75 = self._patch(_kernel("75_srq"), INTER=inter)
+        pp75 = self._tmp((H + 1) * 4, src=False)
+        self.queue.write_buffer(pp75, 0, np.zeros(H + 1, np.uint32).tobytes())
+        par75 = self._uniform(np.array([sc["down_in"], sc["down_out"], 0, 0], np.float32))
+        self.dispatch(f"k75_{inter}", k75, [geglu, b[f"L{L}.down_bits"], pp75,
+                      b[f"L{L}.down_scale"], hidden, b[f"L{L}.down_nw"], par75], (H // 4, 1, 1))
+        # 76: PLE input gate
+        gate = self._tmp(self.cfg["ple_d"] * 4)
+        parP = np.zeros(4, np.uint32)
+        parP[:2] = np.array([sc["plegate_in"], sc["plegate_out"]], np.float32).view(np.uint32)
+        parP[2] = 0   # pleOffset: ple_in_L is already this layer's 256-slice
+        self.dispatch("k76", _kernel("76_reduce"), [hidden, b[f"L{L}.plegate_codes"],
+                      b[f"L{L}.plegate_rowscale"], ple_in_L, gate, b[f"L{L}.gelu_plegate"],
+                      self._uniform(parP)], (self.cfg["ple_d"], 1, 1))
+        # 77: PLE proj + residual*layer_scalar + next-layer norm -> hidden, y2_next
+        pp77 = self._tmp((H + 1) * 4, src=False)
+        self.queue.write_buffer(pp77, 0, np.zeros(H + 1, np.uint32).tobytes())
+        y2n, sum2n = self._tmp(H * 4), self._tmp(4)
+        nxt_in = self.man["layers"][L + 1]["scales"]["qkv_in"] if L + 1 < self.cfg["nL"] else 0.0
+        par77 = self._uniform(np.array([nxt_in, sc["pleproj_in"], sc["pleproj_out"], 0], np.float32))
+        self.dispatch("k77", _kernel("77_sg_sum"), [gate, b[f"L{L}.pleproj_codes"],
+                      b[f"L{L}.pleproj_rowscale"], pp77, hidden, b[f"L{L}.pleproj_w12s"],
+                      y2n, sum2n, par77], (96, 1, 1))
+        return hidden
+
 
 if __name__ == "__main__":
     import sys
@@ -191,5 +308,20 @@ if __name__ == "__main__":
     nL, d = r.cfg["nL"], r.cfg["ple_d"]
     gp = r.read(pb, nL * d * 4).view(np.float32)
     ep = ref.ple_input(tid, e).reshape(-1)
-    print(f"ple_input[{tid}]: gpu[:4]={gp[:4].round(4)} ref[:4]={ep[:4].round(4)} "
-          f"maxAbsDiff={np.abs(gp - ep).max():.3e}")
+    print(f"ple_input[{tid}]: maxAbsDiff={np.abs(gp - ep).max():.3e}")
+
+    # stage 3: layer 0
+    H = r.cfg["H"]
+    hidden = r._tmp(H * 4)
+    r.embed(tid, out=hidden)
+    hd0 = r.man["layers"][0]["head_dim"]
+    kc = r._tmp(8 * hd0 * 4); vc = r._tmp(8 * hd0 * 4)
+    ple_slice = r._tmp(d * 4)
+    enc = r.device.create_command_encoder()
+    enc.copy_buffer_to_buffer(pb, 0, ple_slice, 0, d * 4)   # layer 0's 256-slice
+    r.queue.submit([enc.finish()])
+    r.layer(0, 0, hidden, ple_slice, kc, vc)
+    gh = r.read(hidden, H * 4).view(np.float32)
+    rh = ref.layer(e.copy(), 0, 0, ref.ple_input(tid, e)[0])
+    print(f"layer0[{tid}]: gpu[:4]={gh[:4].round(4)} ref[:4]={rh[:4].round(4)} "
+          f"maxAbsDiff={np.abs(gh - rh).max():.3e} maxRel={np.abs(gh-rh).max()/ (np.abs(rh).max()+1e-9):.2e}")

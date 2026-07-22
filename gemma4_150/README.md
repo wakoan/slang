@@ -47,6 +47,32 @@ prefill-only). It's three things, all now understood and de-risked:
    Reuse `../gendemo4/bench_headless.mjs` harness (autonomous tok/s).
 6. **Export + server**: standalone weights.bin (their layouts) + scales + a server.
 
+## Exact per-layer decode dispatch chain (mapped from kernel headers)
+
+Data flows SRQ-quantized between fused kernels (each emits its output already
+srq'd for the next). Per decoder layer, ~6-7 dispatches:
+
+1. **69_sg_sum** `DecodeRmsSrq`: weighted RMSNorm(x) → SRQ int8 (as f16) codes
+   `a` + per-row `sum_a`. (input_layernorm; produces the qkv input)
+2. **70_srq** qkv: one dispatch, reads presrq `a`+`sum_a`, weights `[q|k|v]_bits`,
+   `scales=[qScale|kScale|vScale]`, `params=[q/k/v OutScale]` → out_q/k/v (f32).
+3. **101_srq** flash decode attention: fuses q-RMSNorm+split-half RoPE, chunked
+   (NCHUNK wgs), same-dispatch last-arriver atomic merge, emits SRQ'd attn out.
+   (needs cosTbl/sinTbl, k/v caches as vec4<f32>, per-head; OUT_Q srq at merge.)
+4. **73_sg_sum** o-proj + post-attn residual-add + pre-FFN norm: reads srq'd attn
+   `a`, o `bits_buf`+`scale`, `w12=[w1|w2]`; updates `hidden`; emits gate/up presrq
+   input `y2` (f16) + `sum2`. Atomic `pp` tail. params=[outScale, inScale2].
+5. **74/16/30_sg_sum** gate/up geglu (presrq): reads `hidden`(f16 y2)+`sum_a`,
+   `gate_bits`/`up_bits`+scales, `gelu_lut`; emits down input int8 code (f16).
+   virtual-subgroup, N_ROWS=4. params=[gateOutScale, upOutScale, outQuantScale].
+6. **75_srq** down + post-FFN residual-add: reads gate/up codes (f16), down
+   `bits_buf`+`scale`, norm `nw`; updates `hidden`. Atomic `pp` last-arriver merge.
+
+PLE block + embed (00/01_main gather) are separate. Weight layouts: row-major
+`o*WPR+wd` (70/73/74/75), block-major `blk*N+col` (33 dense/logits). Codes are
+LSB-first; ZP=2^(bits-1). All decode kernels: `enable subgroups` (+`f16` where
+f16 buffers) and the 32-lane subgroupShuffleXor fallback for wide-subgroup GPUs.
+
 ## Status
 
 Foundation + full de-risk complete; the recipe is exact and the data loads. The

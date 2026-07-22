@@ -2826,8 +2826,405 @@ def matvec_dq2_vec4(
         y_out[r] = partial[0] * scale[r]
 
 
+@kernel(workgroup_size=(64,))
+def mv_gateup_geglu_dq2_vec4_blk2(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    gate_w: StorageBuffer[vec4[u32], "read"],
+    up_w: StorageBuffer[vec4[u32], "read"],
+    x: StorageBuffer[vec4[f32], "read"],
+    gscale: StorageBuffer[f32, "read"],
+    uscale: StorageBuffer[f32, "read"],
+    y_out: StorageBuffer[f32, "read_write"],
+    dims: StorageBuffer[u32, "read"],
+    pg0: WorkgroupArray[f32, 64],
+    pu0: WorkgroupArray[f32, 64],
+    pg1: WorkgroupArray[f32, 64],
+    pu1: WorkgroupArray[f32, 64],
+):
+    r0: u32 = 2 * wid.x + 0
+    r1: u32 = 2 * wid.x + 1
+    li: u32 = lid.x
+    n_in: u32 = dims[1]
+    n64: u32 = n_in / 64
+    g0: f32 = 0.0
+    u0: f32 = 0.0
+    g1: f32 = 0.0
+    u1: f32 = 0.0
+    for j in range(li, n64, 64):
+        gv0 = gate_w[r0 * n64 + j]
+        uv0 = up_w[r0 * n64 + j]
+        gv1 = gate_w[r1 * n64 + j]
+        uv1 = up_w[r1 * n64 + j]
+        xb: u32 = 16 * j
+        xa00 = x[xb + 0]
+        g0 += f32(i32(gv0.x & 3) - 2) * xa00.x
+        u0 += f32(i32(uv0.x & 3) - 2) * xa00.x
+        g1 += f32(i32(gv1.x & 3) - 2) * xa00.x
+        u1 += f32(i32(uv1.x & 3) - 2) * xa00.x
+        g0 += f32(i32((gv0.x >> 2) & 3) - 2) * xa00.y
+        u0 += f32(i32((uv0.x >> 2) & 3) - 2) * xa00.y
+        g1 += f32(i32((gv1.x >> 2) & 3) - 2) * xa00.y
+        u1 += f32(i32((uv1.x >> 2) & 3) - 2) * xa00.y
+        g0 += f32(i32((gv0.x >> 4) & 3) - 2) * xa00.z
+        u0 += f32(i32((uv0.x >> 4) & 3) - 2) * xa00.z
+        g1 += f32(i32((gv1.x >> 4) & 3) - 2) * xa00.z
+        u1 += f32(i32((uv1.x >> 4) & 3) - 2) * xa00.z
+        g0 += f32(i32((gv0.x >> 6) & 3) - 2) * xa00.w
+        u0 += f32(i32((uv0.x >> 6) & 3) - 2) * xa00.w
+        g1 += f32(i32((gv1.x >> 6) & 3) - 2) * xa00.w
+        u1 += f32(i32((uv1.x >> 6) & 3) - 2) * xa00.w
+        xa01 = x[xb + 1]
+        g0 += f32(i32((gv0.x >> 8) & 3) - 2) * xa01.x
+        u0 += f32(i32((uv0.x >> 8) & 3) - 2) * xa01.x
+        g1 += f32(i32((gv1.x >> 8) & 3) - 2) * xa01.x
+        u1 += f32(i32((uv1.x >> 8) & 3) - 2) * xa01.x
+        g0 += f32(i32((gv0.x >> 10) & 3) - 2) * xa01.y
+        u0 += f32(i32((uv0.x >> 10) & 3) - 2) * xa01.y
+        g1 += f32(i32((gv1.x >> 10) & 3) - 2) * xa01.y
+        u1 += f32(i32((uv1.x >> 10) & 3) - 2) * xa01.y
+        g0 += f32(i32((gv0.x >> 12) & 3) - 2) * xa01.z
+        u0 += f32(i32((uv0.x >> 12) & 3) - 2) * xa01.z
+        g1 += f32(i32((gv1.x >> 12) & 3) - 2) * xa01.z
+        u1 += f32(i32((uv1.x >> 12) & 3) - 2) * xa01.z
+        g0 += f32(i32((gv0.x >> 14) & 3) - 2) * xa01.w
+        u0 += f32(i32((uv0.x >> 14) & 3) - 2) * xa01.w
+        g1 += f32(i32((gv1.x >> 14) & 3) - 2) * xa01.w
+        u1 += f32(i32((uv1.x >> 14) & 3) - 2) * xa01.w
+        xa02 = x[xb + 2]
+        g0 += f32(i32((gv0.x >> 16) & 3) - 2) * xa02.x
+        u0 += f32(i32((uv0.x >> 16) & 3) - 2) * xa02.x
+        g1 += f32(i32((gv1.x >> 16) & 3) - 2) * xa02.x
+        u1 += f32(i32((uv1.x >> 16) & 3) - 2) * xa02.x
+        g0 += f32(i32((gv0.x >> 18) & 3) - 2) * xa02.y
+        u0 += f32(i32((uv0.x >> 18) & 3) - 2) * xa02.y
+        g1 += f32(i32((gv1.x >> 18) & 3) - 2) * xa02.y
+        u1 += f32(i32((uv1.x >> 18) & 3) - 2) * xa02.y
+        g0 += f32(i32((gv0.x >> 20) & 3) - 2) * xa02.z
+        u0 += f32(i32((uv0.x >> 20) & 3) - 2) * xa02.z
+        g1 += f32(i32((gv1.x >> 20) & 3) - 2) * xa02.z
+        u1 += f32(i32((uv1.x >> 20) & 3) - 2) * xa02.z
+        g0 += f32(i32((gv0.x >> 22) & 3) - 2) * xa02.w
+        u0 += f32(i32((uv0.x >> 22) & 3) - 2) * xa02.w
+        g1 += f32(i32((gv1.x >> 22) & 3) - 2) * xa02.w
+        u1 += f32(i32((uv1.x >> 22) & 3) - 2) * xa02.w
+        xa03 = x[xb + 3]
+        g0 += f32(i32((gv0.x >> 24) & 3) - 2) * xa03.x
+        u0 += f32(i32((uv0.x >> 24) & 3) - 2) * xa03.x
+        g1 += f32(i32((gv1.x >> 24) & 3) - 2) * xa03.x
+        u1 += f32(i32((uv1.x >> 24) & 3) - 2) * xa03.x
+        g0 += f32(i32((gv0.x >> 26) & 3) - 2) * xa03.y
+        u0 += f32(i32((uv0.x >> 26) & 3) - 2) * xa03.y
+        g1 += f32(i32((gv1.x >> 26) & 3) - 2) * xa03.y
+        u1 += f32(i32((uv1.x >> 26) & 3) - 2) * xa03.y
+        g0 += f32(i32((gv0.x >> 28) & 3) - 2) * xa03.z
+        u0 += f32(i32((uv0.x >> 28) & 3) - 2) * xa03.z
+        g1 += f32(i32((gv1.x >> 28) & 3) - 2) * xa03.z
+        u1 += f32(i32((uv1.x >> 28) & 3) - 2) * xa03.z
+        g0 += f32(i32((gv0.x >> 30) & 3) - 2) * xa03.w
+        u0 += f32(i32((uv0.x >> 30) & 3) - 2) * xa03.w
+        g1 += f32(i32((gv1.x >> 30) & 3) - 2) * xa03.w
+        u1 += f32(i32((uv1.x >> 30) & 3) - 2) * xa03.w
+        xa10 = x[xb + 4]
+        g0 += f32(i32(gv0.y & 3) - 2) * xa10.x
+        u0 += f32(i32(uv0.y & 3) - 2) * xa10.x
+        g1 += f32(i32(gv1.y & 3) - 2) * xa10.x
+        u1 += f32(i32(uv1.y & 3) - 2) * xa10.x
+        g0 += f32(i32((gv0.y >> 2) & 3) - 2) * xa10.y
+        u0 += f32(i32((uv0.y >> 2) & 3) - 2) * xa10.y
+        g1 += f32(i32((gv1.y >> 2) & 3) - 2) * xa10.y
+        u1 += f32(i32((uv1.y >> 2) & 3) - 2) * xa10.y
+        g0 += f32(i32((gv0.y >> 4) & 3) - 2) * xa10.z
+        u0 += f32(i32((uv0.y >> 4) & 3) - 2) * xa10.z
+        g1 += f32(i32((gv1.y >> 4) & 3) - 2) * xa10.z
+        u1 += f32(i32((uv1.y >> 4) & 3) - 2) * xa10.z
+        g0 += f32(i32((gv0.y >> 6) & 3) - 2) * xa10.w
+        u0 += f32(i32((uv0.y >> 6) & 3) - 2) * xa10.w
+        g1 += f32(i32((gv1.y >> 6) & 3) - 2) * xa10.w
+        u1 += f32(i32((uv1.y >> 6) & 3) - 2) * xa10.w
+        xa11 = x[xb + 5]
+        g0 += f32(i32((gv0.y >> 8) & 3) - 2) * xa11.x
+        u0 += f32(i32((uv0.y >> 8) & 3) - 2) * xa11.x
+        g1 += f32(i32((gv1.y >> 8) & 3) - 2) * xa11.x
+        u1 += f32(i32((uv1.y >> 8) & 3) - 2) * xa11.x
+        g0 += f32(i32((gv0.y >> 10) & 3) - 2) * xa11.y
+        u0 += f32(i32((uv0.y >> 10) & 3) - 2) * xa11.y
+        g1 += f32(i32((gv1.y >> 10) & 3) - 2) * xa11.y
+        u1 += f32(i32((uv1.y >> 10) & 3) - 2) * xa11.y
+        g0 += f32(i32((gv0.y >> 12) & 3) - 2) * xa11.z
+        u0 += f32(i32((uv0.y >> 12) & 3) - 2) * xa11.z
+        g1 += f32(i32((gv1.y >> 12) & 3) - 2) * xa11.z
+        u1 += f32(i32((uv1.y >> 12) & 3) - 2) * xa11.z
+        g0 += f32(i32((gv0.y >> 14) & 3) - 2) * xa11.w
+        u0 += f32(i32((uv0.y >> 14) & 3) - 2) * xa11.w
+        g1 += f32(i32((gv1.y >> 14) & 3) - 2) * xa11.w
+        u1 += f32(i32((uv1.y >> 14) & 3) - 2) * xa11.w
+        xa12 = x[xb + 6]
+        g0 += f32(i32((gv0.y >> 16) & 3) - 2) * xa12.x
+        u0 += f32(i32((uv0.y >> 16) & 3) - 2) * xa12.x
+        g1 += f32(i32((gv1.y >> 16) & 3) - 2) * xa12.x
+        u1 += f32(i32((uv1.y >> 16) & 3) - 2) * xa12.x
+        g0 += f32(i32((gv0.y >> 18) & 3) - 2) * xa12.y
+        u0 += f32(i32((uv0.y >> 18) & 3) - 2) * xa12.y
+        g1 += f32(i32((gv1.y >> 18) & 3) - 2) * xa12.y
+        u1 += f32(i32((uv1.y >> 18) & 3) - 2) * xa12.y
+        g0 += f32(i32((gv0.y >> 20) & 3) - 2) * xa12.z
+        u0 += f32(i32((uv0.y >> 20) & 3) - 2) * xa12.z
+        g1 += f32(i32((gv1.y >> 20) & 3) - 2) * xa12.z
+        u1 += f32(i32((uv1.y >> 20) & 3) - 2) * xa12.z
+        g0 += f32(i32((gv0.y >> 22) & 3) - 2) * xa12.w
+        u0 += f32(i32((uv0.y >> 22) & 3) - 2) * xa12.w
+        g1 += f32(i32((gv1.y >> 22) & 3) - 2) * xa12.w
+        u1 += f32(i32((uv1.y >> 22) & 3) - 2) * xa12.w
+        xa13 = x[xb + 7]
+        g0 += f32(i32((gv0.y >> 24) & 3) - 2) * xa13.x
+        u0 += f32(i32((uv0.y >> 24) & 3) - 2) * xa13.x
+        g1 += f32(i32((gv1.y >> 24) & 3) - 2) * xa13.x
+        u1 += f32(i32((uv1.y >> 24) & 3) - 2) * xa13.x
+        g0 += f32(i32((gv0.y >> 26) & 3) - 2) * xa13.y
+        u0 += f32(i32((uv0.y >> 26) & 3) - 2) * xa13.y
+        g1 += f32(i32((gv1.y >> 26) & 3) - 2) * xa13.y
+        u1 += f32(i32((uv1.y >> 26) & 3) - 2) * xa13.y
+        g0 += f32(i32((gv0.y >> 28) & 3) - 2) * xa13.z
+        u0 += f32(i32((uv0.y >> 28) & 3) - 2) * xa13.z
+        g1 += f32(i32((gv1.y >> 28) & 3) - 2) * xa13.z
+        u1 += f32(i32((uv1.y >> 28) & 3) - 2) * xa13.z
+        g0 += f32(i32((gv0.y >> 30) & 3) - 2) * xa13.w
+        u0 += f32(i32((uv0.y >> 30) & 3) - 2) * xa13.w
+        g1 += f32(i32((gv1.y >> 30) & 3) - 2) * xa13.w
+        u1 += f32(i32((uv1.y >> 30) & 3) - 2) * xa13.w
+        xa20 = x[xb + 8]
+        g0 += f32(i32(gv0.z & 3) - 2) * xa20.x
+        u0 += f32(i32(uv0.z & 3) - 2) * xa20.x
+        g1 += f32(i32(gv1.z & 3) - 2) * xa20.x
+        u1 += f32(i32(uv1.z & 3) - 2) * xa20.x
+        g0 += f32(i32((gv0.z >> 2) & 3) - 2) * xa20.y
+        u0 += f32(i32((uv0.z >> 2) & 3) - 2) * xa20.y
+        g1 += f32(i32((gv1.z >> 2) & 3) - 2) * xa20.y
+        u1 += f32(i32((uv1.z >> 2) & 3) - 2) * xa20.y
+        g0 += f32(i32((gv0.z >> 4) & 3) - 2) * xa20.z
+        u0 += f32(i32((uv0.z >> 4) & 3) - 2) * xa20.z
+        g1 += f32(i32((gv1.z >> 4) & 3) - 2) * xa20.z
+        u1 += f32(i32((uv1.z >> 4) & 3) - 2) * xa20.z
+        g0 += f32(i32((gv0.z >> 6) & 3) - 2) * xa20.w
+        u0 += f32(i32((uv0.z >> 6) & 3) - 2) * xa20.w
+        g1 += f32(i32((gv1.z >> 6) & 3) - 2) * xa20.w
+        u1 += f32(i32((uv1.z >> 6) & 3) - 2) * xa20.w
+        xa21 = x[xb + 9]
+        g0 += f32(i32((gv0.z >> 8) & 3) - 2) * xa21.x
+        u0 += f32(i32((uv0.z >> 8) & 3) - 2) * xa21.x
+        g1 += f32(i32((gv1.z >> 8) & 3) - 2) * xa21.x
+        u1 += f32(i32((uv1.z >> 8) & 3) - 2) * xa21.x
+        g0 += f32(i32((gv0.z >> 10) & 3) - 2) * xa21.y
+        u0 += f32(i32((uv0.z >> 10) & 3) - 2) * xa21.y
+        g1 += f32(i32((gv1.z >> 10) & 3) - 2) * xa21.y
+        u1 += f32(i32((uv1.z >> 10) & 3) - 2) * xa21.y
+        g0 += f32(i32((gv0.z >> 12) & 3) - 2) * xa21.z
+        u0 += f32(i32((uv0.z >> 12) & 3) - 2) * xa21.z
+        g1 += f32(i32((gv1.z >> 12) & 3) - 2) * xa21.z
+        u1 += f32(i32((uv1.z >> 12) & 3) - 2) * xa21.z
+        g0 += f32(i32((gv0.z >> 14) & 3) - 2) * xa21.w
+        u0 += f32(i32((uv0.z >> 14) & 3) - 2) * xa21.w
+        g1 += f32(i32((gv1.z >> 14) & 3) - 2) * xa21.w
+        u1 += f32(i32((uv1.z >> 14) & 3) - 2) * xa21.w
+        xa22 = x[xb + 10]
+        g0 += f32(i32((gv0.z >> 16) & 3) - 2) * xa22.x
+        u0 += f32(i32((uv0.z >> 16) & 3) - 2) * xa22.x
+        g1 += f32(i32((gv1.z >> 16) & 3) - 2) * xa22.x
+        u1 += f32(i32((uv1.z >> 16) & 3) - 2) * xa22.x
+        g0 += f32(i32((gv0.z >> 18) & 3) - 2) * xa22.y
+        u0 += f32(i32((uv0.z >> 18) & 3) - 2) * xa22.y
+        g1 += f32(i32((gv1.z >> 18) & 3) - 2) * xa22.y
+        u1 += f32(i32((uv1.z >> 18) & 3) - 2) * xa22.y
+        g0 += f32(i32((gv0.z >> 20) & 3) - 2) * xa22.z
+        u0 += f32(i32((uv0.z >> 20) & 3) - 2) * xa22.z
+        g1 += f32(i32((gv1.z >> 20) & 3) - 2) * xa22.z
+        u1 += f32(i32((uv1.z >> 20) & 3) - 2) * xa22.z
+        g0 += f32(i32((gv0.z >> 22) & 3) - 2) * xa22.w
+        u0 += f32(i32((uv0.z >> 22) & 3) - 2) * xa22.w
+        g1 += f32(i32((gv1.z >> 22) & 3) - 2) * xa22.w
+        u1 += f32(i32((uv1.z >> 22) & 3) - 2) * xa22.w
+        xa23 = x[xb + 11]
+        g0 += f32(i32((gv0.z >> 24) & 3) - 2) * xa23.x
+        u0 += f32(i32((uv0.z >> 24) & 3) - 2) * xa23.x
+        g1 += f32(i32((gv1.z >> 24) & 3) - 2) * xa23.x
+        u1 += f32(i32((uv1.z >> 24) & 3) - 2) * xa23.x
+        g0 += f32(i32((gv0.z >> 26) & 3) - 2) * xa23.y
+        u0 += f32(i32((uv0.z >> 26) & 3) - 2) * xa23.y
+        g1 += f32(i32((gv1.z >> 26) & 3) - 2) * xa23.y
+        u1 += f32(i32((uv1.z >> 26) & 3) - 2) * xa23.y
+        g0 += f32(i32((gv0.z >> 28) & 3) - 2) * xa23.z
+        u0 += f32(i32((uv0.z >> 28) & 3) - 2) * xa23.z
+        g1 += f32(i32((gv1.z >> 28) & 3) - 2) * xa23.z
+        u1 += f32(i32((uv1.z >> 28) & 3) - 2) * xa23.z
+        g0 += f32(i32((gv0.z >> 30) & 3) - 2) * xa23.w
+        u0 += f32(i32((uv0.z >> 30) & 3) - 2) * xa23.w
+        g1 += f32(i32((gv1.z >> 30) & 3) - 2) * xa23.w
+        u1 += f32(i32((uv1.z >> 30) & 3) - 2) * xa23.w
+        xa30 = x[xb + 12]
+        g0 += f32(i32(gv0.w & 3) - 2) * xa30.x
+        u0 += f32(i32(uv0.w & 3) - 2) * xa30.x
+        g1 += f32(i32(gv1.w & 3) - 2) * xa30.x
+        u1 += f32(i32(uv1.w & 3) - 2) * xa30.x
+        g0 += f32(i32((gv0.w >> 2) & 3) - 2) * xa30.y
+        u0 += f32(i32((uv0.w >> 2) & 3) - 2) * xa30.y
+        g1 += f32(i32((gv1.w >> 2) & 3) - 2) * xa30.y
+        u1 += f32(i32((uv1.w >> 2) & 3) - 2) * xa30.y
+        g0 += f32(i32((gv0.w >> 4) & 3) - 2) * xa30.z
+        u0 += f32(i32((uv0.w >> 4) & 3) - 2) * xa30.z
+        g1 += f32(i32((gv1.w >> 4) & 3) - 2) * xa30.z
+        u1 += f32(i32((uv1.w >> 4) & 3) - 2) * xa30.z
+        g0 += f32(i32((gv0.w >> 6) & 3) - 2) * xa30.w
+        u0 += f32(i32((uv0.w >> 6) & 3) - 2) * xa30.w
+        g1 += f32(i32((gv1.w >> 6) & 3) - 2) * xa30.w
+        u1 += f32(i32((uv1.w >> 6) & 3) - 2) * xa30.w
+        xa31 = x[xb + 13]
+        g0 += f32(i32((gv0.w >> 8) & 3) - 2) * xa31.x
+        u0 += f32(i32((uv0.w >> 8) & 3) - 2) * xa31.x
+        g1 += f32(i32((gv1.w >> 8) & 3) - 2) * xa31.x
+        u1 += f32(i32((uv1.w >> 8) & 3) - 2) * xa31.x
+        g0 += f32(i32((gv0.w >> 10) & 3) - 2) * xa31.y
+        u0 += f32(i32((uv0.w >> 10) & 3) - 2) * xa31.y
+        g1 += f32(i32((gv1.w >> 10) & 3) - 2) * xa31.y
+        u1 += f32(i32((uv1.w >> 10) & 3) - 2) * xa31.y
+        g0 += f32(i32((gv0.w >> 12) & 3) - 2) * xa31.z
+        u0 += f32(i32((uv0.w >> 12) & 3) - 2) * xa31.z
+        g1 += f32(i32((gv1.w >> 12) & 3) - 2) * xa31.z
+        u1 += f32(i32((uv1.w >> 12) & 3) - 2) * xa31.z
+        g0 += f32(i32((gv0.w >> 14) & 3) - 2) * xa31.w
+        u0 += f32(i32((uv0.w >> 14) & 3) - 2) * xa31.w
+        g1 += f32(i32((gv1.w >> 14) & 3) - 2) * xa31.w
+        u1 += f32(i32((uv1.w >> 14) & 3) - 2) * xa31.w
+        xa32 = x[xb + 14]
+        g0 += f32(i32((gv0.w >> 16) & 3) - 2) * xa32.x
+        u0 += f32(i32((uv0.w >> 16) & 3) - 2) * xa32.x
+        g1 += f32(i32((gv1.w >> 16) & 3) - 2) * xa32.x
+        u1 += f32(i32((uv1.w >> 16) & 3) - 2) * xa32.x
+        g0 += f32(i32((gv0.w >> 18) & 3) - 2) * xa32.y
+        u0 += f32(i32((uv0.w >> 18) & 3) - 2) * xa32.y
+        g1 += f32(i32((gv1.w >> 18) & 3) - 2) * xa32.y
+        u1 += f32(i32((uv1.w >> 18) & 3) - 2) * xa32.y
+        g0 += f32(i32((gv0.w >> 20) & 3) - 2) * xa32.z
+        u0 += f32(i32((uv0.w >> 20) & 3) - 2) * xa32.z
+        g1 += f32(i32((gv1.w >> 20) & 3) - 2) * xa32.z
+        u1 += f32(i32((uv1.w >> 20) & 3) - 2) * xa32.z
+        g0 += f32(i32((gv0.w >> 22) & 3) - 2) * xa32.w
+        u0 += f32(i32((uv0.w >> 22) & 3) - 2) * xa32.w
+        g1 += f32(i32((gv1.w >> 22) & 3) - 2) * xa32.w
+        u1 += f32(i32((uv1.w >> 22) & 3) - 2) * xa32.w
+        xa33 = x[xb + 15]
+        g0 += f32(i32((gv0.w >> 24) & 3) - 2) * xa33.x
+        u0 += f32(i32((uv0.w >> 24) & 3) - 2) * xa33.x
+        g1 += f32(i32((gv1.w >> 24) & 3) - 2) * xa33.x
+        u1 += f32(i32((uv1.w >> 24) & 3) - 2) * xa33.x
+        g0 += f32(i32((gv0.w >> 26) & 3) - 2) * xa33.y
+        u0 += f32(i32((uv0.w >> 26) & 3) - 2) * xa33.y
+        g1 += f32(i32((gv1.w >> 26) & 3) - 2) * xa33.y
+        u1 += f32(i32((uv1.w >> 26) & 3) - 2) * xa33.y
+        g0 += f32(i32((gv0.w >> 28) & 3) - 2) * xa33.z
+        u0 += f32(i32((uv0.w >> 28) & 3) - 2) * xa33.z
+        g1 += f32(i32((gv1.w >> 28) & 3) - 2) * xa33.z
+        u1 += f32(i32((uv1.w >> 28) & 3) - 2) * xa33.z
+        g0 += f32(i32((gv0.w >> 30) & 3) - 2) * xa33.w
+        u0 += f32(i32((uv0.w >> 30) & 3) - 2) * xa33.w
+        g1 += f32(i32((gv1.w >> 30) & 3) - 2) * xa33.w
+        u1 += f32(i32((uv1.w >> 30) & 3) - 2) * xa33.w
+    pg0[li] = g0
+    pu0[li] = u0
+    pg1[li] = g1
+    pu1[li] = u1
+    barrier()
+    s: u32 = 32
+    while s > 0:
+        if li < s:
+            pg0[li] = pg0[li] + pg0[li + s]
+            pu0[li] = pu0[li] + pu0[li + s]
+            pg1[li] = pg1[li] + pg1[li + s]
+            pu1[li] = pu1[li] + pu1[li + s]
+        barrier()
+        s = s / 2
+    if li == 0:
+        y_out[r0] = gelu(pg0[0] * gscale[r0]) * (pu0[0] * uscale[r0])
+        y_out[r1] = gelu(pg1[0] * gscale[r1]) * (pu1[0] * uscale[r1])
+
+
+@kernel(workgroup_size=(64,))
+def matvec_dq4_vec4(
+    wid: Builtin.workgroup_id,
+    lid: Builtin.local_invocation_id,
+    w: StorageBuffer[vec4[u32], "read"],   # [n_out, n_in/32] (vec4<u32>=32 int4)
+    x: StorageBuffer[vec4[f32], "read"],   # [n_in/4]
+    scale: StorageBuffer[f32, "read"],
+    y_out: StorageBuffer[f32, "read_write"],
+    dims: StorageBuffer[u32, "read"],      # [n_out, n_in] (n_in % 32 == 0)
+    partial: WorkgroupArray[f32, 64],
+):
+    r: u32 = wid.x
+    li: u32 = lid.x
+    n_out: u32 = dims[0]
+    n_in: u32 = dims[1]
+    n32: u32 = n_in / 32
+    acc: f32 = 0.0
+    if r < n_out:
+        for j in range(li, n32, 64):
+            wv = w[r * n32 + j]
+            xb: u32 = 8 * j
+            xa00 = x[xb + 0]
+            acc += f32(i32(wv.x & 15) - 8) * xa00.x
+            acc += f32(i32((wv.x >> 4) & 15) - 8) * xa00.y
+            acc += f32(i32((wv.x >> 8) & 15) - 8) * xa00.z
+            acc += f32(i32((wv.x >> 12) & 15) - 8) * xa00.w
+            xa01 = x[xb + 1]
+            acc += f32(i32((wv.x >> 16) & 15) - 8) * xa01.x
+            acc += f32(i32((wv.x >> 20) & 15) - 8) * xa01.y
+            acc += f32(i32((wv.x >> 24) & 15) - 8) * xa01.z
+            acc += f32(i32((wv.x >> 28) & 15) - 8) * xa01.w
+            xa10 = x[xb + 2]
+            acc += f32(i32(wv.y & 15) - 8) * xa10.x
+            acc += f32(i32((wv.y >> 4) & 15) - 8) * xa10.y
+            acc += f32(i32((wv.y >> 8) & 15) - 8) * xa10.z
+            acc += f32(i32((wv.y >> 12) & 15) - 8) * xa10.w
+            xa11 = x[xb + 3]
+            acc += f32(i32((wv.y >> 16) & 15) - 8) * xa11.x
+            acc += f32(i32((wv.y >> 20) & 15) - 8) * xa11.y
+            acc += f32(i32((wv.y >> 24) & 15) - 8) * xa11.z
+            acc += f32(i32((wv.y >> 28) & 15) - 8) * xa11.w
+            xa20 = x[xb + 4]
+            acc += f32(i32(wv.z & 15) - 8) * xa20.x
+            acc += f32(i32((wv.z >> 4) & 15) - 8) * xa20.y
+            acc += f32(i32((wv.z >> 8) & 15) - 8) * xa20.z
+            acc += f32(i32((wv.z >> 12) & 15) - 8) * xa20.w
+            xa21 = x[xb + 5]
+            acc += f32(i32((wv.z >> 16) & 15) - 8) * xa21.x
+            acc += f32(i32((wv.z >> 20) & 15) - 8) * xa21.y
+            acc += f32(i32((wv.z >> 24) & 15) - 8) * xa21.z
+            acc += f32(i32((wv.z >> 28) & 15) - 8) * xa21.w
+            xa30 = x[xb + 6]
+            acc += f32(i32(wv.w & 15) - 8) * xa30.x
+            acc += f32(i32((wv.w >> 4) & 15) - 8) * xa30.y
+            acc += f32(i32((wv.w >> 8) & 15) - 8) * xa30.z
+            acc += f32(i32((wv.w >> 12) & 15) - 8) * xa30.w
+            xa31 = x[xb + 7]
+            acc += f32(i32((wv.w >> 16) & 15) - 8) * xa31.x
+            acc += f32(i32((wv.w >> 20) & 15) - 8) * xa31.y
+            acc += f32(i32((wv.w >> 24) & 15) - 8) * xa31.z
+            acc += f32(i32((wv.w >> 28) & 15) - 8) * xa31.w
+    partial[li] = acc
+    barrier()
+    s: u32 = 32
+    while s > 0:
+        if li < s:
+            partial[li] = partial[li] + partial[li + s]
+        barrier()
+        s = s / 2
+    if li == 0 and r < n_out:
+        y_out[r] = partial[0] * scale[r]
+
+
 
 BROWSER_EXTRA_KERNELS.update({
+    "matvec_dq4_vec4": matvec_dq4_vec4,
+    "mv_gateup_geglu_dq2_vec4_blk2": mv_gateup_geglu_dq2_vec4_blk2,
     "matvec_dq2_vec4": matvec_dq2_vec4,
     "matvec_dq2_blk2_f16": matvec_dq2_blk2_f16,
     "mv_gateup_geglu_dq4_blk2": mv_gateup_geglu_dq4_blk2,

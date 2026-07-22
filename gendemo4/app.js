@@ -33,7 +33,7 @@ const K_RMS_ADD_SCALE = USE_T256_NORMS ? "rmsnorm_add_scale_wg_t256" : "rmsnorm_
 const USE_FLASH_ATTN = true;
 const FLASH_S = 8;
 // A/B: threads/workgroup for the wide (2-bit) down_proj (long n_in=12288 reduction)
-const DOWN_DQ2_KERNEL = "matvec_dq2_blk2_t128"; // matvec_dq2_blk2 (64) | _t128 | _t256
+const DOWN_DQ2 = { kernel: "matvec_dq2_vec4", rows: 1 }; // vec4<u32> loads | blk2_t128/2
 
 let G = null;
 const status = (m) => { ui.status.textContent = m; };
@@ -323,7 +323,7 @@ async function init() {
       gateup: bg(gateupKernel(gR.kind), W[gR.w], W[uR.w], B.xn, W[gR.scale], W[uR.scale],
                  B.ffh, dimsFor(gR)),
       down: dR.kind === "dq2"
-        ? bg(DOWN_DQ2_KERNEL, W[dR.w], B.ffh, W[dR.scale], B.mlpOut, dimsFor(dR))
+        ? bg(DOWN_DQ2.kernel, W[dR.w], B.ffh, W[dR.scale], B.mlpOut, dimsFor(dR))
         : mvBg(dR, B.ffh, B.mlpOut),
       // int8 experiment: quantize ffh then dot4I8Packed down (dq2 layers only)
       quantDown: dR.kind === "dq2"
@@ -505,7 +505,7 @@ function encodeForwardWith(run, wantLogits) {
       run("quant_i8", L.quantDown, 1);            // ffh -> int8 + scale
       run("matvec_dq2_i8", L.downI8, L.dR.n_out); // 1 row/wg, hardware int dot
     } else {
-      run(L.dR.kind === "dq2" ? DOWN_DQ2_KERNEL : "matvec_dq4_blk2", L.down, L.dR.n_out / 2);
+      run(L.dR.kind === "dq2" ? DOWN_DQ2.kernel : "matvec_dq4_blk2", L.down, L.dR.kind === "dq2" ? L.dR.n_out / DOWN_DQ2.rows : L.dR.n_out / 2);
     }
     run(K_RMS_ADD, L.normPffAdd, 1);
     run("mv_geglu_f16", L.pleGateup, pleH);

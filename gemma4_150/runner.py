@@ -209,13 +209,23 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                           + ("u" if m.group(1) == "u32" else "") + ";", code)
         return code
 
-    def layer(self, L, pos, hidden, ple_in_L, kc, vc):
-        """Run decoder layer L (non-shared) in place on `hidden` (f32 [H])."""
+    def setup_caches(self, max_seq=2048):
+        self.max_seq = max_seq
+        self.kc, self.vc = {}, {}
+        for s in self.man["layers"]:
+            if not s["shared"]:
+                hd = s["head_dim"]
+                self.kc[s["index"]] = self._tmp(max_seq * hd * 4, src=False)
+                self.vc[s["index"]] = self._tmp(max_seq * hd * 4, src=False)
+
+    def layer(self, L, pos, hidden, ple_buf, ple_off):
+        """Run decoder layer L in place on `hidden` (f32 [H])."""
         s = self.man["layers"][L]
         sc = s["scales"]
         H, nH = self.cfg["H"], self.cfg["nH"]
         hd, qd, inter = s["head_dim"], s["q_dim"], s["intermediate"]
-        half, cutoff = hd // 2, s["rope_cutoff"]
+        half, cutoff, shared = hd // 2, s["rope_cutoff"], s["shared"]
+        kc, vc = self.kc[s["kv_source"]], self.vc[s["kv_source"]]
         b = self._bufs
         cb, sb = self._rope(pos, s["rope_theta"], half, cutoff)
 
@@ -225,21 +235,30 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                       [hidden, b[f"L{L}.in_norm"], a, suma,
                        self._uniform(np.array([1, 0, np.float32(sc["qkv_in"]).view(np.uint32), 0], np.uint32))],
                       (1, 1, 1))
-        # 70: qkv
-        outq, outk, outv = self._tmp(qd * 4), self._tmp(hd * 4), self._tmp(hd * 4)
-        k70 = self._patch(_kernel("70_srq"), Q_OUT=qd, Q_WGS=qd // 2,
-                          TOTAL_WGS=qd // 2 + 128 + 128, GRID_X=qd // 2 + 128 + 128)
-        par70 = self._uniform(np.array([sc["q_out"], sc["k_out"], sc["v_out"], 0], np.float32))
-        self.dispatch(f"k70_{qd}", k70,
-                      [a, b[f"L{L}.q_bits"], b[f"L{L}.k_bits"], b[f"L{L}.v_bits"],
-                       b[f"L{L}.qkv_scales"], suma, outq, outk, outv, par70], (qd // 2 + 256, 1, 1))
-        # 71: k norm+rope -> cache ; v norm -> cache
-        k71 = self._patch(_kernel("71_main"), HEAD_DIM=hd, HALF_DIM=half)
-        self.dispatch(f"k71_{hd}", k71,
-                      [outk, b[f"L{L}.k_norm"], cb, sb, kc,
-                       self._uniform(np.array([1, 1, pos * hd, 0], np.uint32))], (1, 1, 1))
-        self.dispatch(f"vnorm_{hd}", self._VNORM % hd,
-                      [outv, vc, self._uniform(np.array([pos * hd, 0, 0, 0], np.uint32))], (1, 1, 1))
+        # 70: qkv  (shared layers: q-only — bind q_bits x3, dispatch only the Q workgroups)
+        # KV head_dim == q head_dim (256 sliding / 512 full), so patch KV_OUT/KV_WGS too.
+        outq = self._tmp(qd * 4)
+        dummy = self._tmp(hd * 4)
+        total = qd // 2 + hd     # Q_WGS + 2*KV_WGS = qd/2 + 2*(hd/2)
+        k70 = self._patch(_kernel("70_srq"), Q_OUT=qd, Q_WGS=qd // 2, KV_OUT=hd,
+                          KV_WGS=hd // 2, TOTAL_WGS=total, GRID_X=total)
+        par70 = self._uniform(np.array([sc["q_out"], sc.get("k_out", 0), sc.get("v_out", 0), 0], np.float32))
+        if shared:
+            self.dispatch(f"k70_{qd}_{hd}", k70,
+                          [a, b[f"L{L}.q_bits"], b[f"L{L}.q_bits"], b[f"L{L}.q_bits"],
+                           b[f"L{L}.q_scale"], suma, outq, dummy, dummy, par70], (qd // 2, 1, 1))
+        else:
+            outk, outv = self._tmp(hd * 4), self._tmp(hd * 4)
+            self.dispatch(f"k70_{qd}_{hd}", k70,
+                          [a, b[f"L{L}.q_bits"], b[f"L{L}.k_bits"], b[f"L{L}.v_bits"],
+                           b[f"L{L}.qkv_scales"], suma, outq, outk, outv, par70], (total, 1, 1))
+            # 71: k norm+rope -> cache ; v norm -> cache (only the KV-owning layers)
+            k71 = self._patch(_kernel("71_main"), HEAD_DIM=hd, HALF_DIM=half)
+            self.dispatch(f"k71_{hd}", k71,
+                          [outk, b[f"L{L}.k_norm"], cb, sb, kc,
+                           self._uniform(np.array([1, 1, pos * hd, 0], np.uint32))], (1, 1, 1))
+            self.dispatch(f"vnorm_{hd}", self._VNORM % hd,
+                          [outv, vc, self._uniform(np.array([pos * hd, 0, 0, 0], np.uint32))], (1, 1, 1))
         # attention (patch HEAD_DIM/HALF/OUT_Q from 101 template)
         att = self._patch(_kernel("101_srq"), HEAD_DIM=hd, HALF_DIM=half)
         att = att.replace("const OUT_Q: f32 = 0.014886821620166302;",
@@ -249,8 +268,8 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         attn = self._tmp(qd * 4)
         window = self.cfg["window"] if s["sliding"] else 0
         parA = self._uniform(np.array([1, pos + 1, pos, nH, 1, window, 0, 0], np.uint32))
-        self.dispatch(f"att_{hd}", att, [outq, b[f"L{L}.q_norm"], cb, sb, kc, vc, partials, attn, parA],
-                      (nH, 32, 1))
+        self.dispatch(f"att_{hd}_{sc['o_in']}", att,
+                      [outq, b[f"L{L}.q_norm"], cb, sb, kc, vc, partials, attn, parA], (nH, 32, 1))
         # 73: o-proj + post-attn norm-add + pre-ffn norm  (updates hidden, emits y2 f16 + sum2)
         k73 = self._patch(_kernel("73_sg_sum"), IN_FEATURES=qd, WORDS_PER_ROW=qd // 8)
         pp73 = self._tmp((H + 1) * 4, src=False)
@@ -259,27 +278,28 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         par73 = self._uniform(np.array([sc["o_out"], sc["gate_in"], 0, 0], np.float32))
         self.dispatch(f"k73_{qd}", k73, [attn, b[f"L{L}.o_bits"], b[f"L{L}.o_scale"], pp73,
                       hidden, b[f"L{L}.o_w12"], y2, sum2, par73], (192, 1, 1))
-        # 74: gate/up geglu -> down input (f16)
-        k74 = self._patch(_kernel("74_sg_sum"), INTER=inter, GRID_X=inter // 8)
+        # 74/95: gate/up geglu -> down input (f16). 4-bit MLP (inter 6144, L0-14) uses
+        # kernel 74; 2-bit double-wide MLP (inter 12288, L15-34) uses kernel 95.
+        gu_kern, gu_grid = ("74_sg_sum", 768) if inter == 6144 else ("95_sg_sum", 3072)
         geglu = self._tmp(inter * 2)
         par74 = self._uniform(np.array([sc["gate_out"], sc["up_out"], sc["down_in"], 0], np.float32))
-        self.dispatch(f"k74_{inter}", k74, [y2, b[f"L{L}.gate_bits"], b[f"L{L}.gate_scale"],
+        self.dispatch(f"gu_{inter}", _kernel(gu_kern), [y2, b[f"L{L}.gate_bits"], b[f"L{L}.gate_scale"],
                       b[f"L{L}.up_bits"], b[f"L{L}.up_scale"], sum2, geglu, b[f"L{L}.gelu_gate"], par74],
-                      (inter // 8, 1, 1))
-        # 75: down + post-ffn norm-add (updates hidden)
-        k75 = self._patch(_kernel("75_srq"), INTER=inter)
+                      (gu_grid, 1, 1))
+        # 75/96: down + post-ffn norm-add (updates hidden). 4-bit -> 75, 2-bit -> 96.
+        down_kern = "75_srq" if inter == 6144 else "96_srq"
         pp75 = self._tmp((H + 1) * 4, src=False)
         self.queue.write_buffer(pp75, 0, np.zeros(H + 1, np.uint32).tobytes())
         par75 = self._uniform(np.array([sc["down_in"], sc["down_out"], 0, 0], np.float32))
-        self.dispatch(f"k75_{inter}", k75, [geglu, b[f"L{L}.down_bits"], pp75,
+        self.dispatch(f"down_{inter}", _kernel(down_kern), [geglu, b[f"L{L}.down_bits"], pp75,
                       b[f"L{L}.down_scale"], hidden, b[f"L{L}.down_nw"], par75], (H // 4, 1, 1))
-        # 76: PLE input gate
+        # 76: PLE input gate  (reads its 256-slice at ple_off in the shared ple buffer)
         gate = self._tmp(self.cfg["ple_d"] * 4)
         parP = np.zeros(4, np.uint32)
         parP[:2] = np.array([sc["plegate_in"], sc["plegate_out"]], np.float32).view(np.uint32)
-        parP[2] = 0   # pleOffset: ple_in_L is already this layer's 256-slice
+        parP[2] = ple_off
         self.dispatch("k76", _kernel("76_reduce"), [hidden, b[f"L{L}.plegate_codes"],
-                      b[f"L{L}.plegate_rowscale"], ple_in_L, gate, b[f"L{L}.gelu_plegate"],
+                      b[f"L{L}.plegate_rowscale"], ple_buf, gate, b[f"L{L}.gelu_plegate"],
                       self._uniform(parP)], (self.cfg["ple_d"], 1, 1))
         # 77: PLE proj + residual*layer_scalar + next-layer norm -> hidden, y2_next
         pp77 = self._tmp((H + 1) * 4, src=False)
@@ -291,6 +311,32 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                       b[f"L{L}.pleproj_rowscale"], pp77, hidden, b[f"L{L}.pleproj_w12s"],
                       y2n, sum2n, par77], (96, 1, 1))
         return hidden
+
+    # ---- stage 4: full forward ----
+    def forward(self, token_id: int, pos: int, hidden=None):
+        H, nL, d, vocab = self.cfg["H"], self.cfg["nL"], self.cfg["ple_d"], self.cfg["vocab"]
+        if not hasattr(self, "kc"):
+            self.setup_caches()
+        hidden = hidden if hidden is not None else self._tmp(H * 4)
+        self.embed(token_id, out=hidden)
+        ple = self.ple_input(token_id, hidden)
+        for L in range(nL):
+            self.layer(L, pos, hidden, ple, L * d)
+        # final norm (kernel 69, srq passthrough inScale=0) -> normed
+        normed = self._tmp(H * 4); sa = self._tmp(4)
+        self.dispatch("finalnorm", _kernel("69_sg_sum"),
+                      [hidden, self._bufs["final_norm"], normed, sa,
+                       self._uniform(np.array([1, 0, 0, 0], np.uint32))], (1, 1, 1))
+        # logits (kernel 33), lm_head act scales are 0 -> weight-only
+        logits = self._tmp(vocab * 4)
+        self.dispatch("logits", _kernel("33_srq"),
+                      [normed, self._bufs["lmhead_blk"], self._bufs["lmhead_scale"], logits,
+                       self._uniform(np.array([0, 0, 0, 0], np.float32))], (vocab // 128, 1, 1))
+        return logits
+
+    def logits_np(self, token_id, pos, hidden=None):
+        lg = self.forward(token_id, pos, hidden)
+        return self.read(lg, self.cfg["vocab"] * 4).view(np.float32)
 
 
 if __name__ == "__main__":
@@ -320,8 +366,17 @@ if __name__ == "__main__":
     enc = r.device.create_command_encoder()
     enc.copy_buffer_to_buffer(pb, 0, ple_slice, 0, d * 4)   # layer 0's 256-slice
     r.queue.submit([enc.finish()])
-    r.layer(0, 0, hidden, ple_slice, kc, vc)
+    r.setup_caches()
+    r.layer(0, 0, hidden, pb, 0)
     gh = r.read(hidden, H * 4).view(np.float32)
     rh = ref.layer(e.copy(), 0, 0, ref.ple_input(tid, e)[0])
-    print(f"layer0[{tid}]: gpu[:4]={gh[:4].round(4)} ref[:4]={rh[:4].round(4)} "
-          f"maxAbsDiff={np.abs(gh - rh).max():.3e} maxRel={np.abs(gh-rh).max()/ (np.abs(rh).max()+1e-9):.2e}")
+    print(f"layer0[{tid}]: maxAbsDiff={np.abs(gh - rh).max():.3e}")
+
+    # stage 4: full forward, first-token argmax vs reference
+    import time
+    t0 = time.time()
+    glog = r.logits_np(tid, 0)
+    rlog = ref.forward(tid, 0)
+    ga, ra = int(np.argmax(glog)), int(np.argmax(rlog))
+    print(f"forward[{tid}] ({time.time()-t0:.1f}s): gpu argmax={ga} ref argmax={ra} "
+          f"{'MATCH' if ga == ra else 'MISMATCH'} | logits maxAbsDiff={np.abs(glog-rlog).max():.3e}")

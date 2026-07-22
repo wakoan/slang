@@ -169,13 +169,16 @@ class ReferenceSRQ:
         o = self._qlin(attn, L, "self_attn.o_proj")[0]
         x = res + rms_norm(o, self._bf16(p + "post_attention_layernorm.weight"))
 
-        # MLP (sandwich norm)
+        # MLP (sandwich norm). gate/up/down activations are f16 in the kernels
+        # (kernel 73 emits y2 = f16(srq(f16(pre_ffn_norm), gate_in)); 74/75 read
+        # vec4<f16>), so the oracle must round through f16 too.
         res = x
         h = rms_norm(x, self._bf16(p + "pre_feedforward_layernorm.weight"))
-        gate, glin = self._qlin(h, L, "mlp.gate_proj")
-        up = self._qlin(h, L, "mlp.up_proj")[0]
-        geglu = gelu_tanh(gate) * up
-        geglu = srq(geglu, self.c.linear(L, "mlp.down_proj")["in_scale"])
+        y2 = srq(h.astype(np.float16).astype(np.float32),
+                 self.c.linear(L, "mlp.gate_proj")["in_scale"]).astype(np.float16).astype(np.float32)
+        gate = self._qlin(y2, L, "mlp.gate_proj")[0]
+        up = self._qlin(y2, L, "mlp.up_proj")[0]
+        geglu = srq(gelu_tanh(gate) * up, self.c.linear(L, "mlp.down_proj")["in_scale"])
         down = self._qlin(geglu, L, "mlp.down_proj")[0]
         x = res + rms_norm(down, self._bf16(p + "post_feedforward_layernorm.weight"))
 

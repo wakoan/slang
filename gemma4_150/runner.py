@@ -169,13 +169,14 @@ class G4Runner:
         return b
 
     # ---- stage 1: embed gather (kernel 00) ----
-    def embed(self, token_id: int, out=None) -> object:
+    def embed(self, token_id: int, out=None, ids=None) -> object:
         H = self.cfg["H"]
         y = out if out is not None else self._scratch("hidden", H * 4)
+        idb = ids if ids is not None else self._ids_buf(token_id)   # resident: read a GPU token
         par = self._uni("embed_par", np.array([1, 0, 0, 0], np.uint32))
         self.dispatch("embed", _kernel("00_main"),
-                      [self._ids_buf(token_id), self._bufs["embed_q"],
-                       self._bufs["embed_scale"], y, par], (1, 1, 1), bgkey=("embed", id(y)))
+                      [idb, self._bufs["embed_q"], self._bufs["embed_scale"], y, par],
+                      (1, 1, 1), bgkey=("embed", id(y), id(idb)))
         return y
 
     # ---- stage 2: PLE input (kernel 68 proj + kernel 01 gather + combine) ----
@@ -196,18 +197,19 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   outp[base] = (c*rms*nw[tid] + ple[base])*RS2;
 }"""
 
-    def ple_input(self, token_id: int, embed_buf) -> object:
+    def ple_input(self, token_id: int, embed_buf, ids=None) -> object:
         H, nL, d = self.cfg["H"], self.cfg["nL"], self.cfg["ple_d"]
         ctx = self._scratch("ctx", nL * d * 4)
         ple = self._scratch("plegath", nL * d * 4)
+        idb = ids if ids is not None else self._ids_buf(token_id)
         par0 = self._uni("ple_par0", np.array([0, 0, 0, 0], np.float32))   # kernel 68 inScale/outScale
         seq1 = self._uni("ple_seq1", np.array([1, 0, 0, 0], np.uint32))    # kernel 01 seq=1
         self.dispatch("proj68", _kernel("68_reduce"),
                       [embed_buf, self._bufs["pl_model_proj"], ctx, par0], (nL * d // 8, 1, 1),
                       bgkey=("proj68", id(embed_buf)))
         self.dispatch("plegather", _kernel("01_main"),
-                      [self._ids_buf(token_id), self._bufs["ple_q"],
-                       self._bufs["ple_scale"], ple, seq1], (1, 1, 1), bgkey=("plegather",))
+                      [idb, self._bufs["ple_q"], self._bufs["ple_scale"], ple, seq1],
+                      (1, 1, 1), bgkey=("plegather", id(idb)))
         out = self._scratch("ple", nL * d * 4)
         code = self._COMBINE % (H ** -0.5)
         self.dispatch("combine", code, [ctx, ple, self._bufs["pl_proj_norm"], out], (nL, 1, 1),
@@ -368,15 +370,16 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         return hidden
 
     # ---- stage 4: full forward ----
-    def forward(self, token_id: int, pos: int, hidden=None, argmax=None):
+    def forward(self, token_id: int, pos: int, hidden=None, argmax=None,
+                ids_buf=None, gen_ids=None, step=0):
         H, nL, d, vocab = self.cfg["H"], self.cfg["nL"], self.cfg["ple_d"], self.cfg["vocab"]
         if not hasattr(self, "kc"):
             self.setup_caches()
         hidden = hidden if hidden is not None else self._scratch("hidden", H * 4)
         logits = self._scratch("logits", vocab * 4)
         self._enc = self.device.create_command_encoder()   # batch the whole forward into one submit
-        self.embed(token_id, out=hidden)
-        ple = self.ple_input(token_id, hidden)
+        self.embed(token_id, out=hidden, ids=ids_buf)
+        ple = self.ple_input(token_id, hidden, ids=ids_buf)
         for L in range(nL):
             self.layer(L, pos, hidden, ple, L * d)
         # final norm (kernel 69, srq passthrough inScale=0) -> normed
@@ -395,9 +398,43 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             cv, ci = self._scratch("cv", 256 * 4), self._scratch("ci", 256 * 4)
             self.dispatch("amax1", _kernel("34_main"), [logits, cv, ci], (256, 1, 1), bgkey=("amax1",))
             self.dispatch("amax2", _kernel("35_main"), [cv, ci, argmax], (1, 1, 1), bgkey=("amax2", id(argmax)))
+            if gen_ids is not None:      # resident: append the token to the output buffer on-GPU
+                self._enc.copy_buffer_to_buffer(argmax, 0, gen_ids, step * 4, 4)
         self.queue.submit([self._enc.finish()])
         self._enc = None
         return logits
+
+    def generate_resident(self, ids, n_new=40, eos=1, chunk=16):
+        """GPU-resident greedy decode: the argmax token feeds back into cur_tok on
+        the GPU, so no CPU sync per token — the GPU runs async while the CPU records
+        ahead. EOS is checked once per `chunk` tokens."""
+        import time
+        self.setup_caches()
+        hidden = self._scratch("hidden", self.cfg["H"] * 4)
+        cur = self._scratch("cur_tok", 4)             # the on-GPU current token (fed back)
+        gen = self._scratch("gen_ids", n_new * 4)
+        pos = 0
+        for t in ids[:-1]:                            # prefill (CPU-known tokens)
+            self.queue.write_buffer(cur, 0, np.array([t], np.uint32).tobytes())
+            self.forward(int(t), pos, hidden, ids_buf=cur); pos += 1
+        self.queue.write_buffer(cur, 0, np.array([ids[-1]], np.uint32).tobytes())
+        out = []
+        t0 = time.time()
+        step = 0
+        while step < n_new:
+            for _ in range(min(chunk, n_new - step)):
+                # cur holds the token; forward reads it, argmax writes the next into cur
+                self.forward(0, pos, hidden, argmax=cur, ids_buf=cur, gen_ids=gen, step=step)
+                pos += 1; step += 1
+            got = self.read(gen, step * 4).view(np.uint32)   # one sync per chunk
+            new = [int(x) for x in got[len(out):step]]
+            for tok in new:
+                if tok == eos:
+                    dt = time.time() - t0
+                    return out, len(out) / dt if dt else 0.0
+                out.append(tok)
+        dt = time.time() - t0
+        return out, len(out) / dt if dt else 0.0
 
     def logits_np(self, token_id, pos, hidden=None):
         lg = self.forward(token_id, pos, hidden)

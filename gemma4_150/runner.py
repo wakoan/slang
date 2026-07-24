@@ -217,29 +217,54 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         return out
 
     # ---- stage 3: one decoder layer ----
-    _VNORM = """
-const HD:u32=%du; const EPS:f32=1e-6;
-@group(0) @binding(0) var<storage, read> v: array<f32>;
-@group(0) @binding(1) var<storage, read_write> cache: array<f32>;
-@group(0) @binding(2) var<uniform> p: vec4<u32>;   // p.x = dstOffset
-var<workgroup> red: array<f32, HD>;
+    # Fused k/v cache write (replaces reference k71 + a separate v-norm): k gets
+    # weighted RMSNorm + split-half RoPE, v gets scale-free RMSNorm, both -> cache.
+    _KVNORM = """
+const HD:u32=%du; const HALF:u32=%du; const EPS:f32=1e-6;
+@group(0) @binding(0) var<storage, read> ink: array<f32>;
+@group(0) @binding(1) var<storage, read> inv: array<f32>;
+@group(0) @binding(2) var<storage, read> knorm: array<f32>;
+@group(0) @binding(3) var<storage, read> cosT: array<f32>;
+@group(0) @binding(4) var<storage, read> sinT: array<f32>;
+@group(0) @binding(5) var<storage, read_write> kcache: array<f32>;
+@group(0) @binding(6) var<storage, read_write> vcache: array<f32>;
+@group(0) @binding(7) var<uniform> p: vec4<u32>;   // p.x = dstOffset
+var<workgroup> rk: array<f32, HD>;
+var<workgroup> rv: array<f32, HD>;
 @compute @workgroup_size(HD,1,1)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
-  let tid = lid.x; let x = v[tid];
-  red[tid] = x*x; workgroupBarrier();
-  var s:u32 = HD/2u; loop { if(s==0u){break;} if(tid<s){red[tid]=red[tid]+red[tid+s];} s=s/2u; workgroupBarrier(); }
-  cache[p.x + tid] = x * inverseSqrt(red[0]/f32(HD)+EPS);
+  let tid = lid.x; let ko = ink[tid]; let vo = inv[tid];
+  rk[tid] = ko*ko; rv[tid] = vo*vo; workgroupBarrier();
+  var s:u32 = HD/2u; loop { if(s==0u){break;} if(tid<s){rk[tid]=rk[tid]+rk[tid+s]; rv[tid]=rv[tid]+rv[tid+s];} s=s/2u; workgroupBarrier(); }
+  let rmsk = inverseSqrt(rk[0]/f32(HD)+EPS);
+  let rmsv = inverseSqrt(rv[0]/f32(HD)+EPS);
+  vcache[p.x + tid] = vo * rmsv;
+  if (tid < HALF) {
+    let n0 = ink[tid]*rmsk*knorm[tid];
+    let n1 = ink[tid+HALF]*rmsk*knorm[tid+HALF];
+    let c = cosT[tid]; let sn = sinT[tid];
+    kcache[p.x + tid] = n0*c - n1*sn;
+    kcache[p.x + tid + HALF] = n1*c + n0*sn;
+  }
 }"""
 
-    def _rope(self, pos, theta, half, cutoff):
-        inv = 1.0 / theta ** (np.arange(half, dtype=np.float64) / half)
-        inv[cutoff:] = 0.0
-        ang = pos * inv
-        cb = self._scratch(f"rcos{half}", half * 4)
-        sb = self._scratch(f"rsin{half}", half * 4)
-        self.queue.write_buffer(cb, 0, np.cos(ang).astype(np.float32).tobytes())
-        self.queue.write_buffer(sb, 0, np.sin(ang).astype(np.float32).tobytes())
-        return cb, sb
+    def _write_step_uniforms(self, pos):
+        """Write the per-token dynamic uniforms ONCE per head-dim type (not per layer):
+        rope cos/sin, attention params (pos), and the k/v-cache dstOffset."""
+        nH, win = self.cfg["nH"], self.cfg["window"]
+        if not hasattr(self, "_rope_cfgs"):
+            self._rope_cfgs = {}
+            for s in self.man["layers"]:
+                self._rope_cfgs[s["head_dim"]] = (s["rope_theta"], s["rope_cutoff"], s["sliding"])
+        for hd, (theta, cutoff, sliding) in self._rope_cfgs.items():
+            half = hd // 2
+            inv = 1.0 / theta ** (np.arange(half, dtype=np.float64) / half)
+            inv[cutoff:] = 0.0
+            ang = pos * inv
+            self.queue.write_buffer(self._scratch(f"rcos{half}", half * 4), 0, np.cos(ang).astype(np.float32).tobytes())
+            self.queue.write_buffer(self._scratch(f"rsin{half}", half * 4), 0, np.sin(ang).astype(np.float32).tobytes())
+            self._uni(f"parA_{hd}", np.array([1, pos + 1, pos, nH, 1, win if sliding else 0, 0, 0], np.uint32))
+            self._uni(f"pkv_{hd}", np.array([pos * hd, 0, 0, 0], np.uint32))
 
     @lru_cache(maxsize=None)
     def _patch(self, code, **consts):
@@ -289,7 +314,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         half, cutoff, shared = hd // 2, s["rope_cutoff"], s["shared"]
         kc, vc = self.kc[s["kv_source"]], self.vc[s["kv_source"]]
         b = self._bufs
-        cb, sb = self._rope(pos, s["rope_theta"], half, cutoff)
+        cb, sb = self._scratch(f"rcos{half}", half * 4), self._scratch(f"rsin{half}", half * 4)  # written per-token
         hk = (L, id(hidden), id(ple_buf))    # bind-group cache suffix (hidden/ple vary by caller)
 
         outq, dummy = self._scratch("outq", qd * 4), self._scratch("dummy", hd * 4)
@@ -328,21 +353,17 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             self.dispatch(f"k70_{qd}_{hd}", k70,
                           [a, b[f"L{L}.q_bits"], b[f"L{L}.k_bits"], b[f"L{L}.v_bits"],
                            b[f"L{L}.qkv_scales"], suma, outq, outk, outv, par70], (total, 1, 1), bgkey=("k70",)+hk)
-            # 71: k norm+rope -> cache ; v norm -> cache (dstOffset is per-token dynamic)
-            k71 = self._patch(_kernel("71_main"), HEAD_DIM=hd, HALF_DIM=half)
-            self.dispatch(f"k71_{hd}", k71,
-                          [outk, b[f"L{L}.k_norm"], cb, sb, kc,
-                           self._uni(f"p71_{L}", np.array([1, 1, pos * hd, 0], np.uint32))], (1, 1, 1), bgkey=("k71",)+hk)
-            self.dispatch(f"vnorm_{hd}", self._VNORM % hd,
-                          [outv, vc, self._uni(f"pvn_{L}", np.array([pos * hd, 0, 0, 0], np.uint32))], (1, 1, 1), bgkey=("vn",)+hk)
+            # fused k-norm+rope + v-norm -> caches (one dispatch; dstOffset shared per type)
+            self.dispatch(f"kvnorm_{hd}", self._KVNORM % (hd, half),
+                          [outk, outv, b[f"L{L}.k_norm"], cb, sb, kc, vc,
+                           self._unis[f"pkv_{hd}"]], (1, 1, 1), bgkey=("kvn",)+hk)
         # attention (patch HEAD_DIM/HALF/OUT_Q); parA has pos -> dynamic
         att = self._patch(_kernel("101_srq"), HEAD_DIM=hd, HALF_DIM=half)
         att = att.replace("const OUT_Q: f32 = 0.014886821620166302;",
                           f"const OUT_Q: f32 = {sc['o_in']!r};")
-        window = self.cfg["window"] if s["sliding"] else 0
-        parA = self._uni(f"pA_{L}", np.array([1, pos + 1, pos, nH, 1, window, 0, 0], np.uint32))
         self.dispatch(f"att_{hd}_{sc['o_in']}", att,
-                      [outq, b[f"L{L}.q_norm"], cb, sb, kc, vc, partials, attn, parA], (nH, 32, 1), bgkey=("att",)+hk)
+                      [outq, b[f"L{L}.q_norm"], cb, sb, kc, vc, partials, attn, self._unis[f"parA_{hd}"]],
+                      (nH, 32, 1), bgkey=("att",)+hk)
         # 73: o-proj + post-attn norm-add + pre-ffn norm
         k73 = self._patch(_kernel("73_sg_sum"), IN_FEATURES=qd, WORDS_PER_ROW=qd // 8)
         par73 = self._uni_static(f"p73_{L}", np.array([sc["o_out"], sc["gate_in"], 0, 0], np.float32))
@@ -382,6 +403,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             self.setup_caches()
         hidden = hidden if hidden is not None else self._scratch("hidden", H * 4)
         logits = self._scratch("logits", vocab * 4)
+        self._write_step_uniforms(pos)                     # per-type rope/params, once per token
         self._enc = self.device.create_command_encoder()   # batch the whole forward into one submit
         self.embed(token_id, out=hidden, ids=ids_buf)
         ple = self.ple_input(token_id, hidden, ids=ids_buf)

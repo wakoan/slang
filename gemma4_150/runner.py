@@ -82,6 +82,32 @@ class G4Runner:
         return self.device.create_buffer_with_data(
             data=arr.tobytes(), usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
 
+    # --- persistent pools: buffers are stable objects so bind groups cache (resident path) ---
+    _pool: dict = None
+    _unis: dict = None
+    _bgcache: dict = None
+
+    def _scratch(self, name, nbytes):
+        if self._pool is None:
+            self._pool = {}
+        b = self._pool.get(name)
+        if b is None or b.size < nbytes:
+            b = self._tmp(max(nbytes, 4))
+            self._pool[name] = b
+        return b
+
+    def _uni(self, name, arr):
+        if self._unis is None:
+            self._unis = {}
+        data = np.ascontiguousarray(arr).tobytes()
+        b = self._unis.get(name)
+        if b is None or b.size < len(data):
+            b = self.device.create_buffer(size=max(len(data), 16),
+                                          usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+            self._unis[name] = b
+        self.queue.write_buffer(b, 0, data)
+        return b
+
     # ---- pipelines (templated: patch baked consts before compile) ----
     def _shader(self, code: str):
         try:
@@ -106,11 +132,17 @@ class G4Runner:
 
     _enc = None
 
-    def dispatch(self, key, code, buffers, grid):
+    def dispatch(self, key, code, buffers, grid, bgkey=None):
         pipe, layout = self._pipe(key, code)
-        bg = self.device.create_bind_group(layout=layout, entries=[
-            {"binding": i, "resource": {"buffer": b, "offset": 0, "size": b.size}}
-            for i, b in enumerate(buffers)])
+        if bgkey is not None and self._bgcache is None:
+            self._bgcache = {}
+        bg = self._bgcache.get(bgkey) if bgkey is not None else None
+        if bg is None:
+            bg = self.device.create_bind_group(layout=layout, entries=[
+                {"binding": i, "resource": {"buffer": b, "offset": 0, "size": b.size}}
+                for i, b in enumerate(buffers)])
+            if bgkey is not None:
+                self._bgcache[bgkey] = bg
         enc = self._enc or self.device.create_command_encoder()
         cp = enc.begin_compute_pass()
         cp.set_pipeline(pipe)
@@ -132,18 +164,18 @@ class G4Runner:
         return out
 
     def _ids_buf(self, token_id: int):
-        return self.device.create_buffer_with_data(
-            data=np.array([token_id], np.uint32).tobytes(),
-            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        b = self._scratch("ids", 4)
+        self.queue.write_buffer(b, 0, np.array([token_id], np.uint32).tobytes())
+        return b
 
     # ---- stage 1: embed gather (kernel 00) ----
     def embed(self, token_id: int, out=None) -> object:
         H = self.cfg["H"]
-        y = out if out is not None else self._tmp(H * 4)
-        par = self._uniform(np.array([1, 0, 0, 0], np.uint32))
+        y = out if out is not None else self._scratch("hidden", H * 4)
+        par = self._uni("embed_par", np.array([1, 0, 0, 0], np.uint32))
         self.dispatch("embed", _kernel("00_main"),
                       [self._ids_buf(token_id), self._bufs["embed_q"],
-                       self._bufs["embed_scale"], y, par], (1, 1, 1))
+                       self._bufs["embed_scale"], y, par], (1, 1, 1), bgkey=("embed", id(y)))
         return y
 
     # ---- stage 2: PLE input (kernel 68 proj + kernel 01 gather + combine) ----
@@ -166,18 +198,20 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 
     def ple_input(self, token_id: int, embed_buf) -> object:
         H, nL, d = self.cfg["H"], self.cfg["nL"], self.cfg["ple_d"]
-        ctx = self._tmp(nL * d * 4)
-        ple = self._tmp(nL * d * 4)
-        par0 = self._uniform(np.array([0, 0, 0, 0], np.float32))      # kernel 68: inScale/outScale
-        seq1 = self._uniform(np.array([1, 0, 0, 0], np.uint32))       # kernel 01: seq=1
+        ctx = self._scratch("ctx", nL * d * 4)
+        ple = self._scratch("plegath", nL * d * 4)
+        par0 = self._uni("ple_par0", np.array([0, 0, 0, 0], np.float32))   # kernel 68 inScale/outScale
+        seq1 = self._uni("ple_seq1", np.array([1, 0, 0, 0], np.uint32))    # kernel 01 seq=1
         self.dispatch("proj68", _kernel("68_reduce"),
-                      [embed_buf, self._bufs["pl_model_proj"], ctx, par0], (nL * d // 8, 1, 1))
+                      [embed_buf, self._bufs["pl_model_proj"], ctx, par0], (nL * d // 8, 1, 1),
+                      bgkey=("proj68", id(embed_buf)))
         self.dispatch("plegather", _kernel("01_main"),
                       [self._ids_buf(token_id), self._bufs["ple_q"],
-                       self._bufs["ple_scale"], ple, seq1], (1, 1, 1))
-        out = self._tmp(nL * d * 4)
+                       self._bufs["ple_scale"], ple, seq1], (1, 1, 1), bgkey=("plegather",))
+        out = self._scratch("ple", nL * d * 4)
         code = self._COMBINE % (H ** -0.5)
-        self.dispatch("combine", code, [ctx, ple, self._bufs["pl_proj_norm"], out], (nL, 1, 1))
+        self.dispatch("combine", code, [ctx, ple, self._bufs["pl_proj_norm"], out], (nL, 1, 1),
+                      bgkey=("combine",))
         return out
 
     # ---- stage 3: one decoder layer ----
@@ -199,12 +233,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         inv = 1.0 / theta ** (np.arange(half, dtype=np.float64) / half)
         inv[cutoff:] = 0.0
         ang = pos * inv
-        cb = self.device.create_buffer_with_data(
-            data=np.cos(ang).astype(np.float32).tobytes(),
-            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
-        sb = self.device.create_buffer_with_data(
-            data=np.sin(ang).astype(np.float32).tobytes(),
-            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        cb = self._scratch(f"rcos{half}", half * 4)
+        sb = self._scratch(f"rsin{half}", half * 4)
+        self.queue.write_buffer(cb, 0, np.cos(ang).astype(np.float32).tobytes())
+        self.queue.write_buffer(sb, 0, np.sin(ang).astype(np.float32).tobytes())
         return cb, sb
 
     @lru_cache(maxsize=None)
@@ -215,6 +247,14 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                           + ("u" if m.group(1) == "u32" else "") + ";", code)
         return code
 
+    def _uni_static(self, name, arr):
+        """Persistent uniform written once (scale params that don't change per token)."""
+        if self._unis is None:
+            self._unis = {}
+        if name not in self._unis:
+            return self._uni(name, arr)
+        return self._unis[name]
+
     def setup_caches(self, max_seq=2048):
         self.max_seq = max_seq
         self.kc, self.vc = {}, {}
@@ -223,6 +263,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                 hd = s["head_dim"]
                 self.kc[s["index"]] = self._tmp(max_seq * hd * 4, src=False)
                 self.vc[s["index"]] = self._tmp(max_seq * hd * 4, src=False)
+        # pre-size pooled scratch at maxima so bind groups never reallocate
+        H, d, nL, V = self.cfg["H"], self.cfg["ple_d"], self.cfg["nL"], self.cfg["vocab"]
+        for name, n in [("hidden", H * 4), ("a", H * 4), ("outq", 4096 * 4), ("attn", 4096 * 4),
+                        ("outk", 512 * 4), ("outv", 512 * 4), ("dummy", 512 * 4),
+                        ("y2", H * 4), ("y2n", H * 4), ("geglu", 12288 * 2), ("gate", d * 4),
+                        ("ctx", nL * d * 4), ("plegath", nL * d * 4), ("ple", nL * d * 4),
+                        ("normed", H * 4), ("logits", V * 4), ("cv", 256 * 4), ("ci", 256 * 4),
+                        ("suma", 4), ("sum2", 4), ("sum2n", 4), ("sa", 4), ("ids", 4)]:
+            self._scratch(name, n)
+        # atomic scratch: WebGPU zero-inits + the kernels self-reset the ticket, so zero once
+        for name, n in [("pp73", (H + 1) * 4), ("pp75", (H + 1) * 4), ("pp77", (H + 1) * 4),
+                        ("partials256", (8 * 32 * 258 + 8) * 4), ("partials512", (8 * 32 * 514 + 8) * 4)]:
+            bz = self._scratch(name, n)
+            self.queue.write_buffer(bz, 0, np.zeros(n // 4, np.uint32).tobytes())
 
     def layer(self, L, pos, hidden, ple_buf, ple_off):
         """Run decoder layer L in place on `hidden` (f32 [H])."""
@@ -234,88 +288,83 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         kc, vc = self.kc[s["kv_source"]], self.vc[s["kv_source"]]
         b = self._bufs
         cb, sb = self._rope(pos, s["rope_theta"], half, cutoff)
+        hk = (L, id(hidden), id(ple_buf))    # bind-group cache suffix (hidden/ple vary by caller)
 
-        # 69: input norm + srq -> a[H], sum_a
-        a = self._tmp(H * 4); suma = self._tmp(4)
+        a, suma = self._scratch("a", H * 4), self._scratch("suma", 4)
+        outq, dummy = self._scratch("outq", qd * 4), self._scratch("dummy", hd * 4)
+        outk, outv = self._scratch("outk", hd * 4), self._scratch("outv", hd * 4)
+        attn = self._scratch("attn", qd * 4)
+        y2, sum2 = self._scratch("y2", H * 4), self._scratch("sum2", 4)
+        geglu, gate = self._scratch("geglu", inter * 2), self._scratch("gate", self.cfg["ple_d"] * 4)
+        y2n, sum2n = self._scratch("y2n", H * 4), self._scratch("sum2n", 4)
+        pp73, pp75, pp77 = self._scratch("pp73", (H + 1) * 4), self._scratch("pp75", (H + 1) * 4), self._scratch("pp77", (H + 1) * 4)
+        # sliding (hd=256) and full (hd=512) attention put their self-reset counter at
+        # different offsets; a full layer's value writes would clobber a sliding counter,
+        # so keep separate partials buffers per head-dim.
+        partials = self._scratch(f"partials{hd}", (8 * 32 * (hd + 2) + 8) * 4)
+
+        # 69: input norm + srq -> a[H], sum_a  (static param: inScale)
         self.dispatch("k69", _kernel("69_sg_sum"),
                       [hidden, b[f"L{L}.in_norm"], a, suma,
-                       self._uniform(np.array([1, 0, np.float32(sc["qkv_in"]).view(np.uint32), 0], np.uint32))],
-                      (1, 1, 1))
-        # 70: qkv  (shared layers: q-only — bind q_bits x3, dispatch only the Q workgroups)
-        # KV head_dim == q head_dim (256 sliding / 512 full), so patch KV_OUT/KV_WGS too.
-        outq = self._tmp(qd * 4)
-        dummy = self._tmp(hd * 4)
-        total = qd // 2 + hd     # Q_WGS + 2*KV_WGS = qd/2 + 2*(hd/2)
+                       self._uni_static(f"p69_{L}", np.array([1, 0, np.float32(sc["qkv_in"]).view(np.uint32), 0], np.uint32))],
+                      (1, 1, 1), bgkey=("k69",)+hk)
+        # 70: qkv (shared: q-only). KV head_dim == q head_dim -> patch KV_OUT/KV_WGS too.
+        total = qd // 2 + hd
         k70 = self._patch(_kernel("70_srq"), Q_OUT=qd, Q_WGS=qd // 2, KV_OUT=hd,
                           KV_WGS=hd // 2, TOTAL_WGS=total, GRID_X=total)
-        par70 = self._uniform(np.array([sc["q_out"], sc.get("k_out", 0), sc.get("v_out", 0), 0], np.float32))
+        par70 = self._uni_static(f"p70_{L}", np.array([sc["q_out"], sc.get("k_out", 0), sc.get("v_out", 0), 0], np.float32))
         if shared:
             self.dispatch(f"k70_{qd}_{hd}", k70,
                           [a, b[f"L{L}.q_bits"], b[f"L{L}.q_bits"], b[f"L{L}.q_bits"],
-                           b[f"L{L}.q_scale"], suma, outq, dummy, dummy, par70], (qd // 2, 1, 1))
+                           b[f"L{L}.q_scale"], suma, outq, dummy, dummy, par70], (qd // 2, 1, 1), bgkey=("k70",)+hk)
         else:
-            outk, outv = self._tmp(hd * 4), self._tmp(hd * 4)
             self.dispatch(f"k70_{qd}_{hd}", k70,
                           [a, b[f"L{L}.q_bits"], b[f"L{L}.k_bits"], b[f"L{L}.v_bits"],
-                           b[f"L{L}.qkv_scales"], suma, outq, outk, outv, par70], (total, 1, 1))
-            # 71: k norm+rope -> cache ; v norm -> cache (only the KV-owning layers)
+                           b[f"L{L}.qkv_scales"], suma, outq, outk, outv, par70], (total, 1, 1), bgkey=("k70",)+hk)
+            # 71: k norm+rope -> cache ; v norm -> cache (dstOffset is per-token dynamic)
             k71 = self._patch(_kernel("71_main"), HEAD_DIM=hd, HALF_DIM=half)
             self.dispatch(f"k71_{hd}", k71,
                           [outk, b[f"L{L}.k_norm"], cb, sb, kc,
-                           self._uniform(np.array([1, 1, pos * hd, 0], np.uint32))], (1, 1, 1))
+                           self._uni(f"p71_{L}", np.array([1, 1, pos * hd, 0], np.uint32))], (1, 1, 1), bgkey=("k71",)+hk)
             self.dispatch(f"vnorm_{hd}", self._VNORM % hd,
-                          [outv, vc, self._uniform(np.array([pos * hd, 0, 0, 0], np.uint32))], (1, 1, 1))
-        # attention (patch HEAD_DIM/HALF/OUT_Q from 101 template)
+                          [outv, vc, self._uni(f"pvn_{L}", np.array([pos * hd, 0, 0, 0], np.uint32))], (1, 1, 1), bgkey=("vn",)+hk)
+        # attention (patch HEAD_DIM/HALF/OUT_Q); parA has pos -> dynamic
         att = self._patch(_kernel("101_srq"), HEAD_DIM=hd, HALF_DIM=half)
         att = att.replace("const OUT_Q: f32 = 0.014886821620166302;",
                           f"const OUT_Q: f32 = {sc['o_in']!r};")
-        partials = self._tmp((8 * 32 * (hd + 2) + 8) * 4, src=False)
-        self.queue.write_buffer(partials, 0, np.zeros(8 * 32 * (hd + 2) + 8, np.uint32).tobytes())
-        attn = self._tmp(qd * 4)
         window = self.cfg["window"] if s["sliding"] else 0
-        parA = self._uniform(np.array([1, pos + 1, pos, nH, 1, window, 0, 0], np.uint32))
+        parA = self._uni(f"pA_{L}", np.array([1, pos + 1, pos, nH, 1, window, 0, 0], np.uint32))
         self.dispatch(f"att_{hd}_{sc['o_in']}", att,
-                      [outq, b[f"L{L}.q_norm"], cb, sb, kc, vc, partials, attn, parA], (nH, 32, 1))
-        # 73: o-proj + post-attn norm-add + pre-ffn norm  (updates hidden, emits y2 f16 + sum2)
+                      [outq, b[f"L{L}.q_norm"], cb, sb, kc, vc, partials, attn, parA], (nH, 32, 1), bgkey=("att",)+hk)
+        # 73: o-proj + post-attn norm-add + pre-ffn norm
         k73 = self._patch(_kernel("73_sg_sum"), IN_FEATURES=qd, WORDS_PER_ROW=qd // 8)
-        pp73 = self._tmp((H + 1) * 4, src=False)
-        self.queue.write_buffer(pp73, 0, np.zeros(H + 1, np.uint32).tobytes())
-        y2, sum2 = self._tmp(H * 2), self._tmp(4)
-        par73 = self._uniform(np.array([sc["o_out"], sc["gate_in"], 0, 0], np.float32))
+        par73 = self._uni_static(f"p73_{L}", np.array([sc["o_out"], sc["gate_in"], 0, 0], np.float32))
         self.dispatch(f"k73_{qd}", k73, [attn, b[f"L{L}.o_bits"], b[f"L{L}.o_scale"], pp73,
-                      hidden, b[f"L{L}.o_w12"], y2, sum2, par73], (192, 1, 1))
-        # 74/95: gate/up geglu -> down input (f16). 4-bit MLP (inter 6144, L0-14) uses
-        # kernel 74; 2-bit double-wide MLP (inter 12288, L15-34) uses kernel 95.
+                      hidden, b[f"L{L}.o_w12"], y2, sum2, par73], (192, 1, 1), bgkey=("k73",)+hk)
+        # 74/95: gate/up geglu (4-bit kernel 74 / 2-bit double-wide kernel 95)
         gu_kern, gu_grid = ("74_sg_sum", 768) if inter == 6144 else ("95_sg_sum", 3072)
-        geglu = self._tmp(inter * 2)
-        par74 = self._uniform(np.array([sc["gate_out"], sc["up_out"], sc["down_in"], 0], np.float32))
+        par74 = self._uni_static(f"p74_{L}", np.array([sc["gate_out"], sc["up_out"], sc["down_in"], 0], np.float32))
         self.dispatch(f"gu_{inter}", _kernel(gu_kern), [y2, b[f"L{L}.gate_bits"], b[f"L{L}.gate_scale"],
                       b[f"L{L}.up_bits"], b[f"L{L}.up_scale"], sum2, geglu, b[f"L{L}.gelu_gate"], par74],
-                      (gu_grid, 1, 1))
-        # 75/96: down + post-ffn norm-add (updates hidden). 4-bit -> 75, 2-bit -> 96.
+                      (gu_grid, 1, 1), bgkey=("gu",)+hk)
+        # 75/96: down + post-ffn norm-add (4-bit -> 75, 2-bit -> 96)
         down_kern = "75_srq" if inter == 6144 else "96_srq"
-        pp75 = self._tmp((H + 1) * 4, src=False)
-        self.queue.write_buffer(pp75, 0, np.zeros(H + 1, np.uint32).tobytes())
-        par75 = self._uniform(np.array([sc["down_in"], sc["down_out"], 0, 0], np.float32))
+        par75 = self._uni_static(f"p75_{L}", np.array([sc["down_in"], sc["down_out"], 0, 0], np.float32))
         self.dispatch(f"down_{inter}", _kernel(down_kern), [geglu, b[f"L{L}.down_bits"], pp75,
-                      b[f"L{L}.down_scale"], hidden, b[f"L{L}.down_nw"], par75], (H // 4, 1, 1))
-        # 76: PLE input gate  (reads its 256-slice at ple_off in the shared ple buffer)
-        gate = self._tmp(self.cfg["ple_d"] * 4)
+                      b[f"L{L}.down_scale"], hidden, b[f"L{L}.down_nw"], par75], (H // 4, 1, 1), bgkey=("down",)+hk)
+        # 76: PLE input gate (reads its 256-slice at ple_off; static param)
         parP = np.zeros(4, np.uint32)
         parP[:2] = np.array([sc["plegate_in"], sc["plegate_out"]], np.float32).view(np.uint32)
         parP[2] = ple_off
         self.dispatch("k76", _kernel("76_reduce"), [hidden, b[f"L{L}.plegate_codes"],
                       b[f"L{L}.plegate_rowscale"], ple_buf, gate, b[f"L{L}.gelu_plegate"],
-                      self._uniform(parP)], (self.cfg["ple_d"], 1, 1))
-        # 77: PLE proj + residual*layer_scalar + next-layer norm -> hidden, y2_next
-        pp77 = self._tmp((H + 1) * 4, src=False)
-        self.queue.write_buffer(pp77, 0, np.zeros(H + 1, np.uint32).tobytes())
-        y2n, sum2n = self._tmp(H * 4), self._tmp(4)
+                      self._uni_static(f"p76_{L}", parP)], (self.cfg["ple_d"], 1, 1), bgkey=("k76",)+hk)
+        # 77: PLE proj + residual*layer_scalar + next-layer norm
         nxt_in = self.man["layers"][L + 1]["scales"]["qkv_in"] if L + 1 < self.cfg["nL"] else 0.0
-        par77 = self._uniform(np.array([nxt_in, sc["pleproj_in"], sc["pleproj_out"], 0], np.float32))
+        par77 = self._uni_static(f"p77_{L}", np.array([nxt_in, sc["pleproj_in"], sc["pleproj_out"], 0], np.float32))
         self.dispatch("k77", _kernel("77_sg_sum"), [gate, b[f"L{L}.pleproj_codes"],
                       b[f"L{L}.pleproj_rowscale"], pp77, hidden, b[f"L{L}.pleproj_w12s"],
-                      y2n, sum2n, par77], (96, 1, 1))
+                      y2n, sum2n, par77], (96, 1, 1), bgkey=("k77",)+hk)
         return hidden
 
     # ---- stage 4: full forward ----
@@ -323,27 +372,29 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         H, nL, d, vocab = self.cfg["H"], self.cfg["nL"], self.cfg["ple_d"], self.cfg["vocab"]
         if not hasattr(self, "kc"):
             self.setup_caches()
-        hidden = hidden if hidden is not None else self._tmp(H * 4)
-        logits = self._tmp(vocab * 4)
+        hidden = hidden if hidden is not None else self._scratch("hidden", H * 4)
+        logits = self._scratch("logits", vocab * 4)
         self._enc = self.device.create_command_encoder()   # batch the whole forward into one submit
         self.embed(token_id, out=hidden)
         ple = self.ple_input(token_id, hidden)
         for L in range(nL):
             self.layer(L, pos, hidden, ple, L * d)
         # final norm (kernel 69, srq passthrough inScale=0) -> normed
-        normed = self._tmp(H * 4); sa = self._tmp(4)
+        normed, sa = self._scratch("normed", H * 4), self._scratch("sa", 4)
         self.dispatch("finalnorm", _kernel("69_sg_sum"),
                       [hidden, self._bufs["final_norm"], normed, sa,
-                       self._uniform(np.array([1, 0, 0, 0], np.uint32))], (1, 1, 1))
+                       self._uni_static("pfn", np.array([1, 0, 0, 0], np.uint32))], (1, 1, 1),
+                      bgkey=("finalnorm", id(hidden)))
         # logits (kernel 33), lm_head act scales are 0 -> weight-only
         self.dispatch("logits", _kernel("33_srq"),
                       [normed, self._bufs["lmhead_blk"], self._bufs["lmhead_scale"], logits,
-                       self._uniform(np.array([0, 0, 0, 0], np.float32))], (vocab // 128, 1, 1))
+                       self._uni_static("plog", np.array([0, 0, 0, 0], np.float32))], (vocab // 128, 1, 1),
+                      bgkey=("logits",))
         if argmax:
             # GPU argmax (softcap is monotonic -> skipped): 34 -> 256 candidates -> 35 -> token
-            cv, ci = self._tmp(256 * 4), self._tmp(256 * 4)
-            self.dispatch("amax1", _kernel("34_main"), [logits, cv, ci], (256, 1, 1))
-            self.dispatch("amax2", _kernel("35_main"), [cv, ci, argmax], (1, 1, 1))
+            cv, ci = self._scratch("cv", 256 * 4), self._scratch("ci", 256 * 4)
+            self.dispatch("amax1", _kernel("34_main"), [logits, cv, ci], (256, 1, 1), bgkey=("amax1",))
+            self.dispatch("amax2", _kernel("35_main"), [cv, ci, argmax], (1, 1, 1), bgkey=("amax2", id(argmax)))
         self.queue.submit([self._enc.finish()])
         self._enc = None
         return logits
@@ -356,7 +407,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         """Greedy decode. Returns (new_ids, decode_tok_per_s)."""
         import time
         self.setup_caches()
-        hidden = self._tmp(self.cfg["H"] * 4)
+        hidden = self._scratch("hidden", self.cfg["H"] * 4)
         pos = 0
         for t in ids[:-1]:                       # prefill all but last
             self.forward(t, pos, hidden); pos += 1

@@ -292,7 +292,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         cb, sb = self._rope(pos, s["rope_theta"], half, cutoff)
         hk = (L, id(hidden), id(ple_buf))    # bind-group cache suffix (hidden/ple vary by caller)
 
-        a, suma = self._scratch("a", H * 4), self._scratch("suma", 4)
         outq, dummy = self._scratch("outq", qd * 4), self._scratch("dummy", hd * 4)
         outk, outv = self._scratch("outk", hd * 4), self._scratch("outv", hd * 4)
         attn = self._scratch("attn", qd * 4)
@@ -305,11 +304,17 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         # so keep separate partials buffers per head-dim.
         partials = self._scratch(f"partials{hd}", (8 * 32 * (hd + 2) + 8) * 4)
 
-        # 69: input norm + srq -> a[H], sum_a  (static param: inScale)
-        self.dispatch("k69", _kernel("69_sg_sum"),
-                      [hidden, b[f"L{L}.in_norm"], a, suma,
-                       self._uni_static(f"p69_{L}", np.array([1, 0, np.float32(sc["qkv_in"]).view(np.uint32), 0], np.uint32))],
-                      (1, 1, 1), bgkey=("k69",)+hk)
+        # 69: input norm + srq -> a[H], sum_a. Only layer 0 needs it; layers 1+ reuse the
+        # PREVIOUS layer's k77 outputs (y2n/sum2n), which already = srq(this-layer input
+        # norm(x), this-layer qkv_in) + its sum — the reference's cross-layer fusion.
+        if L == 0:
+            a, suma = self._scratch("a", H * 4), self._scratch("suma", 4)
+            self.dispatch("k69", _kernel("69_sg_sum"),
+                          [hidden, b[f"L{L}.in_norm"], a, suma,
+                           self._uni_static(f"p69_{L}", np.array([1, 0, np.float32(sc["qkv_in"]).view(np.uint32), 0], np.uint32))],
+                          (1, 1, 1), bgkey=("k69",)+hk)
+        else:
+            a, suma = self._scratch("y2n", H * 4), self._scratch("sum2n", 4)
         # 70: qkv (shared: q-only). KV head_dim == q head_dim -> patch KV_OUT/KV_WGS too.
         total = qd // 2 + hd
         k70 = self._patch(_kernel("70_srq"), Q_OUT=qd, Q_WGS=qd // 2, KV_OUT=hd,

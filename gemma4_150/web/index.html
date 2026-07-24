@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Gemma 4 E2B — gemma4_150 (WebGPU)</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 20px; }
+  textarea { width: 100%; box-sizing: border-box; font: inherit; padding: 8px; }
+  button { font: inherit; padding: 6px 16px; margin-top: 8px; cursor: pointer; }
+  #out { white-space: pre-wrap; background: #f6f6f6; padding: 12px; border-radius: 6px; min-height: 60px; margin-top: 12px; }
+  #status { color: #666; font-size: 13px; margin-top: 8px; }
+  #tps { font-weight: 600; color: #0a7; }
+</style>
+</head>
+<body>
+<h1>Gemma 4 E2B QAT — gemma4_150 (reference SRQ kernels, WebGPU)</h1>
+<p id="status">loading…</p>
+<textarea id="prompt" rows="2">The capital of France is</textarea><br>
+<button id="run" disabled>Generate</button>
+<label style="margin-left:12px;font-size:13px">max tokens <input id="n" type="number" value="48" min="1" max="256" style="width:56px"></label>
+<div id="out"></div>
+<p><span id="tps"></span></p>
+<script type="module" src="/app.js"></script>
+</body>
+</html>

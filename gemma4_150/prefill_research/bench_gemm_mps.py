@@ -41,7 +41,7 @@ def main():
     print("loading model + compiling kernels…")
     g = G4()
     dev = g.dev
-    g._compile_one(open(os.path.join(HERE, "dq2_f16.metal")).read(), "dq2_f16", "dq2_f16")
+    g._compile_one(open(os.path.join(HERE, "dq_f16.metal")).read(), "dq_f16", "dq_f16")
 
     bits, scale = g.w[f"L{L}.gate_bits"], g.w[f"L{L}.gate_scale"]
     wf16 = dev.newBufferWithLength_options_(N_OUT * N_IN * 2, _SHARED)
@@ -50,7 +50,7 @@ def main():
 
     def dequant():
         b = Batch(g)
-        b.dg("dq2_f16", [(bits, 0), (scale, 0), (wf16, 0), (pdq, 0)], nwords // 256)
+        b.dg("dq_f16", [(bits, 0), (scale, 0), (wf16, 0), (pdq, 0)], nwords // 256)
         b.commit_wait()
 
     print("warming GPU clock…")

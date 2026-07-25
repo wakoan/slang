@@ -112,6 +112,7 @@ class G4:
             self.w[name] = self.dev.newBufferWithBytes_length_options_(mv[off:off + ln], ln, _SHARED)
 
         self.pool = {}; self.uni = {}; self.kc = {}; self.vc = {}
+        self._pf = None       # lazy batched-prefill engine (gemma4_150/prefill_gpu.py)
         self.mvcache = {}     # buffer-name -> writable memoryview (uniforms/cur/gen)
         self.chat_pos = 0; self.chat_carry = None
 
@@ -371,6 +372,18 @@ class G4:
         new position."""
         if not toks:
             return pos
+        # Batched prefill (layers-outer, MPS GEMMs) is ~5.6x faster once the
+        # prompt is long enough to amortize its fixed ~27ms of weight dequant.
+        # It is not numerically identical to the per-token path -- f16 GEMM
+        # replaces the exact int-dot -- so G4_BATCHED_PREFILL=0 opts out.
+        if len(toks) >= 16 and os.environ.get("G4_BATCHED_PREFILL", "1") != "0":
+            try:
+                from gemma4_150.prefill_gpu import PrefillGPU
+                if self._pf is None:
+                    self._pf = PrefillGPU(self)
+                return self._pf.prefill(toks, pos)
+            except Exception as e:
+                print(f"(batched prefill unavailable: {e}; using per-token)", file=sys.stderr)
         buf = self._buf_u32(list(toks))
         i = 0
         while i < len(toks):

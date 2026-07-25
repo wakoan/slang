@@ -43,6 +43,8 @@ def _mps_encode(b, mm, A, B, C):
 
 
 class PrefillGPU:
+    BUCKET = 64          # batch-size quantum; see prefill()
+
     def __init__(self, g: G4):
         self.g = g
         self.dev = g.dev
@@ -252,9 +254,17 @@ class PrefillGPU:
         if not toks:
             return startPos
         g, B = self.g, self._buf
-        S = len(toks)
+        n = len(toks)
+        # Round the batch up to a bucket. MPS builds a pipeline per unique
+        # (M,N,K,alpha), so a chat whose turns are 37, 52, 61 tokens long would
+        # pay that build on every turn; bucketing makes them share one. The
+        # padding repeats the last token, and its KV lands at positions
+        # >= startPos+n which no real query can attend to (attention is bounded
+        # by each query's own absolute position) and which the next prefill or
+        # decode step overwrites.
+        S = min(max(((n + self.BUCKET - 1) // self.BUCKET) * self.BUCKET, self.BUCKET), 2048)
         self._alloc_acts(S)
-        ids = g._buf_u32(list(toks))
+        ids = g._buf_u32(list(toks) + [toks[-1]] * (S - n))
         H, nL, d = g.H, g.nL, g.ple_d
         seq = self._u32(S, 0, 0, 0)
 
@@ -276,4 +286,4 @@ class PrefillGPU:
         for l in range(nL):
             self._layer(b, l, S, startPos)
         b.commit_wait()
-        return startPos + S
+        return startPos + n   # padding is scratch; only real tokens advance pos

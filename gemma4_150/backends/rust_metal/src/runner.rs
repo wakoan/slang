@@ -1,6 +1,6 @@
 // Full gemma4_150 decode runner in Rust + native Metal — a port of
 // swift-gemma4/Sources/g4/Runner.swift. Same manifest, same weights.bin, same
-// .metal kernels (compiled from swift-gemma4/kernels), same ring-buffered
+// .metal kernels (compiled from gemma4_150/kernels_msl), same ring-buffered
 // resident decode and multi-turn chat.
 use crate::metal::MetalRunner;
 use memmap2::Mmap;
@@ -111,9 +111,9 @@ impl G4 {
     }
 
     pub fn new() -> Result<Self, String> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().parent().unwrap().to_path_buf();
         let gdir = root.join("models/gemma-4-E2B-qat/g4_150");
-        let kdir = root.join("swift-gemma4/kernels");
+        let kdir = root.join("gemma4_150/kernels_msl");
         let man: Value = serde_json::from_slice(
             &std::fs::read(gdir.join("manifest.json")).map_err(|e| e.to_string())?,
         )

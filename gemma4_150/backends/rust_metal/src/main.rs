@@ -7,8 +7,9 @@ use tokenizers::Tokenizer;
 
 fn tok_path() -> String {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
+        .parent().unwrap()   // rust_metal -> backends
+        .parent().unwrap()   // backends -> gemma4_150
+        .parent().unwrap()   // gemma4_150 -> repo root
         .join("models/gemma-4-E2B-qat/tokenizer.json")
         .to_string_lossy()
         .into_owned()

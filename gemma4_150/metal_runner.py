@@ -1,6 +1,6 @@
 """Gemma 4 E2B QAT decode runner in pure Python via PyObjC — Metal directly,
 no wgpu. A port of swift-gemma4 / rust-gemma4: same manifest, same weights.bin,
-same .metal kernels (swift-gemma4/kernels), same ring-buffered resident decode
+same .metal kernels (gemma4_150/kernels_msl), same ring-buffered resident decode
 and multi-turn chat.
 
 Unlike gemma3/runner_metal.py (which uses the `metalgpu` package — 1-D dispatch
@@ -19,7 +19,7 @@ from tokenizers import Tokenizer
 RING = 32  # per-step uniform ring; must be >= max chunk
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GDIR = os.path.join(ROOT, "models/gemma-4-E2B-qat/g4_150")
-KDIR = os.path.join(ROOT, "swift-gemma4/kernels")
+KDIR = os.path.join(ROOT, "gemma4_150/kernels_msl")
 TOKJSON = os.path.join(ROOT, "models/gemma-4-E2B-qat/tokenizer.json")
 _SHARED = Metal.MTLResourceStorageModeShared
 

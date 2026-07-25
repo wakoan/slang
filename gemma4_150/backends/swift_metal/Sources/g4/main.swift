@@ -1,7 +1,7 @@
 import Foundation
 
 let repo = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-    .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
 
 // tokenize / detokenize via the repo venv python (tokenizers lib, -it chat format)
 func py(_ code: String, _ arg: String) -> String {

@@ -27,9 +27,9 @@ final class G4 {
 
     init() throws {
         repo = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         gdir = repo.appendingPathComponent("models/gemma-4-E2B-qat/g4_150")
-        kdir = repo.appendingPathComponent("swift-gemma4/kernels")
+        kdir = repo.appendingPathComponent("gemma4_150/kernels_msl")
         man = try JSONSerialization.jsonObject(with: Data(contentsOf: gdir.appendingPathComponent("manifest.json"))) as! [String: Any]
         cfg = man["config"] as! [String: Any]
         layers = man["layers"] as! [[String: Any]]

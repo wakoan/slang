@@ -43,7 +43,10 @@ def _mps_encode(b, mm, A, B, C):
 
 
 class PrefillGPU:
-    BUCKET = 64          # batch-size quantum; see prefill()
+    BUCKET = 16          # batch-size quantum; see prefill()
+    ATTN_REPEAT = 1      # >1 dispatches attention N times: a diagnostic knob for
+                         # measuring its true share by differencing (the profiler
+                         # overweights small dispatches; end-to-end diffs do not)
 
     def __init__(self, g: G4):
         self.g = g
@@ -51,6 +54,7 @@ class PrefillGPU:
         self._mm = {}          # (M,N,K,alpha) -> MPSMatrixMultiplication
         self._mat = {}         # (buffer id, rows, cols) -> MPSMatrix
         self._buf = {}
+        self._uni_cache = {}
         self._S = 0
         self._compile()
         self._alloc_weights()
@@ -130,20 +134,30 @@ class PrefillGPU:
              (nwords + 255) // 256)
 
     # ---- small uniform helpers --------------------------------------------
-    # Both return a ready-to-bind (buffer, offset) pair, since that is the only
+    # All return a ready-to-bind (buffer, offset) pair, since that is the only
     # way they are ever used.
-    def _u32(self, *v):
-        b = self.dev.newBufferWithBytes_length_options_(
-            struct.pack("<%dI" % len(v), *v), 4 * len(v), _SHARED)
+    def _uni(self, data):
+        """Memoize uniform buffers on their contents.
+
+        A prefill issues ~525 dispatches, and allocating a fresh Metal buffer for
+        each one's 16-byte uniform was pure CPU overhead — measurable, because it
+        is per-prefill work that does NOT shrink as the prompt grows. Almost all
+        of these repeat: most depend only on (layer, S), and the byte patterns
+        recur across layers and across calls. Keying on the bytes is safe because
+        a uniform buffer is never mutated after creation."""
+        b = self._uni_cache.get(data)
+        if b is None:
+            b = self.dev.newBufferWithBytes_length_options_(data, len(data), _SHARED)
+            self._uni_cache[data] = b
         return (b, 0)
+
+    def _u32(self, *v):
+        return self._uni(struct.pack("<%dI" % len(v), *v))
 
     def _mix(self, *v):
         """Pack a uniform of mixed float/int words (float(x) picks the f32 slot)."""
-        out = b""
-        for x in v:
-            out += struct.pack("<f", x) if isinstance(x, float) else struct.pack("<I", x)
-        b = self.dev.newBufferWithBytes_length_options_(out, len(out), _SHARED)
-        return (b, 0)
+        return self._uni(b"".join(
+            struct.pack("<f", x) if isinstance(x, float) else struct.pack("<I", x) for x in v))
 
     # ---- activation arena --------------------------------------------------
     def _alloc_acts(self, S):
@@ -200,9 +214,10 @@ class PrefillGPU:
 
         # ---- attention (causal, whole batch)
         win = g.window if li["sliding"] else 0
-        b.dg2d(f"attnp_{hd}_{l}", [(B["q"], 0), (lw("q_norm"), 0), (cb, 0), (sb, 0), (kc, 0),
-                                   (vc, 0), (B["attn"], 0),
-                                   (self._u32(startPos, nH, 1, win, S, 0, 0, 0))], nH, S)
+        for _ in range(self.ATTN_REPEAT):
+            b.dg2d(f"attnp_{hd}_{l}",
+                   [(B["q"], 0), (lw("q_norm"), 0), (cb, 0), (sb, 0), (kc, 0), (vc, 0),
+                    (B["attn"], 0), (self._u32(startPos, nH, 1, win, S, 0, 0, 0))], nH, S)
 
         # ---- o-proj + residual add-norm + pre-FFN norm
         b.dg("srqh_b", [(B["attn"], 0), (B["attnh"], 0), (self._mix(0.0, S * qd, 0, 0))],

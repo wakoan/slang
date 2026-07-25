@@ -47,6 +47,9 @@ class PrefillGPU:
     ATTN_REPEAT = 1      # >1 dispatches attention N times: a diagnostic knob for
                          # measuring its true share by differencing (the profiler
                          # overweights small dispatches; end-to-end diffs do not)
+    ATTN_GEMM = True     # False falls back to the fused attn_prefill kernel; see
+                         # _attn_gemm() for why the GEMM form exists
+    MAXSEQ = 2048
 
     def __init__(self, g: G4):
         self.g = g
@@ -79,6 +82,9 @@ class PrefillGPU:
                 g._variant(kf("kvnorm_b"), f"kvnormb_{hd}", [
                     ("HD=256u, HALF=128u", f"HD={hd}u, HALF={hd // 2}u"),
                     ("threadsPerThreadgroup = (HD)", f"threadsPerThreadgroup = ({hd})")])
+                g._variant(kf("qprep_b"), f"qprep_{hd}", [
+                    ("HEAD_DIM=512u, HALF_DIM=256u", f"HEAD_DIM={hd}u, HALF_DIM={hd // 2}u"),
+                    ("threadsPerThreadgroup = (512)", f"threadsPerThreadgroup = ({hd})")])
 
     def _new(self, n):
         return self.dev.newBufferWithLength_options_(max(n, 16), _SHARED)
@@ -106,16 +112,21 @@ class PrefillGPU:
             self._mat[key] = m
         return m
 
-    def _gemm(self, b, A, Wb, C, M, N, K, alpha=1.0):
-        """C[M,N] = alpha * A[M,K] @ W[N,K]^T, all f16."""
-        key = (M, N, K, alpha)
+    def _gemm(self, b, A, Wb, C, M, N, K, alpha=1.0, tr=True, acols=None, ccols=None):
+        """C[M,N] = alpha * A[M,K] @ (W[N,K]^T if tr else W[K,N]), all f16.
+
+        acols/ccols give A and C a row stride wider than the operation, which the
+        attention GEMMs need: the score matrix is padded to a 16-byte-aligned row
+        so MPS is happy, while the operation itself covers only the T real keys."""
+        key = (M, N, K, alpha, tr)
         mm = self._mm.get(key)
         if mm is None:
             mm = mps.MPSMatrixMultiplication.alloc()
             mm = mm.initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta_(
-                self.dev, False, True, M, N, K, alpha, 0.0)
+                self.dev, False, tr, M, N, K, alpha, 0.0)
             self._mm[key] = mm
-        _mps_encode(b, mm, self._matrix(A, M, K), self._matrix(Wb, N, K), self._matrix(C, M, N))
+        Bm = self._matrix(Wb, N, K) if tr else self._matrix(Wb, K, N)
+        _mps_encode(b, mm, self._matrix(A, M, acols or K), Bm, self._matrix(C, M, ccols or N))
 
     def _dq(self, b, bits, scale, scale_off, dst, n_in, n_out):
         """Dequantize [n_out][n_in] to f16, deriving the bit width from the packed
@@ -174,14 +185,65 @@ class PrefillGPU:
         f16 = [("ah", H), ("qraw", qd), ("kraw", hd), ("vraw", hd), ("attnh", qd),
                ("oraw", H), ("y2", H), ("graw", it), ("uraw", it), ("geglu", it),
                ("draw", H), ("ctxh", nL * d), ("hh", H), ("plin", d), ("gph", d),
-               ("ppraw", H)]
+               ("ppraw", H), ("qf16", qd), ("attnraw", qd)]
         for n, w in f32:
             B[n] = self._new(S * w * 4)
         for n, w in f16:
             B[n] = self._new(S * w * 2)
         for n in ("suma", "sum2"):
             B[n] = self._new(S * 4)
+        # GEMM-attention scratch. `scores` is the big one: S*nH rows of up to
+        # MAXSEQ keys (33 MB at S=1024). k/v are converted copies of the caches.
+        B["scores"] = self._new(S * g.nH * self.MAXSEQ * 2)
+        B["denom"] = self._new(S * g.nH * 4)
+        B["kf16"] = self._new(self.MAXSEQ * hd * 2)
+        B["vf16"] = self._new(self.MAXSEQ * hd * 2)
         self._S = S
+
+    # ---- attention as two GEMMs -------------------------------------------
+    def _attn_gemm(self, b, l, S, startPos):
+        """Attention for the whole prompt as QK^T -> softmax -> PV.
+
+        attn_prefill computes the same thing with a hand-rolled online softmax,
+        which never touches the matrix units: end-to-end differencing put it at
+        25.8% of prefill, the largest single item left. At prefill sizes both
+        products are ordinary GEMMs, and because kvHeads==1 neither needs
+        batching — q's [S][h][d] layout is already [S*h][d], and every row of it
+        multiplies the same K/V cache.
+
+        The cost is arithmetic the fused kernel skipped: a dense score matrix
+        computes the masked-out upper triangle (and, on sliding layers,
+        everything outside the window) and throws it away. That is a ~2x FLOP
+        overhead bought against a ~3x throughput gain."""
+        g, B = self.g, self._buf
+        li = g.layers[l]
+        nH, hd, qd = g.nH, li["head_dim"], li["q_dim"]
+        lw = lambda n: g.w[f"L{l}.{n}"]
+        src = li["kv_source"]
+        kc, vc = g.kc[src], g.vc[src]
+        cb, sb = g.pool[f"rcosT_{hd}"], g.pool[f"rsinT_{hd}"]
+        T = startPos + S
+        Tp = (T + 7) // 8 * 8      # 16-byte-aligned row stride for MPS
+        R, win = S * nH, (g.window if li["sliding"] else 0)
+
+        b.dg2d(f"qprep_{hd}", [(B["q"], 0), (lw("q_norm"), 0), (cb, 0), (sb, 0),
+                               (B["qf16"], 0), (self._u32(startPos, nH, 0, 0))], nH, S)
+        # The caches are f32; MPS wants f16. Converted per layer rather than once
+        # per distinct cache: kf16/vf16 are single scratch buffers, so a shared
+        # cache's copy would have been overwritten by the intervening layers, and
+        # the conversion is ~3 MB of traffic against the GEMM's hundreds.
+        for cache, dst in ((kc, "kf16"), (vc, "vf16")):
+            b.dg("srqh_b", [(cache, 0), (B[dst], 0), self._mix(0.0, T * hd, 0, 0)],
+                 (T * hd + 255) // 256)
+        for _ in range(self.ATTN_REPEAT):
+            self._gemm(b, B["qf16"], B["kf16"], B["scores"], R, T, hd, ccols=Tp)
+            b.dg("smax_b", [(B["scores"], 0), (B["denom"], 0),
+                            self._u32(startPos, nH, win, T, Tp, 0, 0, 0)], R)
+            self._gemm(b, B["scores"], B["vf16"], B["attnraw"], R, hd, T,
+                       tr=False, acols=Tp)
+        b.dg("attnout_b", [(B["attnraw"], 0), (B["denom"], 0), (B["attnh"], 0),
+                           self._mix(g.sc(l, "o_in"), R * hd, hd, 0)],
+             (R * hd + 255) // 256)
 
     # ---- one layer ---------------------------------------------------------
     def _layer(self, b, l, S, startPos):
@@ -213,15 +275,18 @@ class PrefillGPU:
                                    (self._mix(startPos, sco("k_out"), sco("v_out"), 0))], S)
 
         # ---- attention (causal, whole batch)
-        win = g.window if li["sliding"] else 0
-        for _ in range(self.ATTN_REPEAT):
-            b.dg2d(f"attnp_{hd}_{l}",
-                   [(B["q"], 0), (lw("q_norm"), 0), (cb, 0), (sb, 0), (kc, 0), (vc, 0),
-                    (B["attn"], 0), (self._u32(startPos, nH, 1, win, S, 0, 0, 0))], nH, S)
+        if self.ATTN_GEMM:
+            self._attn_gemm(b, l, S, startPos)          # writes B["attnh"] directly
+        else:
+            win = g.window if li["sliding"] else 0
+            for _ in range(self.ATTN_REPEAT):
+                b.dg2d(f"attnp_{hd}_{l}",
+                       [(B["q"], 0), (lw("q_norm"), 0), (cb, 0), (sb, 0), (kc, 0), (vc, 0),
+                        (B["attn"], 0), (self._u32(startPos, nH, 1, win, S, 0, 0, 0))], nH, S)
+            b.dg("srqh_b", [(B["attn"], 0), (B["attnh"], 0), (self._mix(0.0, S * qd, 0, 0))],
+                 (S * qd + 255) // 256)
 
         # ---- o-proj + residual add-norm + pre-FFN norm
-        b.dg("srqh_b", [(B["attn"], 0), (B["attnh"], 0), (self._mix(0.0, S * qd, 0, 0))],
-             (S * qd + 255) // 256)
         self._dq(b, lw("o_bits"), lw("o_scale"), 0, B["wo"], qd, H)
         self._gemm(b, B["attnh"], B["wo"], B["oraw"], S, H, qd)
         b.dg("rmsadd_b", [(B["oraw"], 0), (lw("o_w12"), 0), (B["hidden"], 0),

@@ -89,6 +89,46 @@ the runner restructure. Note MPS emits f16, so the exact int-dot arithmetic is
 replaced by f16 GEMM — check against the numpy oracle rather than expecting
 bit-identity with the decode path.
 
+## DELIVERED: 1208 tok/s, past LiteRT (2026-07-25)
+
+`gemma4_150/prefill_gpu.py`, used automatically for prompts ≥ 16 tokens. Measured
+at a matched 1024 tokens (`test_prefill_batched.py 1024`):
+
+| | prefill @ 1024 | vs LiteRT |
+|---|---:|---:|
+| per-token (the old path) | 158 tok/s | 0.14× |
+| batched, fused attention | 957 tok/s | 0.85× |
+| **batched, GEMM attention** | **1208 tok/s** | **1.07×** |
+
+The last step was the one the projection above got wrong. It budgeted 180 ms for
+attention; end-to-end differencing (dispatch attention 3× and subtract) measured
+**276 ms, 25.8% of prefill** — the largest remaining item, not a rounding error.
+
+**Attention is also a GEMM at prefill sizes**, and it needs no batching: kvHeads==1,
+so q's `[S][h][d]` layout is already `[S*h][d]` and every row multiplies the same
+K/V cache. `QK^T` and `PV` become two ordinary MPS GEMMs with a masked softmax
+between them (`qprep_b` / `smax_b` / `attnout_b`). That took attention 276 → ~76 ms
+and prefill 1043 → 850 ms.
+
+It buys a ~3× throughput gain with a ~2× FLOP overhead: the dense score matrix
+computes the masked-out upper triangle (and everything outside the sliding window)
+and throws it away. Banding the GEMMs by query block would recover most of that
+and is the obvious next lever.
+
+Two deferred normalisations keep the pass count down: `smax_b` writes unnormalised
+probabilities plus a per-row denominator, which `attnout_b` folds in alongside the
+SRQ it has to apply anyway.
+
+Accuracy (`test_attn_gemm.py 1024`, against the fused kernel, itself verified
+against decode's `attn_101`): layer-0 attention output **99.30% bit-identical**,
+0.65% differing by exactly one SRQ grid step, **0.02% by more** — i.e. f16 scores
+are not a problem; the disagreement sits at the quantization grid the o-projection
+imposes anyway. f32 scores were therefore not needed, which matters because they
+would have cost ~40 ms and given the LiteRT lead straight back.
+
+Long-prompt quality (the open question from the f16-dequant work) now checked: a
+1340-token prompt summarised correctly and fluently.
+
 ## RETRACTION: the earlier batching numbers were measurement artifacts
 
 An earlier revision of this file reported **2.49×** for `gateup_95_b` and **1.00×**

@@ -329,15 +329,20 @@ class G4:
                             (P["pp77"], 0), (P["hidden"], 0), (lw("pleproj_w12s"), 0), (P["y2n"], 0),
                             (P["sum2n"], 0), (U[f"p77_{l}"], 0)], 96)
 
-    def _forward(self, pos, step, argmax, gen, wait):
+    def _forward(self, pos, step, argmax, gen, wait, tok=None):
+        # `tok` = (buffer, byte offset) holding this step's token id; defaults to
+        # the GPU-written `cur`. Prefill passes the prompt buffer at pos*4 so the
+        # CPU never rewrites a buffer the GPU may still be reading (embed_00 and
+        # plegather_01 read ids[0] when seq=1, so an offset bind selects the token).
+        tb, to = tok if tok is not None else (self.pool["cur"], 0)
         slot = step % RING
         self._write_step(pos, slot)
         b = Batch(self)
         P = self.pool; U = self.uni; W = self.w
-        b.dg("embed_00", [(P["cur"], 0), (W["embed_q"], 0), (W["embed_scale"], 0), (P["hidden"], 0),
+        b.dg("embed_00", [(tb, to), (W["embed_q"], 0), (W["embed_scale"], 0), (P["hidden"], 0),
                           (U["ones1"], 0)], 1)
         b.dg("proj_68", [(P["hidden"], 0), (W["pl_model_proj"], 0), (P["ctx"], 0), (U["z4"], 0)], 1120)
-        b.dg("plegather_01", [(P["cur"], 0), (W["ple_q"], 0), (W["ple_scale"], 0), (P["plegath"], 0),
+        b.dg("plegather_01", [(tb, to), (W["ple_q"], 0), (W["ple_scale"], 0), (P["plegath"], 0),
                               (U["ones1"], 0)], 1)
         b.dg("combine", [(P["ctx"], 0), (P["plegath"], 0), (W["pl_proj_norm"], 0), (P["ple"], 0)], self.nL)
         for l in range(self.nL):
@@ -356,11 +361,31 @@ class G4:
             return None
         return b.commit()
 
+    # ---- pipelined prefill ----
+    def prefill(self, toks, pos, chunk=RING):
+        """Run `toks` through the model from `pos`, pipelined: commit a chunk of
+        forwards without waiting so CPU recording overlaps GPU execution (the
+        same trick that makes decode fast). Token ids come from a GPU buffer
+        bound per-step at an offset, so there is no CPU/GPU write race. Chunk is
+        capped at RING so no in-flight step's uniform slot is reused. Returns the
+        new position."""
+        if not toks:
+            return pos
+        buf = self._buf_u32(list(toks))
+        i = 0
+        while i < len(toks):
+            end = min(i + chunk, len(toks))
+            last = None
+            while i < end:
+                last = self._forward(pos, i % RING, False, False, False, tok=(buf, i * 4))
+                pos += 1; i += 1
+            if last is not None:
+                last.waitUntilCompleted()
+        return pos
+
     # ---- single-shot greedy generate ----
     def generate(self, ids, n_new, chunk=32):
-        pos = 0
-        for t in ids[:-1]:
-            self.set_cur(t); self._forward(pos, 0, False, False, True); pos += 1
+        pos = self.prefill(list(ids[:-1]), 0)
         self.set_cur(ids[-1])
         out = []; step = 0; cap = min(n_new, 240)
         t0 = time.time()
@@ -385,8 +410,7 @@ class G4:
 
     def chat_turn(self, frame, max_new, stop, on_chunk, chunk=32):
         pre = ([self.chat_carry] if self.chat_carry is not None else []) + list(frame)
-        for t in pre[:-1]:
-            self.set_cur(t); self._forward(self.chat_pos, 0, False, False, True); self.chat_pos += 1
+        self.chat_pos = self.prefill(pre[:-1], self.chat_pos)
         self.set_cur(pre[-1])
         prefill_end = self.chat_pos
         out = []; step = 0; stopped = False; cap = min(max_new, 240)

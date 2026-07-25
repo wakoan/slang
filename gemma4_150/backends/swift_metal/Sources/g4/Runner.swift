@@ -139,14 +139,14 @@ final class G4 {
         }
     }
 
-    func embed(_ b: MetalRunner.CommandBatch, _ ids: MTLBuffer, _ out: MTLBuffer) throws {
-        try b.dispatchGroups("embed_00", buffers: [(ids,0),(W("embed_q"),0),(W("embed_scale"),0),(out,0),(UU("emb",[1,0,0,0]),0)], groups: 1)
+    func embed(_ b: MetalRunner.CommandBatch, _ ids: MTLBuffer, _ idsOff: Int, _ out: MTLBuffer) throws {
+        try b.dispatchGroups("embed_00", buffers: [(ids,idsOff),(W("embed_q"),0),(W("embed_scale"),0),(out,0),(UU("emb",[1,0,0,0]),0)], groups: 1)
     }
-    func pleInput(_ b: MetalRunner.CommandBatch, _ ids: MTLBuffer, _ hidden: MTLBuffer) throws -> MTLBuffer {
+    func pleInput(_ b: MetalRunner.CommandBatch, _ ids: MTLBuffer, _ idsOff: Int, _ hidden: MTLBuffer) throws -> MTLBuffer {
         let nL = C("nL"), d = C("ple_d")
         let ctx = S("ctx", nL*d*4), ple = S("plegath", nL*d*4), out = S("ple", nL*d*4)
         try b.dispatchGroups("proj_68", buffers: [(hidden,0),(W("pl_model_proj"),0),(ctx,0),(UF("z4",[0,0,0,0]),0)], groups: 1120)
-        try b.dispatchGroups("plegather_01", buffers: [(ids,0),(W("ple_q"),0),(W("ple_scale"),0),(ple,0),(UU("seq1",[1,0,0,0]),0)], groups: 1)
+        try b.dispatchGroups("plegather_01", buffers: [(ids,idsOff),(W("ple_q"),0),(W("ple_scale"),0),(ple,0),(UU("seq1",[1,0,0,0]),0)], groups: 1)
         try b.dispatchGroups("combine", buffers: [(ctx,0),(ple,0),(W("pl_proj_norm"),0),(out,0)], groups: nL)
         return out
     }
@@ -210,13 +210,14 @@ final class G4 {
 
     @discardableResult
     func forward(_ tok: MTLBuffer, _ pos: Int, _ hidden: MTLBuffer, argmax: MTLBuffer?,
-                 gen: MTLBuffer? = nil, step: Int = 0, wait: Bool = true, prof: KernelProfiler? = nil) throws -> MTLCommandBuffer? {
+                 gen: MTLBuffer? = nil, step: Int = 0, wait: Bool = true, tokOff: Int = 0,
+                 prof: KernelProfiler? = nil) throws -> MTLCommandBuffer? {
         let H = C("H"), V = C("vocab")
         let slot = step % Self.RING
         writeStepUniforms(pos, slot)
         let b = try runner.batch(profiler: prof)
-        try embed(b, tok, hidden)
-        let ple = try pleInput(b, tok, hidden)
+        try embed(b, tok, tokOff, hidden)
+        let ple = try pleInput(b, tok, tokOff, hidden)
         for l in 0..<C("nL") { try layer(b, l, pos, slot, hidden, ple) }
         let normed = S("normed", H*4)
         try b.dispatchGroups("rmssrq_69", buffers: [(hidden,0),(W("final_norm"),0),(normed,0),(S("sa",4),0),(UU("fn",[1,0,0,0]),0)], groups: 1)
@@ -248,13 +249,33 @@ final class G4 {
 
     // ---- GPU-resident greedy decode: token feeds back via `cur` on-GPU; commit
     // without per-token sync (GPU runs async), read the gen buffer once per chunk. ----
+    /// Pipelined prefill: commit a chunk of forwards without waiting so CPU
+    /// recording overlaps GPU execution. Token ids live in a GPU buffer bound
+    /// per-step at an offset, so the CPU never rewrites a buffer the GPU may
+    /// still be reading. Chunk is capped at RING so no in-flight uniform slot
+    /// is reused. Returns the new position.
+    @discardableResult
+    func prefill(_ toks: [UInt32], _ startPos: Int, chunk: Int = RING) throws -> Int {
+        if toks.isEmpty { return startPos }
+        let hidden = S("hidden", C("H")*4)
+        let buf = try runner.makeBuffer(toks, label: "prompt")
+        var pos = startPos, i = 0
+        while i < toks.count {
+            let end = min(i + chunk, toks.count)
+            var last: MTLCommandBuffer?
+            while i < end {
+                last = try forward(buf, pos, hidden, argmax: nil, step: i % Self.RING,
+                                   wait: false, tokOff: i * 4)
+                pos += 1; i += 1
+            }
+            last?.waitUntilCompleted()
+        }
+        return pos
+    }
+
     func generate(_ ids: [UInt32], _ nNew: Int, eos: UInt32 = 1, chunk: Int = 32) throws -> ([UInt32], Double) {
         let hidden = S("hidden", C("H")*4), cur = S("cur", 4), gen = S("gen", 256*4)
-        var pos = 0
-        for t in ids.dropLast() {                       // prefill (synced; CPU-set tokens)
-            cur.contents().bindMemory(to: UInt32.self, capacity: 1)[0] = t
-            try forward(cur, pos, hidden, argmax: nil); pos += 1
-        }
+        var pos = try prefill(Array(ids.dropLast()), 0)
         cur.contents().bindMemory(to: UInt32.self, capacity: 1)[0] = ids.last!
         var out: [UInt32] = []
         let t0 = Date()
@@ -300,10 +321,7 @@ final class G4 {
 
         // prefill everything except the last framing token (which seeds decode)
         let pre = (chatCarry.map { [$0] } ?? []) + frame
-        for t in pre.dropLast() {
-            curP[0] = t
-            try forward(cur, chatPos, hidden, argmax: nil); chatPos += 1
-        }
+        chatPos = try prefill(Array(pre.dropLast()), chatPos)
         curP[0] = pre.last!
         let prefillEnd = chatPos            // slot where g_i lands = prefillEnd + i + 1
 

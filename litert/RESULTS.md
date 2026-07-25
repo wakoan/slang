@@ -32,13 +32,32 @@ At the matched 1024-token context, native Metal is **~1.3× faster on decode**
 (and Swift/Rust run a few tok/s above Python). At short chat context (~tens of
 tokens) native Metal reaches ~170.
 
+## Prefill
+
+| Prefill path | tok/s (256 / 1024) |
+|---|---|
+| Was: one **synchronous** forward per token | 122 / — |
+| **Now: pipelined** (chunked, no per-token sync) | **162 / 158** |
+| LiteRT GPU (**batched**) | 1132 |
+
+Pipelining prefill (commit a chunk of forwards without waiting, token ids read from
+a GPU buffer at an offset so the CPU never races the GPU) gives **~1.35×** and is
+bit-identical to the synchronous path. Shipped on all three native-Metal backends.
+
+**The remaining ~7× gap is true batching, not sync.** LiteRT processes S tokens per
+pass, so each weight row is read **once for S tokens** instead of re-reading
+~0.82 GB/token. Closing it needs batched (M=S) GEMM kernels: `embed_00`,
+`plegather_01`, `rmssrq_69` and `attn_101` already carry a seq/rows dimension, but
+every matmul the reference bundle captured (`qkv_70`, `oproj_73`, `gateup_74/95`,
+`down_75/96`, `proj_68`, `plegate_76`, `pleproj_77`, `logits_33`) is a single-row
+GEMV — the capture was decode-only. That is ~7 new kernels plus causal-mask
+orchestration: a separate project, and the regime where matrix units finally pay off
+(batch fills the N dimension a GEMV wastes).
+
 ## The honest caveats
 
-1. **Prefill: LiteRT wins decisively — 1132 tok/s vs this repo's one-token-per-pass.**
-   LiteRT does *batched* prefill (the regime where matmul batching / matrix units pay
-   off); these runners process the prompt one token per forward. This is the strongest
-   argument for the "batched prefill" roadmap item and the reason LiteRT reaches
-   first-token faster on long prompts.
+1. **Prefill: LiteRT still wins — 1132 vs 158 tok/s** (see above). Batched prefill
+   remains the open roadmap item; pipelining closed only the sync portion.
 2. **Different quantization.** LiteRT's `.litertlm` is 2.4 GB, instruction-tuned +
    multimodal; this repo runs the QAT `g4_150` (2.1 GB, text). Not an identical weight
    format, so decode-bandwidth is not perfectly matched.

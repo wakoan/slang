@@ -318,19 +318,28 @@ impl G4 {
     /// One decode/prefill step. Reads token from `cur`; on `argmax` writes the
     /// next token back into `cur` and (if `gen`) blits it to gen[step].
     fn forward(&self, pos: usize, step: usize, argmax: bool, gen: bool, wait: bool) -> Option<CommandBuffer> {
+        self.forward_tok(pos, step, argmax, gen, wait, None)
+    }
+
+    /// `tok` = (buffer, byte offset) holding this step's token id; None uses the
+    /// GPU-written `cur`. Prefill passes the prompt buffer at pos*4 so the CPU
+    /// never rewrites a buffer the GPU may still be reading.
+    fn forward_tok(&self, pos: usize, step: usize, argmax: bool, gen: bool, wait: bool,
+                   tok: Option<(&BufferRef, u64)>) -> Option<CommandBuffer> {
+        let (tb, to) = tok.unwrap_or((self.pb("cur"), 0));
         let slot = step % RING;
         self.write_step_uniforms(pos, slot);
         let mut b = self.r.batch();
 
         // embed
         b.dg("embed_00", &[
-            (self.pb("cur"), 0), (self.wb("embed_q"), 0), (self.wb("embed_scale"), 0),
+            (tb, to), (self.wb("embed_q"), 0), (self.wb("embed_scale"), 0),
             (self.pb("hidden"), 0), (self.ub("ones1"), 0)], 1);
         // PLE input (proj_68 + plegather_01 + combine)
         b.dg("proj_68", &[
             (self.pb("hidden"), 0), (self.wb("pl_model_proj"), 0), (self.pb("ctx"), 0), (self.ub("z4"), 0)], 1120);
         b.dg("plegather_01", &[
-            (self.pb("cur"), 0), (self.wb("ple_q"), 0), (self.wb("ple_scale"), 0),
+            (tb, to), (self.wb("ple_q"), 0), (self.wb("ple_scale"), 0),
             (self.pb("plegath"), 0), (self.ub("ones1"), 0)], 1);
         b.dg("combine", &[
             (self.pb("ctx"), 0), (self.pb("plegath"), 0), (self.wb("pl_proj_norm"), 0), (self.pb("ple"), 0)],
@@ -444,15 +453,34 @@ impl G4 {
             (self.ub(&format!("p77_{l}")), 0)], 96);
     }
 
+    /// Pipelined prefill: commit a chunk of forwards without waiting so CPU
+    /// recording overlaps GPU execution. Chunk is capped at RING so no in-flight
+    /// uniform slot is reused. Returns the new position.
+    pub fn prefill(&mut self, toks: &[u32], start_pos: usize) -> usize {
+        if toks.is_empty() {
+            return start_pos;
+        }
+        let buf = self.r.buffer_u32(toks);
+        let (mut pos, mut i) = (start_pos, 0usize);
+        while i < toks.len() {
+            let end = (i + RING).min(toks.len());
+            let mut last: Option<CommandBuffer> = None;
+            while i < end {
+                last = self.forward_tok(pos, i % RING, false, false, false, Some((&buf, (i * 4) as u64)));
+                pos += 1;
+                i += 1;
+            }
+            if let Some(cb) = last {
+                cb.wait_until_completed();
+            }
+        }
+        pos
+    }
+
     // ---- single-shot greedy generate (mirrors Swift generate) ----
     pub fn generate(&mut self, ids: &[u32], n_new: usize) -> (Vec<u32>, f64) {
         let chunk = 32usize;
-        let mut pos = 0usize;
-        for &t in &ids[..ids.len() - 1] {
-            self.set_cur(t);
-            self.forward(pos, 0, false, false, true);
-            pos += 1;
-        }
+        let mut pos = self.prefill(&ids[..ids.len() - 1], 0);
         self.set_cur(*ids.last().unwrap());
         let mut out = Vec::new();
         let t0 = Instant::now();
@@ -500,11 +528,7 @@ impl G4 {
             pre.push(c);
         }
         pre.extend_from_slice(frame);
-        for &t in &pre[..pre.len() - 1] {
-            self.set_cur(t);
-            self.forward(self.chat_pos, 0, false, false, true);
-            self.chat_pos += 1;
-        }
+        self.chat_pos = self.prefill(&pre[..pre.len() - 1], self.chat_pos);
         self.set_cur(*pre.last().unwrap());
         let prefill_end = self.chat_pos; // g_i lands at prefill_end + i + 1
 

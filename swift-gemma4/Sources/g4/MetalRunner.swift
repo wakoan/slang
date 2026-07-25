@@ -52,6 +52,23 @@ final class MetalRunner {
         )
     }
 
+    /// Compile a shape-variant: apply string replacements to the source, then
+    /// register the pipeline under `name` (the MSL function keeps its base name).
+    func compileVariant(file path: String, name: String, replace: [(String, String)]) throws {
+        if kernels[name] != nil { return }
+        var source = try String(contentsOfFile: path, encoding: .utf8)
+        for (a, b) in replace { source = source.replacingOccurrences(of: a, with: b) }
+        let base = URL(fileURLWithPath: path).deletingPathExtension().lastPathComponent
+        let library: MTLLibrary
+        do { library = try device.makeLibrary(source: source, options: nil) }
+        catch { throw RuntimeError("MSL variant compile failed for \(name): \(error)") }
+        guard let function = library.makeFunction(name: base) else {
+            throw RuntimeError("Function '\(base)' not found for variant \(name)")
+        }
+        kernels[name] = Kernel(pipeline: try device.makeComputePipelineState(function: function),
+                               threadsPerGroup: Self.parseThreadsPerGroup(source) ?? 64)
+    }
+
     private static func parseThreadsPerGroup(_ source: String) -> Int? {
         guard let range = source.range(of: "threadsPerThreadgroup = (") else { return nil }
         let rest = source[range.upperBound...].prefix(while: { $0.isNumber })
@@ -162,6 +179,17 @@ final class MetalRunner {
         func dispatchGroups(_ name: String, buffers: [(MTLBuffer, Int)], groups: Int,
                             label: String? = nil) throws {
             try encode(name, buffers: buffers, groups: groups, label: label)
+        }
+
+        /// 2-D threadgroup grid (e.g. attention: (heads, chunks)).
+        func dispatchGroups2D(_ name: String, buffers: [(MTLBuffer, Int)],
+                              width: Int, height: Int, label: String? = nil) throws {
+            guard let kernel = runner.kernels[name] else { throw RuntimeError("Kernel '\(name)' not compiled") }
+            let enc = try encoderFor(label: label ?? name)
+            enc.setComputePipelineState(kernel.pipeline)
+            for (i, (buf, offset)) in buffers.enumerated() { enc.setBuffer(buf, offset: offset, index: i) }
+            enc.dispatchThreadgroups(MTLSize(width: width, height: height, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: kernel.threadsPerGroup, height: 1, depth: 1))
         }
 
         func commitAndWait() {

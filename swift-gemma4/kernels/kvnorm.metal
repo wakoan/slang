@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 // custom (runner.py _KVNORM) — k: RMSNorm*knorm + split-half RoPE; v: scale-free RMSNorm; -> caches
-// HD/HALF patched per layer-type. dispatch with threadsPerThreadgroup = (HD) ; groups = 1
+// HD/HALF patched per layer-type. dispatch with threadsPerThreadgroup = (256) ; groups = 1
 kernel void kvnorm(
     device const float* ink [[buffer(0)]], device const float* inv [[buffer(1)]],
     device const float* knorm [[buffer(2)]], device const float* cosT [[buffer(3)]],

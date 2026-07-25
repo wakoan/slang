@@ -30,6 +30,8 @@ let nNew = args.count > 2 ? Int(args[2])! : 48
 
 print("loading model + compiling kernels…")
 let g4 = try G4()
+if prompt == "bench" { try g4.bench(); exit(0) }
+if prompt == "profile" { try g4.profile(); exit(0) }
 let ids = tokenize(prompt)
 let (out, tps) = try g4.generate(ids, nNew)
 print("prompt: \(prompt)")

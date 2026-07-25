@@ -100,30 +100,32 @@ final class G4 {
                         ("partials256", (8*32*258+8)*4), ("partials512", (8*32*514+8)*4)] {
             let b = S(n, sz); memset(b.contents(), 0, sz)
         }
-    }
-
-    // ---- per-token dynamic uniforms (rope/attn/kv per head-dim type) ----
-    func writeStepUniforms(_ pos: Int) {
-        let nH = C("nH"), win = C("window")
-        var byHd: [Int: (Double, Int, Bool)] = [:]
-        for l in 0..<C("nL") {
-            byHd[LI(l, "head_dim")] = ((layers[l]["rope_theta"] as! NSNumber).doubleValue, LI(l, "rope_cutoff"), LB(l, "sliding"))
-        }
-        for (hd, (theta, cutoff, sliding)) in byHd {
+        // precompute rope cos/sin for all positions per head-dim type (bind at offset pos*half)
+        var byHd: [Int: (Double, Int)] = [:]
+        for l in 0..<nL { byHd[LI(l, "head_dim")] = ((layers[l]["rope_theta"] as! NSNumber).doubleValue, LI(l, "rope_cutoff")) }
+        for (hd, (theta, cutoff)) in byHd {
             let half = hd/2
-            var cosv = [Float](repeating: 0, count: half), sinv = cosv
-            for i in 0..<half {
+            var cosv = [Float](repeating: 0, count: maxSeq*half), sinv = cosv
+            for pos in 0..<maxSeq { for i in 0..<half {
                 let inv = i < cutoff ? 1.0 / pow(theta, Double(i)/Double(half)) : 0.0
                 let ang = Double(pos) * inv
-                cosv[i] = Float(cos(ang)); sinv[i] = Float(sin(ang))
-            }
-            let cb = S("rcos\(half)", half*4), sb = S("rsin\(half)", half*4)
-            cb.contents().copyMemory(from: cosv, byteCount: half*4)
-            sb.contents().copyMemory(from: sinv, byteCount: half*4)
-            let pA = S("parA_\(hd)", 32)
-            pA.contents().bindMemory(to: UInt32.self, capacity: 8).update(from: [1, UInt32(pos+1), UInt32(pos), UInt32(nH), 1, UInt32(sliding ? win : 0), 0, 0], count: 8)
-            let pkv = S("pkv_\(hd)", 16)
-            pkv.contents().bindMemory(to: UInt32.self, capacity: 4).update(from: [UInt32(pos*hd), 0, 0, 0], count: 4)
+                cosv[pos*half+i] = Float(cos(ang)); sinv[pos*half+i] = Float(sin(ang))
+            } }
+            pool["rcosT_\(hd)"] = try runner.makeBuffer(cosv, label: "rcosT\(hd)")
+            pool["rsinT_\(hd)"] = try runner.makeBuffer(sinv, label: "rsinT\(hd)")
+        }
+    }
+
+    // ---- per-token dynamic uniforms (attention params + kv dstOffset per type) ----
+    func writeStepUniforms(_ pos: Int) {
+        let nH = C("nH"), win = C("window")
+        var byHd: [Int: Bool] = [:]
+        for l in 0..<C("nL") { byHd[LI(l, "head_dim")] = LB(l, "sliding") }
+        for (hd, sliding) in byHd {
+            S("parA_\(hd)", 32).contents().bindMemory(to: UInt32.self, capacity: 8)
+                .update(from: [1, UInt32(pos+1), UInt32(pos), UInt32(nH), 1, UInt32(sliding ? win : 0), 0, 0], count: 8)
+            S("pkv_\(hd)", 16).contents().bindMemory(to: UInt32.self, capacity: 4)
+                .update(from: [UInt32(pos*hd), 0, 0, 0], count: 4)
         }
     }
 
@@ -139,11 +141,11 @@ final class G4 {
         return out
     }
 
-    func layer(_ b: MetalRunner.CommandBatch, _ l: Int, _ hidden: MTLBuffer, _ ple: MTLBuffer) throws {
+    func layer(_ b: MetalRunner.CommandBatch, _ l: Int, _ pos: Int, _ hidden: MTLBuffer, _ ple: MTLBuffer) throws {
         let H = C("H"), nH = C("nH"), hd = LI(l,"head_dim"), qd = LI(l,"q_dim"), inter = LI(l,"intermediate")
         let half = hd/2, shared = LB(l,"shared"), src = LI(l,"kv_source"), d = C("ple_d")
         func LW(_ n: String) -> MTLBuffer { W("L\(l).\(n)") }
-        let cb = S("rcos\(half)", half*4), sb = S("rsin\(half)", half*4)
+        let cb = pool["rcosT_\(hd)"]!, sb = pool["rsinT_\(hd)"]!, roff = pos*half*4
         let kcb = kc[src]!, vcb = vc[src]!
         let outq = S("outq", qd*4), outk = S("outk", hd*4), outv = S("outv", hd*4), dummy = S("dummy", hd*4), dummy2 = S("dummy2", hd*4)
         let attn = S("attn", qd*4), y2 = S("y2", H*4), sum2 = S("sum2", 4)
@@ -164,10 +166,10 @@ final class G4 {
             try b.dispatchGroups("qkv_\(qd)_\(hd)", buffers: [(a,0),(LW("q_bits"),0),(LW("q_bits"),0),(LW("q_bits"),0),(LW("q_scale"),0),(suma,0),(outq,0),(dummy,0),(dummy2,0),(par70,0)], groups: qd/2)
         } else {
             try b.dispatchGroups("qkv_\(qd)_\(hd)", buffers: [(a,0),(LW("q_bits"),0),(LW("k_bits"),0),(LW("v_bits"),0),(LW("qkv_scales"),0),(suma,0),(outq,0),(outk,0),(outv,0),(par70,0)], groups: qd/2+hd)
-            try b.dispatchGroups("kvnorm_\(hd)", buffers: [(outk,0),(outv,0),(LW("k_norm"),0),(cb,0),(sb,0),(kcb,0),(vcb,0),(S("pkv_\(hd)",16),0)], groups: 1)
+            try b.dispatchGroups("kvnorm_\(hd)", buffers: [(outk,0),(outv,0),(LW("k_norm"),0),(cb,roff),(sb,roff),(kcb,0),(vcb,0),(S("pkv_\(hd)",16),0)], groups: 1)
         }
         // attention (2-D: heads x chunks)
-        try b.dispatchGroups2D("attn_\(hd)_\(l)", buffers: [(outq,0),(LW("q_norm"),0),(cb,0),(sb,0),(kcb,0),(vcb,0),(partials,0),(attn,0),(S("parA_\(hd)",32),0)], width: nH, height: 32)
+        try b.dispatchGroups2D("attn_\(hd)_\(l)", buffers: [(outq,0),(LW("q_norm"),0),(cb,roff),(sb,roff),(kcb,0),(vcb,0),(partials,0),(attn,0),(S("parA_\(hd)",32),0)], width: nH, height: 32)
         // 73 o-proj + norms
         try b.dispatchGroups("oproj_\(qd)", buffers: [(attn,0),(LW("o_bits"),0),(LW("o_scale"),0),(pp73,0),(hidden,0),(LW("o_w12"),0),(y2,0),(sum2,0),(UF("p73_\(l)",[sc(l,"o_out"),sc(l,"gate_in"),0,0]),0)], groups: 192)
         // 74/95 gate/up ; 75/96 down
@@ -188,15 +190,23 @@ final class G4 {
         try b.dispatchGroups("pleproj_77", buffers: [(gate,0),(LW("pleproj_codes"),0),(LW("pleproj_rowscale"),0),(pp77,0),(hidden,0),(LW("pleproj_w12s"),0),(y2n,0),(sum2n,0),(UF("p77_\(l)",[nxt,sc(l,"pleproj_in"),sc(l,"pleproj_out"),0]),0)], groups: 96)
     }
 
+    func profile(_ n: Int = 40) throws {
+        let prof = try KernelProfiler(device: runner.device)
+        let hidden = S("hidden", C("H")*4), cur = S("cur", 4), gen = S("gen", 256*4)
+        cur.contents().bindMemory(to: UInt32.self, capacity: 1)[0] = 2
+        for i in 0..<n { try forward(cur, i, hidden, argmax: cur, gen: gen, step: i%200, prof: prof) }
+        print(prof.report())
+    }
+
     @discardableResult
     func forward(_ tok: MTLBuffer, _ pos: Int, _ hidden: MTLBuffer, argmax: MTLBuffer?,
-                 gen: MTLBuffer? = nil, step: Int = 0, wait: Bool = true) throws -> MTLCommandBuffer? {
+                 gen: MTLBuffer? = nil, step: Int = 0, wait: Bool = true, prof: KernelProfiler? = nil) throws -> MTLCommandBuffer? {
         let H = C("H"), V = C("vocab")
         writeStepUniforms(pos)
-        let b = try runner.batch()
+        let b = try runner.batch(profiler: prof)
         try embed(b, tok, hidden)
         let ple = try pleInput(b, tok, hidden)
-        for l in 0..<C("nL") { try layer(b, l, hidden, ple) }
+        for l in 0..<C("nL") { try layer(b, l, pos, hidden, ple) }
         let normed = S("normed", H*4)
         try b.dispatchGroups("rmssrq_69", buffers: [(hidden,0),(W("final_norm"),0),(normed,0),(S("sa",4),0),(UU("fn",[1,0,0,0]),0)], groups: 1)
         let logits = S("logits", V*4)
@@ -209,6 +219,20 @@ final class G4 {
         }
         if wait { b.commitAndWait(); return nil }
         return b.commit()
+    }
+
+    // Measure CPU record rate vs GPU-overlapped rate to find the bottleneck.
+    func bench(_ n: Int = 128) throws {
+        let hidden = S("hidden", C("H")*4), cur = S("cur", 4), gen = S("gen", 256*4)
+        cur.contents().bindMemory(to: UInt32.self, capacity: 1)[0] = 2
+        for p in 0..<8 { try forward(cur, p, hidden, argmax: cur, gen: gen, step: p) }   // warm
+        let t0 = Date(); var last: MTLCommandBuffer?
+        for i in 0..<n { last = try forward(cur, 8+i, hidden, argmax: cur, gen: gen, step: i%200, wait: false) }
+        let cpu = Date().timeIntervalSince(t0)
+        last?.waitUntilCompleted()
+        let total = Date().timeIntervalSince(t0)
+        print(String(format: "CPU-record: %.1f tok/s (%.2f ms/tok) | GPU-overlapped: %.1f tok/s (%.2f ms/tok)",
+                     Double(n)/cpu, cpu/Double(n)*1000, Double(n)/total, total/Double(n)*1000))
     }
 
     // ---- GPU-resident greedy decode: token feeds back via `cur` on-GPU; commit

@@ -1,5 +1,9 @@
 # LiteRT-LM vs this repo's backends — Gemma 4 E2B, M4 Pro
 
+> **See also `benchmarks/RESULTS.md`** for the combined third-party table
+> (ours vs Ollama vs LiteRT) measured at a matched 1024/256 shape, and for the
+> unreconciled decode discrepancy against the 125.5 figure recorded below.
+
 Google's official on-device runtime (LiteRT-LM) running Gemma 4 E2B, benchmarked
 against this repo's own gemma4_150 backends on the same machine. Run with
 `python litert/bench.py` (1024-token prefill, 256-token decode).

@@ -56,6 +56,27 @@ Weights are 2-bit; MPS needs f16. The design that follows from the measurements:
 
 Estimated landing zone: **~1000–1200 tok/s prefill**, i.e. parity with LiteRT.
 
+## Token-batching only helps SOME matmul shapes (measured)
+
+Both batched kernels are **bit-exact** vs the per-token path. Their speedups are not:
+
+| Kernel | shape (n_in → n_out) | speedup |
+|---|---|---:|
+| `kernels_msl/gateup_95_b.metal` | 1536 → 12288 | **2.49×** (S=16) |
+| `kernels_msl/down_96_b.metal` | 12288 → 1536 | **1.00×** (S=8) |
+
+**Rule:** token-batching wins when `n_in` is *small* — the S activation vectors stay
+in cache, so streaming the weights dominates and reading them once for S tokens is
+the whole cost. When `n_in` is *large* (down: 12288, i.e. 196 KB of activations for
+S=8, re-read by all 768 workgroups), activation traffic dominates and cutting weight
+traffic changes nothing.
+
+So a naive "batch the tokens" pass across all 7 matmuls will **not** uniformly give
+2.5×: gate/up, qkv and logits (small `n_in`) should win, `down` and `o_proj` (large
+`n_in`) will not. Revised estimate for that cheap path: **~250–300 tok/s**, not 400.
+Fixing `down` requires the *same* thing the parity path needs — real GEMM tiling that
+stages activations in threadgroup memory and reuses them across output rows.
+
 ## Cheaper alternative already proven
 
 `../kernels_msl/gateup_95_b.metal` — simple token-batched GEMV (S accumulators in

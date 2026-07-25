@@ -75,6 +75,18 @@ const ST: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
     .union(wgpu::BufferUsages::COPY_SRC).union(wgpu::BufferUsages::COPY_DST);
 const UNIF: wgpu::BufferUsages = wgpu::BufferUsages::UNIFORM.union(wgpu::BufferUsages::COPY_DST);
 
+// precomputed per-layer data (avoids JSON clone + format!/HashMap lookups in the hot loop)
+struct L {
+    hd: u32, qd: u32, inter: u32, half: u32, shared: bool, src: usize, o_in: f64, nxt: f32,
+    sc: HashMap<String, f32>,
+    w: HashMap<&'static str, RBuf>,
+}
+
+const ROLES: [&str; 25] = ["in_norm", "q_norm", "k_norm", "q_bits", "q_scale", "k_bits", "v_bits",
+    "qkv_scales", "o_bits", "o_scale", "o_w12", "gate_bits", "gate_scale", "up_bits", "up_scale",
+    "gelu_gate", "down_bits", "down_scale", "down_nw", "plegate_codes", "plegate_rowscale",
+    "gelu_plegate", "pleproj_codes", "pleproj_rowscale", "pleproj_w12s"];
+
 struct Runner {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -87,10 +99,30 @@ struct Runner {
     kc: HashMap<usize, RBuf>,
     vc: HashMap<usize, RBuf>,
     plan: Vec<(Rc<wgpu::ComputePipeline>, Rc<wgpu::BindGroup>, [u32; 3])>,
+    rope_cfgs: Vec<(u32, f64, u64, bool)>,   // (head_dim, theta, cutoff, sliding), unique per type
 }
 
 impl Runner {
     fn cfg_u(&self, k: &str) -> u64 { self.man["config"][k].as_u64().unwrap() }
+
+    fn build_layers(&self) -> Vec<L> {
+        let arr = self.man["layers"].as_array().unwrap();
+        arr.iter().enumerate().map(|(l, s)| {
+            let mut w = HashMap::new();
+            for r in ROLES {
+                if let Some(b) = self.bufs.get(&format!("L{}.{}", l, r)) { w.insert(r, b.clone()); }
+            }
+            let mut sc = HashMap::new();
+            for (k, v) in s["scales"].as_object().unwrap() { sc.insert(k.clone(), v.as_f64().unwrap() as f32); }
+            let nxt = arr.get(l + 1).map(|n| n["scales"]["qkv_in"].as_f64().unwrap() as f32).unwrap_or(0.0);
+            L {
+                hd: s["head_dim"].as_u64().unwrap() as u32, qd: s["q_dim"].as_u64().unwrap() as u32,
+                inter: s["intermediate"].as_u64().unwrap() as u32, half: s["head_dim"].as_u64().unwrap() as u32 / 2,
+                shared: s["shared"].as_bool().unwrap(), src: s["kv_source"].as_u64().unwrap() as usize,
+                o_in: s["scales"]["o_in"].as_f64().unwrap(), nxt, sc, w,
+            }
+        }).collect()
+    }
 
     fn scratch(&mut self, name: &str, nbytes: u64) -> RBuf {
         let n = nbytes.max(4);
@@ -140,7 +172,7 @@ impl Runner {
         };
         self.plan.push((pipe, bg, grid));
     }
-    fn flush(&mut self) {
+    fn flush(&mut self, copy: Option<(&wgpu::Buffer, &wgpu::Buffer, u64)>) {
         let mut enc = self.device.create_command_encoder(&Default::default());
         for (pipe, bg, grid) in self.plan.drain(..) {
             let mut cp = enc.begin_compute_pass(&Default::default());
@@ -148,6 +180,7 @@ impl Runner {
             cp.set_bind_group(0, Some(bg.as_ref()), &[]);
             cp.dispatch_workgroups(grid[0], grid[1], grid[2]);
         }
+        if let Some((src, dst, off)) = copy { enc.copy_buffer_to_buffer(src, 0, dst, off, 4); }
         self.queue.submit([enc.finish()]);
     }
     fn read_u32(&self, buf: &wgpu::Buffer, nbytes: u64) -> Vec<u32> {
@@ -166,13 +199,18 @@ impl Runner {
     fn write_step_uniforms(&mut self, pos: u32) {
         let n_h = self.cfg_u("nH") as u32;
         let win = self.cfg_u("window") as u32;
-        let mut cfgs: HashMap<u64, (f64, u64, bool)> = HashMap::new();
-        for s in self.man["layers"].as_array().unwrap() {
-            cfgs.insert(s["head_dim"].as_u64().unwrap(),
-                (s["rope_theta"].as_f64().unwrap(), s["rope_cutoff"].as_u64().unwrap(), s["sliding"].as_bool().unwrap()));
+        if self.rope_cfgs.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            for s in self.man["layers"].as_array().unwrap() {
+                let hd = s["head_dim"].as_u64().unwrap();
+                if seen.insert(hd) {
+                    self.rope_cfgs.push((hd as u32, s["rope_theta"].as_f64().unwrap(),
+                        s["rope_cutoff"].as_u64().unwrap(), s["sliding"].as_bool().unwrap()));
+                }
+            }
         }
-        for (hd, (theta, cutoff, sliding)) in cfgs {
-            let hd = hd as u32; let half = hd / 2;
+        for &(hd, theta, cutoff, sliding) in self.rope_cfgs.clone().iter() {
+            let half = hd / 2;
             let mut cos = vec![0f32; half as usize];
             let mut sin = vec![0f32; half as usize];
             for i in 0..half {
@@ -221,18 +259,12 @@ impl Runner {
         out
     }
 
-    fn layer(&mut self, l: usize, hidden: &RBuf, ple_buf: &RBuf, ple_off: u32) {
-        let s = self.man["layers"][l].clone();
-        let sc = |k: &str| s["scales"][k].as_f64().unwrap() as f32;
-        let sc_opt = |k: &str| s["scales"][k].as_f64().unwrap_or(0.0) as f32;
+    fn layer(&mut self, ld: &L, l: usize, hidden: &RBuf, ple_buf: &RBuf, ple_off: u32) {
+        let sc = |k: &str| ld.sc[k];
+        let sc_opt = |k: &str| *ld.sc.get(k).unwrap_or(&0.0);
         let h = self.cfg_u("H");
         let n_h = self.cfg_u("nH") as u32;
-        let hd = s["head_dim"].as_u64().unwrap() as u32;
-        let qd = s["q_dim"].as_u64().unwrap() as u32;
-        let inter = s["intermediate"].as_u64().unwrap() as u32;
-        let half = hd / 2;
-        let shared = s["shared"].as_bool().unwrap();
-        let src = s["kv_source"].as_u64().unwrap() as usize;
+        let (hd, qd, inter, half, shared, src) = (ld.hd, ld.qd, ld.inter, ld.half, ld.shared, ld.src);
 
         let cb = self.scratch(&format!("rcos{}", half), (half * 4) as u64);
         let sb = self.scratch(&format!("rsin{}", half), (half * 4) as u64);
@@ -255,7 +287,7 @@ impl Runner {
         let pp77 = self.scratch("pp77", (h + 1) * 4);
         let partials = self.scratch(&format!("partials{}", hd), (8 * 32 * (hd + 2) + 8) as u64 * 4);
 
-        macro_rules! b { ($n:expr) => { self.bufs[&format!("L{}.{}", l, $n)].clone() } }
+        macro_rules! b { ($n:expr) => { ld.w[$n].clone() } }
 
         let (a, suma) = if l == 0 {
             let a = self.scratch("a", h * 4);
@@ -285,7 +317,7 @@ impl Runner {
                 || KVNORM.replacen("%HD%", &format!("{}u", hd), 1).replacen("%HALF%", &format!("{}u", half), 1),
                 &[&outk, &outv, &kn, &cb, &sb, &kc, &vc, &pkv], [1, 1, 1], &format!("kvn|{}", l));
         }
-        let o_in = s["scales"]["o_in"].as_f64().unwrap();
+        let o_in = ld.o_in;
         let qn = b!("q_norm");
         let par_a = self.unis[&format!("parA_{}", hd)].clone();
         self.dispatch(&format!("att_{}_{}", hd, sc("o_in")),
@@ -317,18 +349,17 @@ impl Runner {
         let (pc, prs, pgl) = (b!("plegate_codes"), b!("plegate_rowscale"), b!("gelu_plegate"));
         self.dispatch("k76", || kernel("76_reduce"), &[hidden, &pc, &prs, ple_buf, &gate, &pgl, &p76], [self.cfg_u("ple_d") as u32, 1, 1], &format!("k76|{}", l));
 
-        let nxt = if l + 1 < self.cfg_u("nL") as usize { self.man["layers"][l + 1]["scales"]["qkv_in"].as_f64().unwrap() as f32 } else { 0.0 };
-        let par77 = self.uni_static(&format!("p77_{}", l), bytemuck::cast_slice(&[nxt, sc("pleproj_in"), sc("pleproj_out"), 0.0]));
+        let par77 = self.uni_static(&format!("p77_{}", l), bytemuck::cast_slice(&[ld.nxt, sc("pleproj_in"), sc("pleproj_out"), 0.0]));
         let (ppc, pprs, ppw) = (b!("pleproj_codes"), b!("pleproj_rowscale"), b!("pleproj_w12s"));
         self.dispatch("k77", || kernel("77_sg_sum"), &[&gate, &ppc, &pprs, &pp77, hidden, &ppw, &y2n, &sum2n, &par77], [96, 1, 1], &format!("k77|{}", l));
     }
 
-    fn forward(&mut self, tok: u32, pos: u32, hidden: &RBuf, argmax: Option<&RBuf>, ids: Option<&RBuf>, gen: Option<&RBuf>, step: u32) {
+    fn forward(&mut self, layers: &[L], tok: u32, pos: u32, hidden: &RBuf, argmax: Option<&RBuf>, ids: Option<&RBuf>, gen: Option<&RBuf>, step: u32) {
         let (h, nl, d, v) = (self.cfg_u("H"), self.cfg_u("nL"), self.cfg_u("ple_d"), self.cfg_u("vocab"));
         self.write_step_uniforms(pos);
         self.embed(tok, hidden, ids);
         let ple = self.ple_input(tok, hidden, ids);
-        for l in 0..nl as usize { self.layer(l, hidden, &ple, l as u32 * d as u32); }
+        for l in 0..nl as usize { self.layer(&layers[l], l, hidden, &ple, l as u32 * d as u32); }
         let normed = self.scratch("normed", h * 4);
         let sa = self.scratch("sa", 4);
         let pfn = self.uni_static("pfn", bytemuck::cast_slice(&[1u32, 0, 0, 0]));
@@ -343,14 +374,10 @@ impl Runner {
             let ci = self.scratch("ci", 256 * 4);
             self.dispatch("amax1", || kernel("34_main"), &[&logits, &cv, &ci], [256, 1, 1], "amax1");
             self.dispatch("amax2", || kernel("35_main"), &[&cv, &ci, am], [1, 1, 1], "amax2");
-            self.flush();
-            if let Some(g) = gen {
-                let mut enc = self.device.create_command_encoder(&Default::default());
-                enc.copy_buffer_to_buffer(am, 0, g, step as u64 * 4, 4);
-                self.queue.submit([enc.finish()]);
-            }
+            let copy = gen.map(|g| (am.as_ref(), g.as_ref(), step as u64 * 4));
+            self.flush(copy);   // gen-copy folded into the same submit
         } else {
-            self.flush();
+            self.flush(None);
         }
     }
 
@@ -379,27 +406,29 @@ impl Runner {
 
     fn bench(&mut self, n: usize) -> f64 {
         self.setup();
+        let layers = self.build_layers();
         let hidden = self.scratch("hidden", self.cfg_u("H") * 4);
         let cur = self.scratch("cur", 4);
         let gen = self.scratch("gen", 256 * 4);
         self.queue.write_buffer(&cur, 0, bytemuck::cast_slice(&[2u32]));
-        for p in 0..8 { self.forward(0, p, &hidden, Some(&cur), Some(&cur), Some(&gen), p); }  // warm (compile + fill cache)
+        for p in 0..8 { self.forward(&layers, 0, p, &hidden, Some(&cur), Some(&cur), Some(&gen), p); }  // warm
         self.read_u32(&gen, 32);
         let t0 = std::time::Instant::now();
-        for i in 0..n as u32 { self.forward(0, 8 + i, &hidden, Some(&cur), Some(&cur), Some(&gen), i % 64); }
+        for i in 0..n as u32 { self.forward(&layers, 0, 8 + i, &hidden, Some(&cur), Some(&cur), Some(&gen), i % 64); }
         self.read_u32(&gen, 4);
         n as f64 / t0.elapsed().as_secs_f64()
     }
 
     fn generate(&mut self, ids: &[u32], n_new: usize, eos: u32, chunk: usize) -> (Vec<u32>, f64) {
         self.setup();
+        let layers = self.build_layers();
         let hidden = self.scratch("hidden", self.cfg_u("H") * 4);
         let cur = self.scratch("cur", 4);
         let gen = self.scratch("gen", n_new as u64 * 4);
         let mut pos = 0u32;
         for &t in &ids[..ids.len() - 1] {
             self.queue.write_buffer(&cur, 0, bytemuck::cast_slice(&[t]));
-            self.forward(0, pos, &hidden, None, Some(&cur), None, 0);
+            self.forward(&layers, 0, pos, &hidden, None, Some(&cur), None, 0);
             pos += 1;
         }
         self.queue.write_buffer(&cur, 0, bytemuck::cast_slice(&[*ids.last().unwrap()]));
@@ -409,7 +438,7 @@ impl Runner {
         while step < n_new {
             let end = (step + chunk).min(n_new);
             while step < end {
-                self.forward(0, pos, &hidden, Some(&cur), Some(&cur), Some(&gen), step as u32);
+                self.forward(&layers, 0, pos, &hidden, Some(&cur), Some(&cur), Some(&gen), step as u32);
                 pos += 1; step += 1;
             }
             let got = self.read_u32(&gen, step as u64 * 4);
@@ -459,7 +488,7 @@ fn main() {
     queue.submit([]);
 
     let mut r = Runner { device, queue, man, bufs, pool: HashMap::new(), unis: HashMap::new(),
-        pipes: HashMap::new(), bgc: HashMap::new(), kc: HashMap::new(), vc: HashMap::new(), plan: vec![] };
+        pipes: HashMap::new(), bgc: HashMap::new(), kc: HashMap::new(), vc: HashMap::new(), plan: vec![], rope_cfgs: vec![] };
 
     let tok = tokenizers::Tokenizer::from_file(model.join("tokenizer.json")).unwrap();
     let inner = format!("<|turn>user\n{}<turn|>\n<|turn>model\n", prompt);

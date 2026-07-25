@@ -2,15 +2,15 @@ import Foundation
 import Metal
 
 // Locate the kernels/ directory whether we run from the repo root or from
-// swift-inference/.
+// swift-gemma3/.
 func findKernelsDir() throws -> String {
     let fm = FileManager.default
-    for candidate in ["swift-inference/kernels", "kernels"] {
+    for candidate in ["swift-gemma3/kernels", "kernels"] {
         if fm.fileExists(atPath: candidate + "/matvec_simd_packed.metal") {
             return candidate
         }
     }
-    throw RuntimeError("kernels/ directory not found; run from repo root or swift-inference/")
+    throw RuntimeError("kernels/ directory not found; run from repo root or swift-gemma3/")
 }
 
 /// Pack an f32 array into u32s holding f16 pairs (element 2j in the low half).

@@ -1,3 +1,5 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 """Example: Python-to-WGSL translation of a matrix multiplication kernel."""
 
 from py_shader_lang_wgpu import kernel, u32, f32, StorageBuffer, Builtin

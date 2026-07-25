@@ -42,19 +42,52 @@ regime it works and is numerically correct (rel err ~0.014 vs f32 numpy).
 Notably my kernel **beats MPS at M=64** (2.59 vs 2.08) but MPS wins decisively at
 large M — and large M is exactly the prefill regime.
 
-## The route to 1132 tok/s
+## The route to 1132 tok/s — VALIDATED end-to-end (2026-07-25)
 
-Weights are 2-bit; MPS needs f16. The design that follows from the measurements:
+Weights are 2-bit; MPS needs f16. Both halves are now measured, not assumed:
+`python -m gemma4_150.prefill_research.bench_gemm_mps`.
 
-1. **Dequantize each weight matrix to f16 scratch once per prefill**, not per token.
-   Cost is trivially amortized: ~100 MB of f16 per layer ≈ 0.5 ms, ×35 layers ≈
-   17 ms, against ~900 ms of prefill compute for S=1024.
-2. **MPS (or an MPS-class GEMM) for all S tokens at once**, at M≥256 where it reaches
-   3.5–4.9 TFLOP/s.
-3. Batched norms/activations (`rmssrq_69`, `embed_00`, `plegather_01` already carry a
-   rows/seq dimension) + causal-mask attention over the query batch.
+**1. Dequant is free.** `dq2_f16.metal` unpacks 2-bit QAT weights to plain f16.
+Verified **EXACT** against a float64 reconstruction (which also pins the bit layout:
+value `i` of a word sits at bit `8*(i/4) + 2*(i%4)`). Runs at **139 GB/s** — the
+whole model is 3.75 GB of f16, so **27 ms once per prompt**, against ~700 ms of
+compute. Amortized only if the loop is **layers-outer / tokens-inner**.
 
-Estimated landing zone: **~1000–1200 tok/s prefill**, i.e. parity with LiteRT.
+**2. MPS delivers, and then some** (gate/up shape, 12288×1536, f16, max rel err
+4.8e-4 vs float64):
+
+| M | ms | TFLOP/s |
+|---:|---:|---:|
+| 16 | 0.302 | 2.00 |
+| 64 | 0.641 | 3.77 |
+| 256 | 1.886 | **5.12** |
+| 1024 | 6.868 | **5.63** |
+
+That **beats LiteRT's effective 4.53** and the 4.90 recorded above. For scale, the
+current per-token GEMV path does gate+up at **1.62 TFLOP/s** — a **3.2× gap**.
+
+**3. Projection** (3.84 TFLOP matmul + 0.18 TFLOP causal attention for 1024 tokens):
+
+| | matmul | dequant | attn | other | total | prefill |
+|---|---:|---:|---:|---:|---:|---:|
+| M=256 | 751 ms | 27 ms | 180 ms | 100 ms | 1.06 s | **968 tok/s** |
+| M=1024 | 683 ms | 27 ms | 180 ms | 100 ms | 0.99 s | **1034 tok/s** |
+
+vs 158 today and LiteRT's 1132 — i.e. **~6.3×, landing at parity**.
+
+**The one thing that decides it: M must be large.** At M=16 MPS gives only 2.00
+TFLOP/s; the win needs M≥256. So prefill must hold all S token activations resident
+and iterate **layers outer, tokens inner** — `[1024][1536]` f32 is 6.3 MB and the
+widest intermediate `[1024][12288]` f16 is 25 MB, so nothing forces streaming. This
+ordering is also what makes dequant a once-per-layer cost, and it is legal because
+every token clears layer L before any reaches L+1 (so a later token's attention can
+read an earlier token's KV).
+
+Remaining build: causal-mask attention over the query batch, batched norms
+(`rmssrq_69`, `embed_00`, `plegather_01` already carry a rows/seq dimension), and
+the runner restructure. Note MPS emits f16, so the exact int-dot arithmetic is
+replaced by f16 GEMM — check against the numpy oracle rather than expecting
+bit-identity with the decode path.
 
 ## RETRACTION: the earlier batching numbers were measurement artifacts
 
@@ -115,7 +148,12 @@ o_proj 7.0%, PLE 1.5%, proj_68 0.7% — 1.88 G MAC/token.
 
 **The whole batching path is worth ~1.3×, and still leaves a 5.4× gap.** It is capped
 by gate/up, which is 55% of the FLOPs and only yields 1.21×. This route is closed;
-the dequant-to-f16 + GEMM route above is the only one whose arithmetic reaches 1132.
+the dequant-to-f16 + GEMM route above is the only one whose arithmetic reaches 1132,
+and it is now measured rather than projected.
+
+Root cause of the cap, worth keeping: a GEMV holds S accumulators in registers, so it
+spills at SEQ=8 — the structure dies long before reaching the M≥256 that MPS needs to
+hit 5 TFLOP/s. Register-blocked GEMV and large-M GEMM are not points on one curve.
 
 ## Note on "bit-exact"
 

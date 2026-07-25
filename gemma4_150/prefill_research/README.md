@@ -56,30 +56,71 @@ Weights are 2-bit; MPS needs f16. The design that follows from the measurements:
 
 Estimated landing zone: **~1000–1200 tok/s prefill**, i.e. parity with LiteRT.
 
-## Token-batching only helps SOME matmul shapes (measured)
+## RETRACTION: the earlier batching numbers were measurement artifacts
 
-Both batched kernels are **bit-exact** vs the per-token path. Their speedups are not:
+An earlier revision of this file reported **2.49×** for `gateup_95_b` and **1.00×**
+for `down_96_b`, and built a "~350–400 tok/s cheap path" on them. **Both numbers were
+wrong**, from two independent methodology bugs. Re-measure with
+`python -m gemma4_150.prefill_research.bench_batched [S]`, which now controls for both.
 
-| Kernel | shape (n_in → n_out) | speedup |
-|---|---|---:|
-| `kernels_msl/gateup_95_b.metal` | 1536 → 12288 | **2.49×** (S=16) |
-| `kernels_msl/down_96_b.metal` | 12288 → 1536 | **1.00×** (S=8) |
+1. **Unfair baseline.** The S per-token decode dispatches were timed as S separate
+   command buffers (commit + wait each) instead of S dispatches in one command
+   buffer. Inside a real forward pass they share a command buffer and overlap.
+   Measured inflation of the baseline: **1.80×**, i.e. pure fiction.
+2. **Cold GPU clock.** Apple silicon idles the GPU at a low clock and needs
+   order-seconds of sustained load to ramp. The *same* `S × down_96` baseline reads
+   **1.013 ms cold and 0.366 ms warm — a 2.8× swing**, landing entirely on whichever
+   kernel runs first. Every number below is taken after a 2 s warm-up, min-of-3, with
+   the baseline re-measured after each sweep to confirm drift < 1.5%.
 
-**Rule:** token-batching wins when `n_in` is *small* — the S activation vectors stay
-in cache, so streaming the weights dominates and reading them once for S tokens is
-the whole cost. When `n_in` is *large* (down: 12288, i.e. 196 KB of activations for
-S=8, re-read by all 768 workgroups), activation traffic dominates and cutting weight
-traffic changes nothing.
+The "shape rule" that revision inferred (`n_in` small → batching wins) was also
+wrong — an artifact of the same bad data. The real story is below.
 
-So a naive "batch the tokens" pass across all 7 matmuls will **not** uniformly give
-2.5×: gate/up, qkv and logits (small `n_in`) should win, `down` and `o_proj` (large
-`n_in`) will not. Revised estimate for that cheap path: **~250–300 tok/s**, not 400.
-Fixing `down` requires the *same* thing the parity path needs — real GEMM tiling that
-stages activations in threadgroup memory and reuses them across output rows.
+## What actually governs these kernels: MAC per issued load
 
-## Cheaper alternative already proven
+These are split-k GEMVs and they are **load-issue bound**, not byte bound. A thread
+holding a micro-tile of `N_ROWS` output rows × `SEQ` tokens issues `N_ROWS` weight
+loads + `4·SEQ` activation loads per weight-word to do `16·N_ROWS·SEQ` MACs:
 
-`../kernels_msl/gateup_95_b.metal` — simple token-batched GEMV (S accumulators in
-registers), **bit-exact**, measured **2.49× at S=16** (regresses at S=32: register
-spill). Rolling that across the ~7 matmuls lands prefill near **350–400 tok/s** for
-far less work, without any dequant-staging redesign.
+    MAC / issued-load  =  16·N_ROWS·SEQ / (N_ROWS + 4·SEQ)
+
+This explains the original failure exactly. `down_96` (decode) already blocks **4
+output rows**; the first `down_96_b` dropped that to **1 row** while adding 8 tokens,
+taking the ratio *down* from 8.0 to 3.9. It traded one amortization for another
+instead of stacking them. **Both dimensions have to be blocked at once.**
+
+Warm, fair measurements of the fixed kernels (bit-exact — see the tie note below):
+
+| Kernel | blocking | S=8 | S=16 |
+|---|---|---:|---:|
+| `kernels_msl/gateup_95_b.metal` | `N_ROWS=2, SEQ=4` | **1.21×** | **1.23×** |
+| `kernels_msl/down_96_b.metal` | `N_ROWS=16, SEQ=4` | **1.45×** | **1.80×** |
+
+The ratio is necessary but **not sufficient** — it ignores register pressure. For
+gate/up, `N_ROWS=8,SEQ=4` has the best ratio (32.0) and the *worst* time (0.43×):
+`n_in=1536` is only 96 words = 3 per lane, too short a k-loop to amortize the
+registers. `down`'s 768-word k-loop does pay for `N_ROWS=16`. `SEQ=8` spills
+everywhere (0.27–0.41×). Sweep, don't extrapolate.
+
+## Verdict: batching is NOT a route to parity
+
+Exact FLOP shares (from the manifest): gate/up **55.3%**, down **27.7%**, qkv 7.8%,
+o_proj 7.0%, PLE 1.5%, proj_68 0.7% — 1.88 G MAC/token.
+
+| Scenario | overall | prefill |
+|---|---:|---:|
+| gate/up + down batched (measured) | 1.26× | ~199 tok/s |
+| *plus* every other matmul also hitting 1.3× (optimistic) | 1.32× | ~209 tok/s |
+| LiteRT | | **1132 tok/s** |
+
+**The whole batching path is worth ~1.3×, and still leaves a 5.4× gap.** It is capped
+by gate/up, which is 55% of the FLOPs and only yields 1.21×. This route is closed;
+the dequant-to-f16 + GEMM route above is the only one whose arithmetic reaches 1132.
+
+## Note on "bit-exact"
+
+The batched kernels match the decode kernels except for occasional single-element
+mismatches (1 in 24576 at S=16). These are **exact ties on the SRQ rounding grid**:
+float64 reconstruction of one such element gives `50.500007`, where a last-ulp
+difference in float accumulation order flips `round()` to the other side. The
+underlying dot products agree exactly (verified in exact integer arithmetic).

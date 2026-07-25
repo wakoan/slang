@@ -54,39 +54,37 @@ GEMV — the capture was decode-only. That is ~7 new kernels plus causal-mask
 orchestration: a separate project, and the regime where matrix units finally pay off
 (batch fills the N dimension a GEMV wastes).
 
-## Batched-prefill prototype (measured, 2026-07-25)
+## Batched-prefill prototype (measured warm, 2026-07-25)
 
-`kernels_msl/gateup_95_b.metal` is a **batched (M=S) variant of the dominant matmul**
-(2-bit gate/up, 12288×1536), built to measure the real win before porting all ~7
-matmuls. It reads each weight word **once** and dots it against S activation vectors.
-Output is **bit-exact** vs the per-token path at every S.
+Batched (M=S) variants of the two dominant matmuls — 2-bit gate/up (55.3% of prefill
+FLOPs) and 2-bit down (27.7%) — built to measure the real win before porting all ~7.
+Each thread holds a micro-tile of `N_ROWS` output rows × `SEQ` tokens, so **both**
+weight and activation loads are amortized. Reproduce with
+`python -m gemma4_150.prefill_research.bench_batched [S]`.
 
-| S (tokens/pass) | S× GEMV | batched | speedup |
-|---:|---:|---:|---:|
-| 4 | 1.01 ms | 0.84 ms | 1.21× |
-| 8 | 1.81 ms | 1.36 ms | 1.33× |
-| **16** | 2.40 ms | **0.96 ms** | **2.49×** |
-| 32 | 2.77 ms | 3.32 ms | 0.83× ← regression |
+| Kernel | blocking | S=8 | S=16 |
+|---|---|---:|---:|
+| `gateup_95_b` | `N_ROWS=2, SEQ=4` | **1.21×** | **1.23×** |
+| `down_96_b` | `N_ROWS=16, SEQ=4` | **1.45×** | **1.80×** |
 
-**Findings that contradict the naive roofline:**
+**An earlier revision of this section reported 2.49× for gate/up. That was wrong**,
+from two compounding measurement bugs, both now controlled for:
 
-1. **The GEMV path was never weight-bandwidth-bound at this size** — it runs at only
-   ~42 GB/s, 15% of the 273 GB/s peak. So "read weights S× less" does not buy S×;
-   the kernel is issue/occupancy-bound, not byte-bound.
-2. **S=32 regresses** (0.83×): 2×32 = 64 float accumulators per thread spills
-   registers. S=16 is the sweet spot for this simple structure.
-3. The baseline is also flattered — S independent GEMV dispatches in one command
-   buffer overlap on the GPU, so they scale sublinearly (1.01→2.77 ms for 4→32).
-   Real prefill runs them as *sequential dependent forwards*, so in-context batching
-   should beat this microbenchmark's 2.5×.
+1. **Unfair baseline** — the S per-token dispatches were timed as S separate command
+   buffers (commit+wait each) rather than S dispatches in one, which is how they
+   actually run inside a forward pass. Inflated the baseline **1.80×**.
+2. **Cold GPU clock** — the same `S × down_96` baseline reads **1.013 ms cold vs
+   0.366 ms warm**, a 2.8× swing that lands on whichever kernel runs first. All
+   numbers above follow a 2 s warm-up, min-of-3, with post-sweep drift < 1.5%.
 
-**Extrapolation:** applying S=16 batching to all ~7 matmuls plausibly takes prefill
-from 158 to roughly **350–400 tok/s** — a solid 2–2.5×, but still ~3× short of
-LiteRT's 1132. Closing the rest needs a **properly tiled GEMM** (threadgroup-memory
-A/B tiles, register micro-tiles) rather than this "S accumulators in registers"
-shape — and that is the regime where Apple's `simdgroup_matrix` units finally pay
-off (falsified for *decode*, where a GEMV wastes 7 of 8 tile columns; a token batch
-fills them).
+**Consequence for the roadmap:** applying this across every matmul is worth
+**~1.26–1.32× overall, i.e. prefill ~200–210 tok/s** — not the 350–400 previously
+extrapolated. It is capped by gate/up, 55% of the FLOPs at only 1.21×. **That still
+leaves a 5.4× gap to LiteRT, so token-batching is closed as a route to parity.**
+The only route whose arithmetic reaches 1132 is dequantize-to-f16 once per prefill +
+an MPS-class tiled GEMM at large M (LiteRT runs at 4.53 TFLOP/s ≈ 92% of this
+machine's measured 4.90 GEMM ceiling; we are at 0.63). See
+`gemma4_150/prefill_research/README.md`.
 
 ## The honest caveats
 

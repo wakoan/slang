@@ -501,13 +501,15 @@ impl G4 {
                 let tk = self.read_gen(out.len());
                 if tk == self.eos {
                     let dt = t0.elapsed().as_secs_f64();
-                    return (out.clone(), if out.is_empty() { 0.0 } else { out.len() as f64 / dt });
+                    // step, not out.len(): dt covers the whole dispatched chunk,
+                    // so an early EOS would put a truncated numerator over it
+                    return (out.clone(), if dt > 0.0 { step as f64 / dt } else { 0.0 });
                 }
                 out.push(tk);
             }
         }
         let dt = t0.elapsed().as_secs_f64();
-        let tps = if out.is_empty() { 0.0 } else { out.len() as f64 / dt };
+        let tps = if dt > 0.0 { step as f64 / dt } else { 0.0 };
         (out, tps)
     }
 

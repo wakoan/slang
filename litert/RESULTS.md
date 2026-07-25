@@ -28,13 +28,23 @@ This repo's Python native-Metal runner (`gemma4_150/metal_runner.py`), decode to
 
 | Context | native-Metal (Python) | LiteRT GPU |
 |---:|---:|---:|
-| 64 | 160.7 | — |
-| 512 | 149.4 | — |
-| **1024** | **125.5** | **95.7** |
+| 64 | 167.4 | — |
+| 512 | 153.1 | — |
+| **1024** | **148.1** | **95.7** |
 
-At the matched 1024-token context, native Metal is **~1.3× faster on decode**
+At the matched 1024-token context, native Metal is **~1.55× faster on decode**
 (and Swift/Rust run a few tok/s above Python). At short chat context (~tens of
 tokens) native Metal reaches ~170.
+
+**Corrected 2026-07-25 — this table previously read 160.7 / 149.4 / 125.5.** The
+1024 entry was wrong, and the cause was a bug in `generate()`, not the GPU:
+decode dispatches a whole chunk of forwards before reading any back, so an early
+EOS discarded up to 31 tokens whose work was still inside the timer, and the rate
+divided the *surviving* tokens by the *full* elapsed time. At a fixed 1024-token
+context that made the same code report 150 tok/s for a long answer, 77 for a
+one-sentence one and 24 for a yes/no. Every chunked backend had it; all now
+divide by the forwards actually executed (`chat_turn` always did). The 64 and 512
+entries barely moved because those prompts happened to run to the token cap.
 
 ## Prefill
 

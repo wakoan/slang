@@ -288,11 +288,14 @@ final class G4 {
             let g = gen.contents().bindMemory(to: UInt32.self, capacity: 256)
             while out.count < step {
                 let tk = g[out.count]
-                if tk == eos { return (out, out.isEmpty ? 0 : Double(out.count) / Date().timeIntervalSince(t0)) }
+                // step, not out.count: the elapsed time covers the whole
+                // dispatched chunk, so an early EOS would put a truncated
+                // numerator over a full denominator and underreport decode.
+                if tk == eos { return (out, Double(step) / Date().timeIntervalSince(t0)) }
                 out.append(tk)
             }
         }
-        return (out, out.isEmpty ? 0 : Double(out.count) / Date().timeIntervalSince(t0))
+        return (out, Double(step) / Date().timeIntervalSince(t0))
     }
 
     // ---- interactive chat: keep the KV cache resident across turns so each

@@ -251,7 +251,9 @@ final class GemmaModel {
             if stop { break }
         }
         let dt = Date().timeIntervalSince(t0)
-        return (out, Double(out.count) / dt)
+        // produced, not out.count: dt covers every forward in the dispatched
+        // chunk, including those discarded after an early EOS.
+        return (out, Double(produced) / dt)
     }
 
     /// Greedy generation from prompt ids. Returns generated ids (prompt

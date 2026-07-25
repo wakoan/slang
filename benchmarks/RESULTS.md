@@ -11,7 +11,7 @@ All numbers measured on the same machine (M4 Pro, 24 GB), same shape:
 
 | Runtime | Prefill | Decode @ 1024 ctx |
 |---|---:|---:|
-| **ours** (`gemma4_150`, native Metal) | **1208 tok/s** | **~148 tok/s** |
+| **ours** (`gemma4_150`, native Metal) | **1208 tok/s** | **148.1 tok/s** |
 | Ollama 0.30.6 (`gemma4:e2b`) | 1153 tok/s | 87.2 tok/s |
 | LiteRT-LM (GPU/WebGPU) | 1132 tok/s | 95.7 tok/s |
 | LiteRT-LM (CPU/XNNPACK) | 443 tok/s | 40.2 tok/s |
@@ -65,11 +65,38 @@ Plus the standing rules from `gemma4_150/prefill_research/README.md`: warm the
 GPU clock first (2.8× swing cold), best-of-N, and never time a per-token
 baseline as one command buffer per token.
 
-## Open
+## Resolved: the old 125.5 was a timer bug, not a slow GPU
 
-Our decode at 1024 context measures **146.7–148.8 tok/s** across three runs
-today, but `litert/RESULTS.md` records **125.5** for the same configuration.
-Unreconciled. The higher figure is the more physically plausible one — 28 of 35
-layers are sliding-window capped at 512 keys, so 512→1024 context should cost
-little, and the measured 149.8→148.5 matches that — but until the discrepancy is
-explained, treat ~148 as provisional.
+`litert/RESULTS.md` recorded 125.5 tok/s decode at 1024 context; measurement gave
+~148. The gap was a bug in `generate()`, and it is now fixed in every backend.
+
+Decode dispatches a whole chunk of 32 forwards before reading any token back, so
+an early EOS discards up to 31 tokens **whose work is still inside the timer**.
+The rate then divided the surviving tokens by the full elapsed time — a truncated
+numerator over a full denominator. At a fixed 1024-token context, the same code
+on the same machine reported:
+
+| prompt | tokens generated | before fix | after fix |
+|---|---:|---:|---:|
+| "continue at length" | 240 | 150.3 | 149.4 |
+| "summarize in one sentence" | 32 | 76.8 | 149.0 |
+| "answer yes or no" | 5 | 23.9 | 148.3 |
+
+So the reported figure depended on *what the model chose to say*, not on decode
+speed. 125.5 was a prompt that stopped somewhere around 200 tokens.
+
+Two things worth keeping from this:
+
+* **`chat_turn` always divided by the executed step count; `generate` was the odd
+  one out** — the correct form was already in the codebase, which is why the bug
+  survived review.
+* It was hit **three separate times in one session** before being recognised: a
+  short prompt reading 59 tok/s instead of 166, the Ollama harness reading 164
+  tok/s over 2 generated tokens, and this. A decode rate should always be
+  reported alongside the number of tokens it was measured over; if that count is
+  small or unstated, the rate is not a measurement.
+
+Falsified along the way: memory/GPU contention. Holding Ollama's 7.1 GB model
+resident at 100% GPU changed our decode by under 1% (167.4 / 153.2 / 149.2 vs
+167.4 / 153.1 / 148.1 clean), so the co-resident LiteRT process was not the
+cause.

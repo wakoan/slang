@@ -458,10 +458,10 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             for tok in new:
                 if tok == eos:
                     dt = time.time() - t0
-                    return out, len(out) / dt if dt else 0.0
+                    return out, step / dt if dt else 0.0
                 out.append(tok)
         dt = time.time() - t0
-        return out, len(out) / dt if dt else 0.0
+        return out, step / dt if dt else 0.0
 
     def logits_np(self, token_id, pos, hidden=None):
         lg = self.forward(token_id, pos, hidden)

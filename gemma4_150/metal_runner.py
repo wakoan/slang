@@ -398,6 +398,17 @@ class G4:
 
     # ---- single-shot greedy generate ----
     def generate(self, ids, n_new, chunk=32):
+        """Returns (tokens, decode tok/s).
+
+        The rate divides by `step` -- the forwards actually executed and timed --
+        NOT by len(out). Decode runs a whole chunk of forwards before reading any
+        of them back, so an early EOS discards up to chunk-1 tokens whose work is
+        still inside dt. Dividing by the surviving tokens puts a truncated
+        numerator over a full denominator and silently underreports: at a fixed
+        1024-token context this reads 150 tok/s for a long answer, 77 for a
+        one-sentence one and 24 for a yes/no -- same code, same context, same
+        machine. A stale 125.5 in litert/RESULTS.md came from exactly this.
+        chat_turn has always divided by step; generate was the odd one out."""
         pos = self.prefill(list(ids[:-1]), 0)
         self.set_cur(ids[-1])
         out = []; step = 0; cap = min(n_new, 240)
@@ -412,10 +423,10 @@ class G4:
                 tk = self._read_gen(len(out))
                 if tk == self.eos:
                     dt = time.time() - t0
-                    return out, (len(out) / dt if out else 0.0)
+                    return out, (step / dt if dt > 0 else 0.0)
                 out.append(tk)
         dt = time.time() - t0
-        return out, (len(out) / dt if out else 0.0)
+        return out, (step / dt if dt > 0 else 0.0)
 
     # ---- multi-turn chat (KV cache resident across turns) ----
     def chat_reset(self):

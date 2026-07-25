@@ -54,6 +54,40 @@ GEMV — the capture was decode-only. That is ~7 new kernels plus causal-mask
 orchestration: a separate project, and the regime where matrix units finally pay off
 (batch fills the N dimension a GEMV wastes).
 
+## Batched-prefill prototype (measured, 2026-07-25)
+
+`kernels_msl/gateup_95_b.metal` is a **batched (M=S) variant of the dominant matmul**
+(2-bit gate/up, 12288×1536), built to measure the real win before porting all ~7
+matmuls. It reads each weight word **once** and dots it against S activation vectors.
+Output is **bit-exact** vs the per-token path at every S.
+
+| S (tokens/pass) | S× GEMV | batched | speedup |
+|---:|---:|---:|---:|
+| 4 | 1.01 ms | 0.84 ms | 1.21× |
+| 8 | 1.81 ms | 1.36 ms | 1.33× |
+| **16** | 2.40 ms | **0.96 ms** | **2.49×** |
+| 32 | 2.77 ms | 3.32 ms | 0.83× ← regression |
+
+**Findings that contradict the naive roofline:**
+
+1. **The GEMV path was never weight-bandwidth-bound at this size** — it runs at only
+   ~42 GB/s, 15% of the 273 GB/s peak. So "read weights S× less" does not buy S×;
+   the kernel is issue/occupancy-bound, not byte-bound.
+2. **S=32 regresses** (0.83×): 2×32 = 64 float accumulators per thread spills
+   registers. S=16 is the sweet spot for this simple structure.
+3. The baseline is also flattered — S independent GEMV dispatches in one command
+   buffer overlap on the GPU, so they scale sublinearly (1.01→2.77 ms for 4→32).
+   Real prefill runs them as *sequential dependent forwards*, so in-context batching
+   should beat this microbenchmark's 2.5×.
+
+**Extrapolation:** applying S=16 batching to all ~7 matmuls plausibly takes prefill
+from 158 to roughly **350–400 tok/s** — a solid 2–2.5×, but still ~3× short of
+LiteRT's 1132. Closing the rest needs a **properly tiled GEMM** (threadgroup-memory
+A/B tiles, register micro-tiles) rather than this "S accumulators in registers"
+shape — and that is the regime where Apple's `simdgroup_matrix` units finally pay
+off (falsified for *decode*, where a GEMV wastes 7 of 8 tile columns; a token batch
+fills them).
+
 ## The honest caveats
 
 1. **Prefill: LiteRT still wins — 1132 vs 158 tok/s** (see above). Batched prefill

@@ -20,7 +20,7 @@ from gemma4_150.runner import G4Runner, _kernel   # _kernel is lru-cached WGSL r
 from gemma4_150.loader import MODEL
 
 HERE = Path(__file__).resolve().parent
-WEB = HERE / "web"
+WEB = HERE / "backends/browser"
 
 # reference kernels the runner dispatches + the two custom templates it defines
 REF_KERNELS = ["00_main", "01_main", "68_reduce", "69_sg_sum", "70_srq", "73_sg_sum",

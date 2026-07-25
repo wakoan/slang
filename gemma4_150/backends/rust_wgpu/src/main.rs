@@ -11,7 +11,7 @@ use wgpu::util::DeviceExt;
 
 type RBuf = Rc<wgpu::Buffer>;
 
-const REPO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+const REPO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../..");
 
 const COMBINE: &str = r#"
 const D:u32=256u; const HINV:f32=%HINV%; const EPS:f32=1e-6; const RS2:f32=0.7071067811865476;

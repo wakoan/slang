@@ -12,6 +12,9 @@ final class G4 {
     var bufs: [String: MTLBuffer] = [:]      // weights (cached)
     var pool: [String: MTLBuffer] = [:]      // scratch
     var kc: [Int: MTLBuffer] = [:], vc: [Int: MTLBuffer] = [:]
+    // ---- multi-turn chat state (KV cache persists across turns) ----
+    var chatPos = 0                 // next free KV slot
+    var chatCarry: UInt32? = nil    // last generated token, not yet in the cache
 
     func C(_ k: String) -> Int { (cfg[k] as! NSNumber).intValue }
     func sc(_ l: Int, _ k: String) -> Float { Float(((layers[l]["scales"] as! [String: Any])[k] as! NSNumber).doubleValue) }
@@ -116,15 +119,22 @@ final class G4 {
         }
     }
 
+    // Ring of per-step uniform buffers. Chunked decode commits many forwards
+    // without waiting, so a *single* parA/pkv buffer would be overwritten by the
+    // CPU before the GPU consumes it (pkv sets the K/V write slot — racing it
+    // corrupts the cache). `slot = step % RING` gives each in-flight forward its
+    // own copy; RING ≥ max chunk guarantees no live buffer is reused.
+    static let RING = 32
+
     // ---- per-token dynamic uniforms (attention params + kv dstOffset per type) ----
-    func writeStepUniforms(_ pos: Int) {
+    func writeStepUniforms(_ pos: Int, _ slot: Int) {
         let nH = C("nH"), win = C("window")
         var byHd: [Int: Bool] = [:]
         for l in 0..<C("nL") { byHd[LI(l, "head_dim")] = LB(l, "sliding") }
         for (hd, sliding) in byHd {
-            S("parA_\(hd)", 32).contents().bindMemory(to: UInt32.self, capacity: 8)
+            S("parA_\(hd)_\(slot)", 32).contents().bindMemory(to: UInt32.self, capacity: 8)
                 .update(from: [1, UInt32(pos+1), UInt32(pos), UInt32(nH), 1, UInt32(sliding ? win : 0), 0, 0], count: 8)
-            S("pkv_\(hd)", 16).contents().bindMemory(to: UInt32.self, capacity: 4)
+            S("pkv_\(hd)_\(slot)", 16).contents().bindMemory(to: UInt32.self, capacity: 4)
                 .update(from: [UInt32(pos*hd), 0, 0, 0], count: 4)
         }
     }
@@ -141,7 +151,7 @@ final class G4 {
         return out
     }
 
-    func layer(_ b: MetalRunner.CommandBatch, _ l: Int, _ pos: Int, _ hidden: MTLBuffer, _ ple: MTLBuffer) throws {
+    func layer(_ b: MetalRunner.CommandBatch, _ l: Int, _ pos: Int, _ slot: Int, _ hidden: MTLBuffer, _ ple: MTLBuffer) throws {
         let H = C("H"), nH = C("nH"), hd = LI(l,"head_dim"), qd = LI(l,"q_dim"), inter = LI(l,"intermediate")
         let half = hd/2, shared = LB(l,"shared"), src = LI(l,"kv_source"), d = C("ple_d")
         func LW(_ n: String) -> MTLBuffer { W("L\(l).\(n)") }
@@ -166,10 +176,10 @@ final class G4 {
             try b.dispatchGroups("qkv_\(qd)_\(hd)", buffers: [(a,0),(LW("q_bits"),0),(LW("q_bits"),0),(LW("q_bits"),0),(LW("q_scale"),0),(suma,0),(outq,0),(dummy,0),(dummy2,0),(par70,0)], groups: qd/2)
         } else {
             try b.dispatchGroups("qkv_\(qd)_\(hd)", buffers: [(a,0),(LW("q_bits"),0),(LW("k_bits"),0),(LW("v_bits"),0),(LW("qkv_scales"),0),(suma,0),(outq,0),(outk,0),(outv,0),(par70,0)], groups: qd/2+hd)
-            try b.dispatchGroups("kvnorm_\(hd)", buffers: [(outk,0),(outv,0),(LW("k_norm"),0),(cb,roff),(sb,roff),(kcb,0),(vcb,0),(S("pkv_\(hd)",16),0)], groups: 1)
+            try b.dispatchGroups("kvnorm_\(hd)", buffers: [(outk,0),(outv,0),(LW("k_norm"),0),(cb,roff),(sb,roff),(kcb,0),(vcb,0),(S("pkv_\(hd)_\(slot)",16),0)], groups: 1)
         }
         // attention (2-D: heads x chunks)
-        try b.dispatchGroups2D("attn_\(hd)_\(l)", buffers: [(outq,0),(LW("q_norm"),0),(cb,roff),(sb,roff),(kcb,0),(vcb,0),(partials,0),(attn,0),(S("parA_\(hd)",32),0)], width: nH, height: 32)
+        try b.dispatchGroups2D("attn_\(hd)_\(l)", buffers: [(outq,0),(LW("q_norm"),0),(cb,roff),(sb,roff),(kcb,0),(vcb,0),(partials,0),(attn,0),(S("parA_\(hd)_\(slot)",32),0)], width: nH, height: 32)
         // 73 o-proj + norms
         try b.dispatchGroups("oproj_\(qd)", buffers: [(attn,0),(LW("o_bits"),0),(LW("o_scale"),0),(pp73,0),(hidden,0),(LW("o_w12"),0),(y2,0),(sum2,0),(UF("p73_\(l)",[sc(l,"o_out"),sc(l,"gate_in"),0,0]),0)], groups: 192)
         // 74/95 gate/up ; 75/96 down
@@ -202,11 +212,12 @@ final class G4 {
     func forward(_ tok: MTLBuffer, _ pos: Int, _ hidden: MTLBuffer, argmax: MTLBuffer?,
                  gen: MTLBuffer? = nil, step: Int = 0, wait: Bool = true, prof: KernelProfiler? = nil) throws -> MTLCommandBuffer? {
         let H = C("H"), V = C("vocab")
-        writeStepUniforms(pos)
+        let slot = step % Self.RING
+        writeStepUniforms(pos, slot)
         let b = try runner.batch(profiler: prof)
         try embed(b, tok, hidden)
         let ple = try pleInput(b, tok, hidden)
-        for l in 0..<C("nL") { try layer(b, l, pos, hidden, ple) }
+        for l in 0..<C("nL") { try layer(b, l, pos, slot, hidden, ple) }
         let normed = S("normed", H*4)
         try b.dispatchGroups("rmssrq_69", buffers: [(hidden,0),(W("final_norm"),0),(normed,0),(S("sa",4),0),(UU("fn",[1,0,0,0]),0)], groups: 1)
         let logits = S("logits", V*4)
@@ -261,5 +272,65 @@ final class G4 {
             }
         }
         return (out, out.isEmpty ? 0 : Double(out.count) / Date().timeIntervalSince(t0))
+    }
+
+    // ---- interactive chat: keep the KV cache resident across turns so each
+    // turn only prefills the NEW framing tokens, not the whole transcript. ----
+    func chatReset() { chatPos = 0; chatCarry = nil }
+
+    // `frame` = this turn's user framing tokens (chat template already applied,
+    // BOS included on the first turn). Prefills them after the carried token,
+    // then greedily decodes until a `stop` token or `maxNew`.
+    //
+    // Decode is GPU-resident and *chunked* (same engine as `generate`): a chunk
+    // of forwards is committed without per-token waits so CPU command-recording
+    // overlaps GPU execution — that overlap is the whole difference between the
+    // ~90 tok/s per-token path and the ~170 tok/s chunked path. On `stop` we may
+    // have speculatively run a few forwards past the turn end; those extra KV
+    // slots are simply overwritten next turn (attention only reads [start..pos]),
+    // so we fix `chatPos`/`chatCarry` back to the true turn boundary. `onChunk`
+    // gets the full accepted-token list after each chunk syncs, for streaming.
+    @discardableResult
+    func chatTurn(_ frame: [UInt32], maxNew: Int, stop: Set<UInt32>, chunk: Int = 32,
+                  onChunk: ([UInt32]) -> Void) throws -> (tokens: [UInt32], tps: Double) {
+        let H = C("H")
+        let hidden = S("hidden", H*4), cur = S("cur", 4), gen = S("gen", 256*4)
+        let curP = cur.contents().bindMemory(to: UInt32.self, capacity: 1)
+        let genP = gen.contents().bindMemory(to: UInt32.self, capacity: 256)
+
+        // prefill everything except the last framing token (which seeds decode)
+        let pre = (chatCarry.map { [$0] } ?? []) + frame
+        for t in pre.dropLast() {
+            curP[0] = t
+            try forward(cur, chatPos, hidden, argmax: nil); chatPos += 1
+        }
+        curP[0] = pre.last!
+        let prefillEnd = chatPos            // slot where g_i lands = prefillEnd + i + 1
+
+        var out: [UInt32] = []
+        let cap = min(maxNew, 240)          // gen buffer holds 256 slots
+        var step = 0, stopped = false
+        let t0 = Date()                     // decode-rate timer (excludes prefill)
+        while step < cap && !stopped && chatPos < 2040 {
+            let end = min(step + chunk, cap)
+            var last: MTLCommandBuffer?
+            while step < end {
+                last = try forward(cur, chatPos, hidden, argmax: cur, gen: gen, step: step, wait: false)
+                chatPos += 1; step += 1
+            }
+            last?.waitUntilCompleted()
+            var i = out.count
+            while i < step {
+                let tk = genP[i]
+                if stop.contains(tk) {          // true turn end: rewind past the speculative tail
+                    stopped = true; chatCarry = tk; chatPos = prefillEnd + i + 1; break
+                }
+                out.append(tk); i += 1
+            }
+            onChunk(out)
+        }
+        if !stopped { chatCarry = curP[0] }     // last produced token, uncached; chatPos already correct
+        let dt = Date().timeIntervalSince(t0)
+        return (out, dt > 0 ? Double(step) / dt : 0)   // step = forwards run (incl. speculative tail)
     }
 }

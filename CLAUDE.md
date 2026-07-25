@@ -96,3 +96,9 @@ The translator emits **WGSL** (default) and **MSL** (`translate(fn, target="msl"
 - The translator targets WGSL first but must be backend-agnostic in structure (Metal, OpenCL planned).
 - `translate()` must be usable as a decorator or called directly on a function object.
 - The `matmul_wgpu.py` WGSL struct layout (`size: vec2<u32>` followed by `data: array<f32>`) is the reference format for storage buffers.
+
+
+## Links
+
+- https://huggingface.co/spaces/webml-community/gemma-4-webgpu-kernels
+- https://google-ai-edge.github.io/LiteRT-LM/web_demos/chat/index.html

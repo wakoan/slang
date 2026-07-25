@@ -10,7 +10,7 @@ MPS emits f16 and the dequantized weights lose the exact int-dot arithmetic, so
 this is a tolerance comparison, not bit-identity — deliberately, and the
 tolerance is reported rather than merely asserted.
 """
-import sys, time
+import os, sys, time
 
 import numpy as np
 
@@ -44,15 +44,20 @@ def main():
     tok = Tokenizer.from_file(TOKJSON)
     text = ("The history of computing begins long before the electronic computer. "
             "Mechanical calculators, punched cards and the theory of computation all "
-            "predate the first stored-program machines by decades. ") * 6
+            "predate the first stored-program machines by decades. ") * 40
     ids = ([g.bos] + tok.encode(text, add_special_tokens=False).ids)[:n]
     n = len(ids)
     print(f"prompt: {n} tokens")
 
+    # G4.prefill now DELEGATES to the batched path, so the reference must force
+    # the per-token one -- otherwise this compares batched against itself and
+    # reports a triumphant 0.0 divergence.
     zero(g)
+    os.environ["G4_BATCHED_PREFILL"] = "0"
     t0 = time.time()
     g.prefill(ids, 0)
     t_ref = time.time() - t0
+    os.environ["G4_BATCHED_PREFILL"] = "1"
     ref = snapshot(g, n)
 
     pf = PrefillGPU(g)

@@ -1,0 +1,20 @@
+[package]
+name = "gemma4_150"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gemma4_150"
+path = "src/main.rs"
+
+[dependencies]
+wgpu = "27"
+pollster = "0.3"
+bytemuck = "1"
+memmap2 = "0.9"
+serde_json = "1"
+regex = "1"
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+
+[profile.release]
+opt-level = 3

@@ -199,6 +199,21 @@ final class MetalRunner {
             cmdBuffer.waitUntilCompleted()
             profiler?.collect()
         }
+
+        /// Blit-copy a small region (e.g. the argmax token into the gen buffer).
+        func blitCopy(_ src: MTLBuffer, _ srcOff: Int, _ dst: MTLBuffer, _ dstOff: Int, _ len: Int) {
+            encoder?.endEncoding(); encoder = nil
+            let blit = cmdBuffer.makeBlitCommandEncoder()!
+            blit.copy(from: src, sourceOffset: srcOff, to: dst, destinationOffset: dstOff, size: len)
+            blit.endEncoding()
+        }
+
+        /// Commit without waiting (resident decode); returns the command buffer to wait on later.
+        @discardableResult func commit() -> MTLCommandBuffer {
+            encoder?.endEncoding(); encoder = nil
+            cmdBuffer.commit()
+            return cmdBuffer
+        }
     }
 
     func batch(profiler: KernelProfiler? = nil) throws -> CommandBatch {

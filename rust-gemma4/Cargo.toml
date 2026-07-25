@@ -1,0 +1,18 @@
+[package]
+name = "g4"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "g4"
+path = "src/main.rs"
+
+[dependencies]
+metal = "0.29"
+objc = "0.2"
+serde_json = "1"
+memmap2 = "0.9"
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+
+[profile.release]
+opt-level = 3

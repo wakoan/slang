@@ -128,3 +128,76 @@ def gemm_tiled(
 def gemm_groups(M: int, N: int) -> tuple[int, int]:
     """Workgroup grid for gemm_tiled at this output size (x = N, y = M)."""
     return ((N + TILE_N - 1) // TILE_N, (M + TILE_M - 1) // TILE_M)
+
+
+# ---------------------------------------------------------------------------
+# Decode kernels. Each one replaces a hand-written pair (a .metal in
+# kernels_msl/ and a .wgsl in reference/webml_gemma4_kernels/) and is verified
+# BIT-EXACT against the kernel it replaces before the pair is retired.
+# ---------------------------------------------------------------------------
+
+def srq(x: f32, s: f32) -> f32:
+    """Symmetric per-row quantization. s == 0 means the tensor is unquantized."""
+    if s == f32(0.0):
+        return x
+    return clamp(round(x / s), f32(-128.0), f32(127.0)) * s
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def rmssrq_69(
+    x: StorageBuffer[f32, "read"],
+    w: StorageBuffer[f32, "read"],
+    y: StorageBuffer[f32],
+    sum_a: StorageBuffer[f32],
+    p: Uniform[vec4[u32]],               # (rows, rowStride, bitcast(inScale), _)
+    sgp: WorkgroupArray[f32, 8],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """Fused weighted RMSNorm + SRQ + sum-of-quantized-activations, one row per
+    workgroup.
+
+    The sum is not incidental: the quantized matmuls need sum(a) to undo the
+    zero-point offset, so computing it here saves a whole pass over the row.
+
+    The cross-subgroup combine is inlined rather than factored into a helper
+    because DSL helpers take scalars only — a threadgroup array cannot be passed.
+    """
+    rows: u32 = p.x
+    stride: u32 = p.y
+    if stride == u32(0):
+        stride = rows
+    row: u32 = wg.x + wg.y * stride
+    if row < rows:
+        inScale: f32 = bitcast_f32(p.z)
+        base: u32 = row * u32(1536)
+
+        acc: f32 = f32(0.0)
+        for i in range(tid, 1536, 256):
+            v: f32 = x[base + i]
+            acc = acc + v * v
+        s1: f32 = subgroupAdd(acc)
+        if (tid & u32(31)) == u32(0):
+            sgp[tid >> u32(5)] = s1
+        barrier()
+        t1: f32 = f32(0.0)
+        for k in range(8):
+            t1 = t1 + sgp[k]
+        barrier()
+        sc: f32 = inverseSqrt(t1 / f32(1536.0) + f32(1e-6))
+
+        qAcc: f32 = f32(0.0)
+        for j in range(tid, 1536, 256):
+            q: f32 = srq(x[base + j] * sc * w[j], inScale)
+            y[base + j] = q
+            qAcc = qAcc + q
+        s2: f32 = subgroupAdd(qAcc)
+        if (tid & u32(31)) == u32(0):
+            sgp[tid >> u32(5)] = s2
+        barrier()
+        t2: f32 = f32(0.0)
+        for k2 in range(8):
+            t2 = t2 + sgp[k2]
+        barrier()
+        if tid == u32(0):
+            sum_a[row] = t2

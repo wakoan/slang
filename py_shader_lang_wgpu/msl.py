@@ -52,7 +52,15 @@ _MSL_ATOMICS = {
 
 _MSL_BITCASTS = {"bitcast_u32": "uint", "bitcast_f32": "float", "bitcast_i32": "int"}
 
+# WGSL builtins whose MSL spelling differs. Anything not listed passes through
+# unchanged, which is correct for the large shared set (dot/exp/clamp/round/…)
+# but silently emits an undefined symbol for a name that only LOOKS shared.
 _MSL_INTRINSICS = {
+    "inverseSqrt": "rsqrt",
+    "countOneBits": "popcount",
+    "countLeadingZeros": "clz",
+    "countTrailingZeros": "ctz",
+    "reverseBits": "reverse_bits",
     "f32": "float",
     "u32": "uint",
     "i32": "int",

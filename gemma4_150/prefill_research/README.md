@@ -134,7 +134,7 @@ Long-prompt quality (the open question from the f16-dequant work) now checked: a
 An earlier revision of this file reported **2.49×** for `gateup_95_b` and **1.00×**
 for `down_96_b`, and built a "~350–400 tok/s cheap path" on them. **Both numbers were
 wrong**, from two independent methodology bugs. Re-measure with
-`python -m gemma4_150.prefill_research.bench_batched [S]`, which now controls for both.
+`python -m gemma4_150.archive.prefill_research.bench_batched [S]`, which now controls for both.
 
 1. **Unfair baseline.** The S per-token decode dispatches were timed as S separate
    command buffers (commit + wait each) instead of S dispatches in one command

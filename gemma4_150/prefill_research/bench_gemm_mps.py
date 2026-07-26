@@ -23,7 +23,7 @@ import Metal
 import MetalPerformanceShaders as mps
 
 from gemma4_150.metal_runner import G4, KDIR, _SHARED, Batch
-from gemma4_150.prefill_research.bench_batched import warmup, _time
+from gemma4_150.archive.prefill_research.bench_batched import warmup, _time
 
 L = 20
 N_IN, N_OUT = 1536, 12288

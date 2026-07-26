@@ -74,7 +74,7 @@ Batched (M=S) variants of the two dominant matmuls — 2-bit gate/up (55.3% of p
 FLOPs) and 2-bit down (27.7%) — built to measure the real win before porting all ~7.
 Each thread holds a micro-tile of `N_ROWS` output rows × `SEQ` tokens, so **both**
 weight and activation loads are amortized. Reproduce with
-`python -m gemma4_150.prefill_research.bench_batched [S]`.
+`python -m gemma4_150.archive.prefill_research.bench_batched [S]`.
 
 | Kernel | blocking | S=8 | S=16 |
 |---|---|---:|---:|

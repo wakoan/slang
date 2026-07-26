@@ -21,7 +21,7 @@ prefill path are DSL-authored: embed, PLE gather/gate/proj, qkv, attention
 widths, every norm, logits, argmax, and all the batched prefill tails.
 
 **Not ported (2), deliberately.** `down_96_b` and `gateup_95_b` are used only by
-`prefill_research/bench_batched.py`. They are register-blocked token-batching
+`archive/prefill_research/bench_batched.py`. They are register-blocked token-batching
 matmuls from a route that was measured, falsified and closed (batching alone
 caps at ~1.3x; the dequant+GEMM route replaced it). They are research artifacts
 retained as evidence for that retraction, not production kernels, and porting

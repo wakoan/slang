@@ -29,7 +29,7 @@ final class G4 {
         repo = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         gdir = repo.appendingPathComponent("models/gemma-4-E2B-qat/g4_150")
-        kdir = repo.appendingPathComponent("gemma4_150/kernels_msl")
+        kdir = repo.appendingPathComponent("gemma4_150/kernels_gen")  // generated from kernels_dsl.py
         man = try JSONSerialization.jsonObject(with: Data(contentsOf: gdir.appendingPathComponent("manifest.json"))) as! [String: Any]
         cfg = man["config"] as! [String: Any]
         layers = man["layers"] as! [[String: Any]]
@@ -80,6 +80,11 @@ final class G4 {
             let oin = sc(l, "o_in")
             try runner.compileVariant(file: file("attn_101"), name: "attn_\(hd)_\(l)", replace: [
                 ("HEAD_DIM=512u", "HEAD_DIM=\(hd)u"), ("HALF_DIM=256u", "HALF_DIM=\(hd/2)u"),
+                // HD4/J_GROUPS/PP_COUNTER_BASE derive from HEAD_DIM and must be
+                // patched too. Omitting them leaves 256-wide layers running
+                // 512-wide constants: full speed, wrong output.
+                ("HD4=128u", "HD4=\(hd/4)u"), ("J_GROUPS=2u", "J_GROUPS=\(256/(hd/4))u"),
+                ("PP_COUNTER_BASE=131584u", "PP_COUNTER_BASE=\(8*32*(hd+2))u"),
                 ("OUT_Q=0.014886821620166302f", "OUT_Q=\(oin)f")])
             if !seenHd.contains(hd) {
                 seenHd.insert(hd)

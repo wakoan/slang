@@ -38,7 +38,7 @@ each backend loads its kernels from today:
 | `metal_runner.py` (PyObjC) | **kernels_dsl** | tokens identical, KV bit-identical |
 | `runner.py` (wgpu) | **kernels_dsl** | tokens identical vs captured WGSL |
 | browser (`server.py` + `app.js`) | **kernels_dsl** | headless Chrome: "**Paris**" at ~160 tok/s |
-| Swift, Rust | `kernels_msl/*.metal` | not started |
+| Swift, Rust | **kernels_gen** (generated) | "**Paris**" at 176 / 178 tok/s |
 
 Each gate compares the DEFAULT against the other source, so the direction flips
 when a backend switches over. Getting that wrong turns a gate into a no-op that
@@ -83,6 +83,24 @@ Three faults, found in order, each hidden by the previous one:
 
 The signature is worth remembering: **correct throughput, wrong output** points
 at specialization, not at the kernels. Empty output pointed at compilation.
+
+### Swift / Rust
+
+Neither can call the Python DSL at runtime, so `python -m gemma4_150.gen_msl`
+writes the kernels to `gemma4_150/kernels_gen/` and both backends read from
+there. `--check` reports drift without writing, for CI.
+
+`kernels_msl/` is left ALONE and stays hand-written. Generating into it — which
+is what I did first — overwrites the independent reference that every parity
+test and both gates compare against, silently turning the verification into a
+self-comparison. The failure was loud (a parity test and the decode gate both
+went red), but only because the fallback patch list happened to be incomplete;
+had it been complete, the gates would have passed while checking nothing.
+
+Both backends also needed attn_101's derived consts added to their replace
+lists — HD4/J_GROUPS/PP_COUNTER_BASE — the identical omission that broke the
+browser. Rust showed it first as "Please provide the correct correct answer" at
+full speed: the same correct-throughput/wrong-output signature.
 
 ## The lesson this port paid for
 

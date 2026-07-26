@@ -80,6 +80,12 @@ fn compile_all(r: &mut MetalRunner, layers: &[LayerInfo], kdir: &std::path::Path
         r.compile_variant(&file("attn_101"), &format!("attn_{hd}_{l}"), &[
             ("HEAD_DIM=512u", &format!("HEAD_DIM={hd}u")),
             ("HALF_DIM=256u", &format!("HALF_DIM={}u", hd / 2)),
+            // Derived from HEAD_DIM and equally required: leaving these at the
+            // 512-wide defaults runs every 256-wide layer with the wrong
+            // constants, at full speed and with nonsense output.
+            ("HD4=128u", &format!("HD4={}u", hd / 4)),
+            ("J_GROUPS=2u", &format!("J_GROUPS={}u", 256 / (hd / 4))),
+            ("PP_COUNTER_BASE=131584u", &format!("PP_COUNTER_BASE={}u", 8 * 32 * (hd + 2))),
             ("OUT_Q=0.014886821620166302f", &format!("OUT_Q={oin}f")),
         ])?;
         if seen_hd.insert(hd) {
@@ -113,7 +119,7 @@ impl G4 {
     pub fn new() -> Result<Self, String> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().parent().unwrap().to_path_buf();
         let gdir = root.join("models/gemma-4-E2B-qat/g4_150");
-        let kdir = root.join("gemma4_150/kernels_msl");
+        let kdir = root.join("gemma4_150/kernels_gen"); // generated from kernels_dsl.py
         let man: Value = serde_json::from_slice(
             &std::fs::read(gdir.join("manifest.json")).map_err(|e| e.to_string())?,
         )

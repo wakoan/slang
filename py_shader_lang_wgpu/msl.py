@@ -121,6 +121,16 @@ class _MSLTranslator(_WGSLTranslator):
         self._emit("#include <metal_stdlib>")
         self._emit("using namespace metal;")
         self._emit()
+        if self._consts_as_decls and self._consts:
+            # Spelled without spaces around '=' on purpose: the Swift and Rust
+            # backends specialize these by substring replace ("HEAD_DIM=512u"),
+            # so the generated form has to match what they already look for.
+            for cname, cval in self._consts.items():
+                if isinstance(cval, int) and not isinstance(cval, bool):
+                    self._emit(f"constant uint {cname}={cval}u;")
+                else:
+                    self._emit(f"constant float {cname}={float(cval)!r}f;")
+            self._emit()
         if self._uses(node, "workgroupUniformLoad"):
             self._emit("template <typename T> inline T _wgUniformLoad("
                        "threadgroup T& v) {")
@@ -129,8 +139,14 @@ class _MSLTranslator(_WGSLTranslator):
             self._emit("}")
             self._emit()
         self._emit_device_fns()
-        ws = ", ".join(str(s) for s in self._workgroup_size)
-        self._emit(f"// dispatch with threadsPerThreadgroup = ({ws})")
+        # 1-D sizes print as "(256)", not "(256, 1, 1)": the Swift/Rust backends
+        # parse this comment for the thread count AND patch it by exact string
+        # ("threadsPerThreadgroup = (256)"), so the shape has to match.
+        dims = list(self._workgroup_size)
+        while len(dims) > 1 and dims[-1] == 1:
+            dims.pop()
+        self._emit("// dispatch with threadsPerThreadgroup = ("
+                   + ", ".join(str(d) for d in dims) + ")")
 
         params: list[str] = []
         for group, idx, name, typ in bindings:

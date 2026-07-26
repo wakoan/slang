@@ -224,6 +224,13 @@ class _MSLTranslator(_WGSLTranslator):
             return f"_wgUniformLoad({args[0]})"
         if fn == "unpack2x16float":
             return f"float2(as_type<half2>({joined}))"
+        # WGSL returns vec4<u32>/vec4<i32>; MSL reinterprets the 4 bytes and
+        # converts. Callers wrap in vec4[f32](...) either way, so the extra
+        # conversion here is redundant on MSL rather than wrong.
+        if fn == "unpack4xU8":
+            return f"float4(as_type<uchar4>({joined}))"
+        if fn == "unpack4xI8":
+            return f"float4(as_type<char4>({joined}))"
         if fn in _MSL_INTRINSICS:
             return f"{_MSL_INTRINSICS[fn]}({joined})"
         return None

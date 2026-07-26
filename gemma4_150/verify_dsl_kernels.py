@@ -30,7 +30,7 @@ from gemma4_150.metal_runner import G4, TOKJSON
 # them under. Add a name here once its parity test passes.
 PORTED = ["rmssrq_69", "combine", "srqh_b", "srq_b", "geglu_b", "down_75",
           "embed_00", "plegather_01", "argmax1_34", "argmax2_35",
-          "rmsadd_b", "rmssrqh_b", "combine_b"]
+          "rmsadd_b", "rmssrqh_b", "combine_b", "proj_68", "plegate_76"]
 
 # Shape-parameterized kernels: one DSL source, one variant per layer geometry.
 # The runner registers these under keys like "kvnorm_256".

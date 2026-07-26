@@ -736,3 +736,138 @@ def combine_b(
         s = s / u32(2)
     rms: f32 = inverseSqrt(red[0] / f32(256.0) + f32(1e-6))
     outp[base] = (c * rms * nw[tid] + ple[base]) * f32(0.7071067811865476)
+
+
+def srq4(x: vec4[f32], s: f32) -> vec4[f32]:
+    """Vector SRQ. s == 0 means the tensor is unquantized."""
+    if s == f32(0.0):
+        return x
+    return clamp(round(x / s),
+                 vec4[f32](f32(-128.0), f32(-128.0), f32(-128.0), f32(-128.0)),
+                 vec4[f32](f32(127.0), f32(127.0), f32(127.0), f32(127.0))) * s
+
+
+@kernel(workgroup_size=(32, 1, 1))
+def proj_68(
+    a: StorageBuffer[f32, "read"],
+    wt: StorageBuffer[f16, "read"],
+    out: StorageBuffer[f32],
+    params: Uniform[vec4[u32]],          # (inScale, outScale, _, _)
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """Dense f16 GEMV for per_layer_model_projection, 8 output rows per
+    workgroup. One subgroup (32 threads) per workgroup, so the reduction is a
+    single subgroupAdd with no threadgroup memory at all.
+
+    The 8 rows are unrolled into 8 accumulators — the DSL has no local arrays,
+    and the sums are independent, so the arithmetic is unchanged.
+    """
+    inScale: f32 = bitcast_f32(params.x)
+    outScale: f32 = bitcast_f32(params.y)
+    rowBase: u32 = (wg.y * u32(1120) + wg.x) * u32(8)
+    if rowBase < u32(8960):
+        a0: f32 = f32(0.0)
+        a1: f32 = f32(0.0)
+        a2: f32 = f32(0.0)
+        a3: f32 = f32(0.0)
+        a4v: f32 = f32(0.0)
+        a5: f32 = f32(0.0)
+        a6: f32 = f32(0.0)
+        a7: f32 = f32(0.0)
+        for k4 in range(tid, 384, 32):
+            kb: u32 = k4 * u32(4)
+            av: vec4[f32] = srq4(vec4[f32](a[kb], a[kb + u32(1)],
+                                           a[kb + u32(2)], a[kb + u32(3)]), inScale)
+            for r in range(8):
+                o: u32 = rowBase + u32(r)
+                if o < u32(8960):
+                    wb: u32 = o * u32(1536) + kb
+                    w4: vec4[f32] = vec4[f32](f32(wt[wb]), f32(wt[wb + u32(1)]),
+                                              f32(wt[wb + u32(2)]), f32(wt[wb + u32(3)]))
+                    d: f32 = dot(w4, av)
+                    if r == 0:
+                        a0 = a0 + d
+                    if r == 1:
+                        a1 = a1 + d
+                    if r == 2:
+                        a2 = a2 + d
+                    if r == 3:
+                        a3 = a3 + d
+                    if r == 4:
+                        a4v = a4v + d
+                    if r == 5:
+                        a5 = a5 + d
+                    if r == 6:
+                        a6 = a6 + d
+                    if r == 7:
+                        a7 = a7 + d
+        s0: f32 = subgroupAdd(a0)
+        s1: f32 = subgroupAdd(a1)
+        s2: f32 = subgroupAdd(a2)
+        s3: f32 = subgroupAdd(a3)
+        s4: f32 = subgroupAdd(a4v)
+        s5: f32 = subgroupAdd(a5)
+        s6: f32 = subgroupAdd(a6)
+        s7: f32 = subgroupAdd(a7)
+        if tid == u32(0):
+            if rowBase < u32(8960):
+                out[rowBase] = srq(s0, outScale)
+            if rowBase + u32(1) < u32(8960):
+                out[rowBase + u32(1)] = srq(s1, outScale)
+            if rowBase + u32(2) < u32(8960):
+                out[rowBase + u32(2)] = srq(s2, outScale)
+            if rowBase + u32(3) < u32(8960):
+                out[rowBase + u32(3)] = srq(s3, outScale)
+            if rowBase + u32(4) < u32(8960):
+                out[rowBase + u32(4)] = srq(s4, outScale)
+            if rowBase + u32(5) < u32(8960):
+                out[rowBase + u32(5)] = srq(s5, outScale)
+            if rowBase + u32(6) < u32(8960):
+                out[rowBase + u32(6)] = srq(s6, outScale)
+            if rowBase + u32(7) < u32(8960):
+                out[rowBase + u32(7)] = srq(s7, outScale)
+
+
+@kernel(workgroup_size=(32, 1, 1))
+def plegate_76(
+    a: StorageBuffer[f32, "read"],
+    codes: StorageBuffer[u32, "read"],
+    row_scale: StorageBuffer[f32, "read"],
+    ple: StorageBuffer[f32, "read"],
+    out: StorageBuffer[f32],
+    gelu_lut: StorageBuffer[f32, "read"],
+    params: Uniform[vec4[u32]],          # (inScale, linOutScale, pleOffset, _)
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """PLE input gate: int8 (+128-biased) GEMV -> gelu-LUT -> * ple.
+
+    The +128 bias is undone in the epilogue via fma(s, 255, -128*aSum) rather
+    than per weight — unpack_unorm4x8 divides by 255, so both corrections fold
+    into one expression over the row sum.
+    """
+    inScale: f32 = bitcast_f32(params.x)
+    linOutScale: f32 = bitcast_f32(params.y)
+    o: u32 = wg.y * u32(256) + wg.x
+    if o < u32(256):
+        acc: f32 = f32(0.0)
+        aAcc: f32 = f32(0.0)
+        for wd in range(tid, 384, 32):
+            kb: u32 = wd * u32(4)
+            av: vec4[f32] = srq4(vec4[f32](a[kb], a[kb + u32(1)],
+                                           a[kb + u32(2)], a[kb + u32(3)]), inScale)
+            aAcc = aAcc + (av.x + av.y) + (av.z + av.w)
+            acc = acc + dot(unpack4x8unorm(codes[o * u32(384) + wd]), av)
+        aSum: f32 = subgroupAdd(aAcc)
+        s: f32 = subgroupAdd(acc)
+        if tid == u32(0):
+            v: f32 = row_scale[o] * fma(s, f32(255.0), f32(-128.0) * aSum)
+            qv: f32 = srq(v, linOutScale)
+            gv: f32 = f32(0.0)
+            if linOutScale == f32(0.0):
+                gv = gelu_tanh(qv)
+            else:
+                gv = gelu_lut[u32(clamp(round(qv / linOutScale),
+                                        f32(-128.0), f32(127.0)) + f32(128.0))]
+            out[o] = gv * ple[params.z + o]

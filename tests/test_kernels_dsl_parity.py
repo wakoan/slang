@@ -441,3 +441,52 @@ def test_combine_b_bit_exact(dev):
     ref = go(open(os.path.join(KDIR, "combine_b.metal")).read())
     got = go(translate(kernels_dsl.combine_b, target="msl"))
     assert np.array_equal(got, ref), f"max |d| {np.abs(got - ref).max():.3e}"
+
+
+def test_proj_68_bit_exact(dev):
+    IN, OUT, GRID = 1536, 8960, 1120
+    rng = np.random.default_rng(71)
+    a = rng.standard_normal(IN).astype(np.float32)
+    wt = (rng.standard_normal(OUT * IN) * 0.05).astype(np.float16)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        ba = dev.newBufferWithBytes_length_options_(a.tobytes(), a.nbytes, SH)
+        bw = dev.newBufferWithBytes_length_options_(wt.tobytes(), wt.nbytes, SH)
+        bo = dev.newBufferWithLength_options_(OUT * 4, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<ffII", 0.0234375, 0.03125, 0, 0), 16, SH)
+        _run(dev, _pso(dev, src, "proj_68"), (ba, bw, bo, bp), GRID, 32)
+        return np.frombuffer(bo.contents().as_buffer(OUT * 4), np.float32).copy()
+
+    ref = go(open(os.path.join(KDIR, "proj_68.metal")).read())
+    got = go(translate(kernels_dsl.proj_68, target="msl"))
+    assert np.array_equal(got, ref), f"max |d| {np.abs(got - ref).max():.3e}"
+    assert np.count_nonzero(got) > OUT // 2, "most outputs should be nonzero"
+
+
+@pytest.mark.parametrize("lin_scale", [0.0, 0.03125])
+def test_plegate_76_bit_exact(dev, lin_scale):
+    """lin_scale=0 takes the polynomial gelu; nonzero takes the LUT."""
+    OUT, WPR, K = 256, 384, 1536
+    rng = np.random.default_rng(72)
+    a = rng.standard_normal(K).astype(np.float32)
+    codes = rng.integers(0, 2 ** 32, size=OUT * WPR, dtype=np.uint64).astype(np.uint32)
+    row_scale = (rng.random(OUT).astype(np.float32) * 0.01 + 0.001)
+    ple = rng.standard_normal(OUT * 2).astype(np.float32)
+    lut = rng.standard_normal(256).astype(np.float32)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        bs = [dev.newBufferWithBytes_length_options_(x.tobytes(), x.nbytes, SH)
+              for x in (a, codes, row_scale, ple)]
+        bo = dev.newBufferWithLength_options_(OUT * 4, SH)
+        bl = dev.newBufferWithBytes_length_options_(lut.tobytes(), lut.nbytes, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<ffII", 0.0234375, lin_scale, OUT, 0), 16, SH)
+        _run(dev, _pso(dev, src, "plegate_76"), (*bs, bo, bl, bp), OUT, 32)
+        return np.frombuffer(bo.contents().as_buffer(OUT * 4), np.float32).copy()
+
+    ref = go(open(os.path.join(KDIR, "plegate_76.metal")).read())
+    got = go(translate(kernels_dsl.plegate_76, target="msl"))
+    assert np.array_equal(got, ref), f"max |d| {np.abs(got - ref).max():.3e}"

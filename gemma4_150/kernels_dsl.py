@@ -393,8 +393,12 @@ def down_75(
         lastFlag[0] = u32(0)
         if ticket == u32(383):
             lastFlag[0] = u32(1)
-    barrier()
-    if lastFlag[0] == u32(1):
+    # workgroupUniformLoad, not a plain read: it carries the barrier AND makes
+    # the value provably uniform, so the barriers inside this branch are legal.
+    # Dawn enforces that ("'workgroupBarrier' must only be called from uniform
+    # control flow"); naga does not, so a plain read compiles in wgpu-py and
+    # fails in the browser.
+    if workgroupUniformLoad(lastFlag[0]) == u32(1):
         if tid == u32(0):
             atomicStore(pp, u32(1536), u32(0))
         acc: f32 = f32(0.0)
@@ -919,8 +923,12 @@ def oproj_73(
         lastFlag[0] = u32(0)
         if tk == u32(191):
             lastFlag[0] = u32(1)
-    barrier()
-    if lastFlag[0] == u32(1):
+    # workgroupUniformLoad, not a plain read: it carries the barrier AND makes
+    # the value provably uniform, so the barriers inside this branch are legal.
+    # Dawn enforces that ("'workgroupBarrier' must only be called from uniform
+    # control flow"); naga does not, so a plain read compiles in wgpu-py and
+    # fails in the browser.
+    if workgroupUniformLoad(lastFlag[0]) == u32(1):
         if tid == u32(0):
             atomicStore(pp, u32(1536), u32(0))
         inScale2: f32 = bitcast_f32(params[1])
@@ -1045,8 +1053,12 @@ def pleproj_77(
         lastFlag[0] = u32(0)
         if tk == u32(95):
             lastFlag[0] = u32(1)
-    barrier()
-    if lastFlag[0] == u32(1):
+    # workgroupUniformLoad, not a plain read: it carries the barrier AND makes
+    # the value provably uniform, so the barriers inside this branch are legal.
+    # Dawn enforces that ("'workgroupBarrier' must only be called from uniform
+    # control flow"); naga does not, so a plain read compiles in wgpu-py and
+    # fails in the browser.
+    if workgroupUniformLoad(lastFlag[0]) == u32(1):
         if tid == u32(0):
             atomicStore(pp, u32(1536), u32(0))
         inScale: f32 = bitcast_f32(params.x)
@@ -1181,8 +1193,12 @@ def down_96(
         lastFlag[0] = u32(0)
         if ticket == u32(383):
             lastFlag[0] = u32(1)
-    barrier()
-    if lastFlag[0] == u32(1):
+    # workgroupUniformLoad, not a plain read: it carries the barrier AND makes
+    # the value provably uniform, so the barriers inside this branch are legal.
+    # Dawn enforces that ("'workgroupBarrier' must only be called from uniform
+    # control flow"); naga does not, so a plain read compiles in wgpu-py and
+    # fails in the browser.
+    if workgroupUniformLoad(lastFlag[0]) == u32(1):
         if tid == u32(0):
             atomicStore(pp, u32(1536), u32(0))
         acc: f32 = f32(0.0)
@@ -1683,8 +1699,7 @@ def attn_101(
         lastFlag[0] = u32(0)
         if tk == nActive - u32(1):
             lastFlag[0] = u32(1)
-    barrier()
-    if lastFlag[0] != u32(1):
+    if workgroupUniformLoad(lastFlag[0]) != u32(1):
         return
     if tid == u32(0):
         atomicStore(partials, u32(PP_COUNTER_BASE) + h, u32(0))

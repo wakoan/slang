@@ -16,7 +16,11 @@ const BGC = new Map();   // bind-group cache
 const PIPES = new Map(); // pipeline cache
 
 const U32 = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
-const UNI = GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST;
+// STORAGE as well as UNIFORM: attn_101's params struct is eight words, which
+// does not fit vec4<u32>, so the DSL kernel takes it as a read-only storage
+// binding. One buffer serves both bindings; without STORAGE here Dawn rejects
+// the bind group with "Binding usage (CopyDst|Uniform)".
+const UNI = GPUBufferUsage.UNIFORM | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
 
 // ---------- kernel text + shape patching ----------
 function patch(code, consts) {

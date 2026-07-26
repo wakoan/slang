@@ -44,25 +44,48 @@ Each gate compares the DEFAULT against the other source, so the direction flips
 when a backend switches over. Getting that wrong turns a gate into a no-op that
 passes unconditionally.
 
-### OPEN: the browser does not work on DSL kernels
+### FIXED en route: a real uniformity bug in five kernels
 
-`G4_KERNEL_SOURCE=dsl python -m gemma4_150.server` serves a correct-looking
-bundle — 18 kernels, entry point renamed to `main`, consts emitted as named
-declarations (`consts_as_decls`) so app.js can still patch per-layer shapes —
-and every one compiles under naga. But the page produces EMPTY output with an
-implausible 1860 tok/s, where the captured bundle gives
-"The capital of France is **Paris**." at 156.9. So dispatches are failing or
-being skipped rather than computing.
+Dawn rejected `oproj_73`, `down_75`, `down_96`, `pleproj_77` and `attn_101` with
+*"'workgroupBarrier' must only be called from uniform control flow"*. The
+last-arriver tail branches on a workgroup variable, and reading it directly
+leaves the branch non-uniform, so every barrier inside it is illegal WGSL.
 
-The default is therefore the captured bundle: shipping the browser broken to
-claim a milestone would be worse than not claiming it.
+The reference does `if (workgroupUniformLoad(&lastFlag) != 1u) { return; }` --
+that builtin carries the barrier AND makes the value provably uniform. The DSL
+has had `workgroupUniformLoad` since the atomics work; the port simply never
+used it. **naga accepts the plain read, so this was invisible in wgpu-py and
+only surfaced under Dawn** -- the same "Dawn is stricter than naga" pattern that
+caught a translator bug earlier in this project. All five now use it, and the
+Metal parity/gates are unchanged.
 
-Leads, in order: Dawn is stricter than naga and has caught translator bugs it
-tolerated before (the shift/paren fix in `translator._binop` came from exactly
-this), so the first step is reading the browser console rather than guessing —
-drive.mjs currently swallows it. Also worth checking that the device requests
-`shader-f16` for the kernels that emit `enable f16;`, and that no workgroup
-array exceeds Dawn's limits.
+### OPEN: the browser still computes the wrong answer
+
+`G4_KERNEL_SOURCE=dsl python -m gemma4_150.server` now serves a bundle where all
+18 kernels COMPILE under Dawn and the page runs at a plausible 161.5 tok/s
+(reference: 156.9) with no validation errors. But the generated text is garbage
+rather than empty, so the remaining fault is numerical, not structural.
+
+**Most likely cause, not yet confirmed: unpatched shape constants.** app.js
+patches the constant names the CAPTURED kernels use, and the DSL kernels do not
+use the same set:
+
+  * `101_srq` — app.js patches `HEAD_DIM`/`HALF_DIM`; the DSL kernel also needs
+    `HD4`, `J_GROUPS` and `PP_COUNTER_BASE`, which app.js does not know about,
+    so they keep their 512-wide values on every 256-wide layer.
+  * `73_sg_sum` — app.js patches `IN_FEATURES`/`WORDS_PER_ROW`; the DSL kernel
+    calls it `WPR`.
+
+Both would produce exactly this signature: correct speed, wrong numbers. The fix
+is to align the const names (or have app.js patch the DSL set); the diagnosis
+should be confirmed by dumping one layer's intermediate from the page first.
+
+The default stays on the captured bundle until it produces the right answer.
+
+Getting here needed two other fixes, both real: drive.mjs swallowed console
+errors (a failing shader looked like a successful empty run), and app.js created
+uniform buffers without STORAGE usage, which Dawn rejects for attn_101''s 8-word
+params binding.
 
 ## The lesson this port paid for
 

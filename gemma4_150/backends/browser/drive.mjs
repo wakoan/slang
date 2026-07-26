@@ -11,7 +11,25 @@ try {
   for (let i = 0; i < 100; i++) { try { const l = await fetch(`http://localhost:${PORT}/json`).then((r) => r.json()); t = l.find((x) => x.type === "page" && x.url.includes("localhost:8000") && x.webSocketDebuggerUrl); if (t) break; } catch {} await sleep(200); }
   if (!t) throw new Error("no page target");
   ws = new WebSocket(t.webSocketDebuggerUrl); await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
-  let id = 0; const pend = new Map(); ws.onmessage = (e) => { const m = JSON.parse(e.data); if (m.id && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id); } };
+  let id = 0; const pend = new Map();
+  // Page-side diagnostics are surfaced, not swallowed: without this a failing
+  // shader looks like a successful run with empty output.
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.id && pend.has(m.id)) { pend.get(m.id)(m); pend.delete(m.id); return; }
+    if (m.method === "Runtime.consoleAPICalled") {
+      const t = (m.params.args || []).map(function (a) {
+        if (a.value !== undefined) return String(a.value);
+        var pr = (a.preview && a.preview.properties) || [];
+        var kv = pr.map(function (q) { return q.name + "=" + q.value; }).join(" ");
+        return kv || a.description || "";
+      }).join(" ");
+      if (t) console.log(`[console.${m.params.type}] ${t.slice(0, 500)}`);
+    } else if (m.method === "Runtime.exceptionThrown") {
+      const d = m.params.exceptionDetails;
+      console.log(`[exception] ${(d.exception?.description || d.text || "").slice(0, 700)}`);
+    }
+  };
   const ev = (expr, tmo = 300000) => new Promise((res) => { const i = ++id; pend.set(i, res); ws.send(JSON.stringify({ id: i, method: "Runtime.evaluate", params: { expression: expr, awaitPromise: true, returnByValue: true, timeout: tmo } })); });
   await new Promise((res) => { const i = ++id; pend.set(i, res); ws.send(JSON.stringify({ id: i, method: "Runtime.enable" })); });
   let ready = false;

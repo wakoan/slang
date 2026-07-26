@@ -604,6 +604,14 @@ class _WGSLTranslator:
         if isinstance(node, ast.BoolOp):
             return self._boolop(node, prec)
         if isinstance(node, ast.Call):
+            # Vector constructor: vec4[f32](a, b, c, d). Spelled with the element
+            # type because the DSL does not infer types, and the backends need it
+            # — WGSL can write vec4(...) and infer, MSL cannot: it needs float4.
+            if isinstance(node.func, ast.Subscript) \
+                    and isinstance(node.func.value, ast.Name) \
+                    and node.func.value.id in ("vec2", "vec3", "vec4"):
+                ty = self._vec_ctor(node.func.value.id, node.func.slice)
+                return f"{ty}({', '.join(self._expr(a) for a in node.args)})"
             # raw name (no identifier mangling): renaming/mangling of call
             # targets is _render_call's job, keyed on the Python-level name
             if isinstance(node.func, ast.Name):
@@ -760,6 +768,10 @@ class _WGSLTranslator:
     def _call_special(self, fn: str, args: list[str]) -> str | None:
         return None
 
+    def _vec_ctor(self, vec_name: str, slice_node: ast.expr) -> str:
+        """Spelling of a vector constructor: WGSL keeps vecN<T>."""
+        return f"{vec_name}<{self._ann_to_wgsl(slice_node)}>"
+
     def _render_call(self, fn: str, args: list[str]) -> str:
         special = self._call_special(fn, args)
         if special is not None:
@@ -852,12 +864,18 @@ def translate(func: Callable, workgroup_size: tuple[int, ...] | None = None,
             for k, v in typing.get_type_hints(func).items()
             if k != "return"
         }
-    except Exception:
-        annotations = {
-            k: v
-            for k, v in func.__annotations__.items()
-            if k != "return"
-        }
+    except Exception as exc:
+        # `from __future__ import annotations` makes every annotation a string,
+        # so if resolution fails the fallback hands the translator raw strings
+        # and it reports the FIRST parameter as unsupported — pointing nowhere
+        # near the real problem (typically one undefined name, e.g. a type the
+        # kernel module forgot to import). Say what actually went wrong.
+        raise TranslationError(
+            f"Could not resolve type annotations for {func.__name__!r}: "
+            f"{type(exc).__name__}: {exc}\n"
+            "Every type used in the signature must be imported in the module "
+            "defining the kernel."
+        ) from exc
     if target == "wgsl":
         cls = _WGSLTranslator
     elif target == "msl":

@@ -56,6 +56,10 @@ _MSL_BITCASTS = {"bitcast_u32": "uint", "bitcast_f32": "float", "bitcast_i32": "
 # unchanged, which is correct for the large shared set (dot/exp/clamp/round/…)
 # but silently emits an undefined symbol for a name that only LOOKS shared.
 _MSL_INTRINSICS = {
+    "unpack4x8unorm": "unpack_unorm4x8_to_float",
+    "unpack4x8snorm": "unpack_snorm4x8_to_float",
+    "pack4x8unorm": "pack_float_to_unorm4x8",
+    "pack4x8snorm": "pack_float_to_snorm4x8",
     "inverseSqrt": "rsqrt",
     "countOneBits": "popcount",
     "countLeadingZeros": "clz",
@@ -189,6 +193,10 @@ class _MSLTranslator(_WGSLTranslator):
                     stop: str, incr: str) -> str:
         ty = _MSL_SCALARS[loop_ty]
         return f"for ({ty} {var} = {start}; {var} {cmp} {stop}; {incr}) {{"
+
+    def _vec_ctor(self, vec_name: str, slice_node: ast.expr) -> str:
+        """MSL spells vectors as float4/uint4/half4, not vec4<T>."""
+        return f"{self._ann_to_wgsl(slice_node)}{vec_name[3]}"
 
     def _call_special(self, fn: str, args: list[str]) -> str | None:
         joined = ", ".join(args)

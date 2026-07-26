@@ -28,7 +28,7 @@ from gemma4_150.metal_runner import G4, TOKJSON
 
 # Kernels ported to gemma4_150/kernels_dsl.py, by the key the runner compiles
 # them under. Add a name here once its parity test passes.
-PORTED = ["rmssrq_69", "combine", "srqh_b", "srq_b", "geglu_b"]
+PORTED = ["rmssrq_69", "combine", "srqh_b", "srq_b", "geglu_b", "down_75"]
 
 PROMPT = "Write a 200-word essay about the sea."
 

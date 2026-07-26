@@ -210,3 +210,47 @@ def test_combine_bit_exact(dev):
     ref = go(open(os.path.join(KDIR, "combine.metal")).read())
     got = go(translate(kernels_dsl.combine, target="msl"))
     assert np.array_equal(got, ref), f"max |d| {np.abs(got - ref).max():.3e}"
+
+
+def test_down_75_bit_exact(dev):
+    """The atomic last-arriver kernel — the one the DSL needed atomics for.
+
+    Exercises everything the easy tier did not: an atomic buffer, a
+    cross-workgroup ticket merge, a device-scope barrier, 4-bit unpacking,
+    subgroup reduction over a vec4, and a self-resetting counter.
+    """
+    OUT_F, WPR, CHUNKS, N_ROWS = 1536, 768, 2, 4
+    TOTAL_WGS = OUT_F // N_ROWS
+    rng = np.random.default_rng(21)
+    a = (rng.standard_normal(WPR * CHUNKS * 4) * 2.0).astype(np.float16)
+    bits = rng.integers(0, 2 ** 32, size=OUT_F * WPR, dtype=np.uint64).astype(np.uint32)
+    scale = (rng.random(OUT_F).astype(np.float32) * 0.01 + 0.001)
+    hidden0 = rng.standard_normal(OUT_F).astype(np.float32)
+    nw = rng.standard_normal(OUT_F).astype(np.float32)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        ba = dev.newBufferWithBytes_length_options_(a.tobytes(), a.nbytes, SH)
+        bb = dev.newBufferWithBytes_length_options_(bits.tobytes(), bits.nbytes, SH)
+        bpp = dev.newBufferWithLength_options_((OUT_F + 1) * 4, SH)
+        bpp.contents().as_buffer((OUT_F + 1) * 4)[:] = b"\x00" * ((OUT_F + 1) * 4)
+        bsc = dev.newBufferWithBytes_length_options_(scale.tobytes(), scale.nbytes, SH)
+        bh = dev.newBufferWithBytes_length_options_(hidden0.tobytes(), hidden0.nbytes, SH)
+        bn = dev.newBufferWithBytes_length_options_(nw.tobytes(), nw.nbytes, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<ffII", 0.00787, 0.0234375, 0, 0), 16, SH)
+        _run(dev, _pso(dev, src, "down_75"),
+             (ba, bb, bpp, bsc, bh, bn, bp), TOTAL_WGS, WG)
+        h = np.frombuffer(bh.contents().as_buffer(OUT_F * 4), np.float32).copy()
+        ctr = np.frombuffer(bpp.contents().as_buffer((OUT_F + 1) * 4), np.uint32)[OUT_F]
+        return h, int(ctr)
+
+    ref_h, ref_ctr = go(open(os.path.join(KDIR, "down_75.metal")).read())
+    got_h, got_ctr = go(translate(kernels_dsl.down_75, target="msl"))
+
+    assert got_h.shape == ref_h.shape
+    assert np.array_equal(got_h, ref_h), (
+        f"hidden differs: max |d| {np.abs(got_h - ref_h).max():.3e}")
+    # the counter must self-reset, or the NEXT token's merge never fires
+    assert got_ctr == 0 == ref_ctr, f"counter left at {got_ctr} (ref {ref_ctr})"
+    assert not np.array_equal(got_h, hidden0), "kernel did not write hidden"

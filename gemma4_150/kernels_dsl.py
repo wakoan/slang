@@ -18,7 +18,8 @@ Python ints for the host side to compute dispatch geometry from.
 from __future__ import annotations
 
 from py_shader_lang_wgpu import (
-    kernel, u32, f32, f16, vec4, StorageBuffer, Uniform, WorkgroupArray, Builtin,
+    kernel, u32, f32, f16, vec4, StorageBuffer, AtomicBuffer, Uniform,
+    WorkgroupArray, Builtin,
 )
 
 # Tile geometry. TILE_M x TILE_N output tile per workgroup, TILE_K deep,
@@ -306,3 +307,127 @@ def combine(
         s = s / u32(2)
     rms: f32 = inverseSqrt(red[0] / f32(256.0) + f32(1e-6))
     outp[base] = (c * rms * nw[tid] + ple[base]) * f32(0.7071067811865476)
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def down_75(
+    a: StorageBuffer[vec4[f16], "read"],     # activations, 2 half4 per packed word
+    bits_buf: StorageBuffer[u32, "read"],    # 4-bit weights, WPR words per row
+    pp: AtomicBuffer[u32],                   # [0,OUT_F) partials, [CTR] ticket
+    scale: StorageBuffer[f32, "read"],
+    hidden: StorageBuffer[f32],
+    nw: StorageBuffer[f32, "read"],
+    params: Uniform[vec4[u32]],              # (inScale, outScale, _, _) bitcast
+    sgq: WorkgroupArray[vec4[f32], 8],
+    sgs: WorkgroupArray[f32, 8],
+    dsh: WorkgroupArray[f32, 1536],
+    lastFlag: WorkgroupArray[u32, 1],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """Fused 4-bit down-projection + post-FFN residual norm-add, in ONE dispatch.
+
+    Each workgroup owns N_ROWS=4 output rows, publishes them through the atomic
+    buffer, and takes a ticket; whichever workgroup draws the last ticket
+    (TOTAL_WGS-1) re-reads every partial and finishes the RMSNorm-add itself.
+    That is what saves a second dispatch and a round trip — and it is the reason
+    the DSL needed atomics at all.
+
+    The counter self-resets at [CTR] so the next token starts clean without a
+    host-side clear.
+
+    N_ROWS is unrolled into four accumulators rather than a loop over a local
+    array: the DSL has no local arrays, and the four sums are independent, so
+    unrolling preserves the arithmetic exactly.
+    """
+    rowBase: u32 = wg.x * u32(4)
+    inScale: f32 = bitcast_f32(params.x)
+    q0: f32 = f32(0.0)
+    q1: f32 = f32(0.0)
+    q2: f32 = f32(0.0)
+    q3: f32 = f32(0.0)
+    sumA: f32 = f32(0.0)
+
+    for w in range(tid, 768, 256):
+        av0: vec4[f32] = vec4[f32](a[w * u32(2)])
+        av1: vec4[f32] = vec4[f32](a[w * u32(2) + u32(1)])
+        sumA = sumA + (av0.x + av0.y + av0.z + av0.w) + (av1.x + av1.y + av1.z + av1.w)
+        if rowBase < u32(1536):
+            p0: u32 = bits_buf[rowBase * u32(768) + w]
+            lo0: vec4[f32] = unpack4x8unorm(p0 & u32(0x0F0F0F0F))
+            hi0: vec4[f32] = unpack4x8unorm((p0 >> u32(4)) & u32(0x0F0F0F0F))
+            q0 = q0 + dot(vec4[f32](lo0.x, hi0.x, lo0.y, hi0.y), av0) \
+                    + dot(vec4[f32](lo0.z, hi0.z, lo0.w, hi0.w), av1)
+        if rowBase + u32(1) < u32(1536):
+            p1: u32 = bits_buf[(rowBase + u32(1)) * u32(768) + w]
+            lo1: vec4[f32] = unpack4x8unorm(p1 & u32(0x0F0F0F0F))
+            hi1: vec4[f32] = unpack4x8unorm((p1 >> u32(4)) & u32(0x0F0F0F0F))
+            q1 = q1 + dot(vec4[f32](lo1.x, hi1.x, lo1.y, hi1.y), av0) \
+                    + dot(vec4[f32](lo1.z, hi1.z, lo1.w, hi1.w), av1)
+        if rowBase + u32(2) < u32(1536):
+            p2: u32 = bits_buf[(rowBase + u32(2)) * u32(768) + w]
+            lo2: vec4[f32] = unpack4x8unorm(p2 & u32(0x0F0F0F0F))
+            hi2: vec4[f32] = unpack4x8unorm((p2 >> u32(4)) & u32(0x0F0F0F0F))
+            q2 = q2 + dot(vec4[f32](lo2.x, hi2.x, lo2.y, hi2.y), av0) \
+                    + dot(vec4[f32](lo2.z, hi2.z, lo2.w, hi2.w), av1)
+        if rowBase + u32(3) < u32(1536):
+            p3: u32 = bits_buf[(rowBase + u32(3)) * u32(768) + w]
+            lo3: vec4[f32] = unpack4x8unorm(p3 & u32(0x0F0F0F0F))
+            hi3: vec4[f32] = unpack4x8unorm((p3 >> u32(4)) & u32(0x0F0F0F0F))
+            q3 = q3 + dot(vec4[f32](lo3.x, hi3.x, lo3.y, hi3.y), av0) \
+                    + dot(vec4[f32](lo3.z, hi3.z, lo3.w, hi3.w), av1)
+
+    red: vec4[f32] = subgroupAdd(vec4[f32](q0, q1, q2, q3))
+    redA: f32 = subgroupAdd(sumA)
+    if (tid & u32(31)) == u32(0):
+        sgq[tid >> u32(5)] = red
+        sgs[tid >> u32(5)] = redA
+    barrier()
+
+    if tid == u32(0):
+        tot: vec4[f32] = vec4[f32](f32(0.0), f32(0.0), f32(0.0), f32(0.0))
+        aSum: f32 = f32(0.0)
+        for i in range(8):
+            tot = tot + sgq[i]
+            aSum = aSum + sgs[i]
+        outScale: f32 = bitcast_f32(params.y)
+        zpA: f32 = f32(8.0) * aSum
+        if rowBase < u32(1536):
+            d0: f32 = srq(scale[rowBase] * (inScale * fma(tot.x, f32(255.0), -zpA)), outScale)
+            atomicStore(pp, rowBase, bitcast_u32(d0))
+        if rowBase + u32(1) < u32(1536):
+            d1: f32 = srq(scale[rowBase + u32(1)] * (inScale * fma(tot.y, f32(255.0), -zpA)), outScale)
+            atomicStore(pp, rowBase + u32(1), bitcast_u32(d1))
+        if rowBase + u32(2) < u32(1536):
+            d2: f32 = srq(scale[rowBase + u32(2)] * (inScale * fma(tot.z, f32(255.0), -zpA)), outScale)
+            atomicStore(pp, rowBase + u32(2), bitcast_u32(d2))
+        if rowBase + u32(3) < u32(1536):
+            d3: f32 = srq(scale[rowBase + u32(3)] * (inScale * fma(tot.w, f32(255.0), -zpA)), outScale)
+            atomicStore(pp, rowBase + u32(3), bitcast_u32(d3))
+
+    storageBarrier()
+    if tid == u32(0):
+        ticket: u32 = atomicAdd(pp, u32(1536), u32(1))
+        lastFlag[0] = u32(0)
+        if ticket == u32(383):
+            lastFlag[0] = u32(1)
+    barrier()
+    if lastFlag[0] == u32(1):
+        if tid == u32(0):
+            atomicStore(pp, u32(1536), u32(0))
+        acc: f32 = f32(0.0)
+        for o2 in range(tid, 1536, 256):
+            d: f32 = bitcast_f32(atomicLoad(pp, o2))
+            dsh[o2] = d
+            acc = acc + d * d
+        s1: f32 = subgroupAdd(acc)
+        if (tid & u32(31)) == u32(0):
+            sgs[tid >> u32(5)] = s1
+        barrier()
+        t1: f32 = f32(0.0)
+        for i2 in range(8):
+            t1 = t1 + sgs[i2]
+        barrier()
+        rms: f32 = inverseSqrt(t1 / f32(1536.0) + f32(1e-6))
+        for o3 in range(tid, 1536, 256):
+            hidden[o3] = hidden[o3] + dsh[o3] * rms * nw[o3]

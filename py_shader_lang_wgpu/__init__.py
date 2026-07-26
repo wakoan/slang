@@ -3,7 +3,7 @@
 from .types import (
     u32, f32, f16, i32, bool_,
     vec2, vec3, vec4,
-    StorageBuffer, AtomicBuffer, Uniform, Builtin, WorkgroupArray,
+    StorageBuffer, AtomicBuffer, Uniform, Builtin, WorkgroupArray, PrivateArray,
     WGSLType, StorageBufferType, AtomicBufferType, UniformType, BuiltinValue,
     WorkgroupArrayType,
 )
@@ -14,6 +14,7 @@ __all__ = [
     "u32", "f32", "f16", "i32", "bool_",
     "vec2", "vec3", "vec4",
     "StorageBuffer", "AtomicBuffer", "Uniform", "Builtin", "WorkgroupArray",
+    "PrivateArray",
     # Type classes (for isinstance checks / custom types)
     "WGSLType", "StorageBufferType", "AtomicBufferType", "UniformType",
     "BuiltinValue", "WorkgroupArrayType",

@@ -37,13 +37,7 @@ PORTED = ["rmssrq_69", "combine", "srqh_b", "srq_b", "geglu_b", "down_75",
 # keys like "kvnorm_256" / "oproj_2048", built by string-patching the .metal.
 SPECIALIZED = (
     [("kvnorm", f"kvnorm_{hd}", {"HD": hd, "HALF": hd // 2}, hd) for hd in (256, 512)]
-    # NB oproj_73 is NOT here. It is bit-exact against the reference in the
-    # parity tests (10 seeds, both q_dim shapes, and a single dispatch on the
-    # model's own buffers for a sliding AND a full layer) — yet swapping it
-    # alone changes greedy decode from token 161 onward, reproducibly, while
-    # stock-vs-stock is deterministic over 4 runs. Something input-dependent
-    # differs that synthetic and single-dispatch checks do not reach; until it
-    # is found the kernel stays out of the runner. See PORT_NOTES.md.
+    + [("oproj_73", f"oproj_{qd}", {"WPR": qd // 8}, 256) for qd in (2048, 4096)]
 )
 
 PROMPT = "Write a 200-word essay about the sea."

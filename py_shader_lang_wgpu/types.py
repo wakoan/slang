@@ -155,6 +155,46 @@ class _WorkgroupArrayFactory:
 WorkgroupArray = _WorkgroupArrayFactory()
 
 
+class PrivateArrayType(WGSLType):
+    """A small fixed-size array in PRIVATE (per-thread) memory.
+
+    Declared inside a kernel body, not as a parameter:
+
+        hloc: PrivateArray[f32, 6]
+
+    Exists because per-thread scratch is not interchangeable with anything else.
+    Substituting a re-read of device memory, or a set of scalars, is
+    semantically equivalent and still changes results: Metal compiles with fast
+    math by default, so multiply-add contraction depends on the expression tree,
+    and an array element is treated differently from a scalar. That cost a real
+    debugging cycle (see gemma4_150/PORT_NOTES.md).
+    """
+
+    def __init__(self, elem_type: WGSLType, size: int) -> None:
+        self.elem_type = elem_type
+        self.size = size
+        super().__init__(f"array<{elem_type.wgsl_name}, {size}>")
+
+    def __repr__(self) -> str:
+        return f"PrivateArray[{self.elem_type!r}, {self.size}]"
+
+
+class _PrivateArrayFactory:
+    """Usage: PrivateArray[f32, 6] — per-thread scratch inside a kernel body."""
+
+    def __getitem__(self, args: tuple) -> PrivateArrayType:
+        elem_type, size = args
+        if not isinstance(size, int) or size < 1:
+            raise TypeError("PrivateArray size must be a positive int literal")
+        return PrivateArrayType(elem_type, size)
+
+    def __repr__(self) -> str:
+        return "PrivateArray"
+
+
+PrivateArray = _PrivateArrayFactory()
+
+
 class BuiltinValue(WGSLType):
     """A WGSL @builtin parameter value."""
 

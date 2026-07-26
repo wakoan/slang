@@ -180,11 +180,20 @@ class _MSLTranslator(_WGSLTranslator):
     # Backend hooks                                                        #
     # ------------------------------------------------------------------ #
 
+    def _array_decl(self, elem: str, size: int) -> str:
+        # marker consumed by _decl_typed; MSL needs "float x[6]", not "T x"
+        return f"{elem}\x00{size}"
+
     def _decl_infer(self, name: str, value: str, mutable: bool) -> str:
         kw = "auto" if mutable else "const auto"
         return f"{kw} {name} = {value};"
 
     def _decl_typed(self, target: str, type_str: str, value: str | None) -> str:
+        if "\x00" in type_str:                       # PrivateArray
+            elem, size = type_str.split("\x00")
+            if value is not None:
+                raise TranslationError("PrivateArray cannot have an initializer")
+            return f"{elem} {target}[{size}];"
         if value is None:
             return f"{type_str} {target};"
         return f"{type_str} {target} = {value};"
@@ -245,4 +254,8 @@ class _MSLTranslator(_WGSLTranslator):
                 and node.value.id in ("vec2", "vec3", "vec4"):
             inner = self._ann_to_wgsl(node.slice)
             return f"{inner}{node.value.id[3]}"
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) \
+                and node.value.id == "PrivateArray":
+            elem, size = node.slice.elts
+            return self._array_decl(self._ann_to_wgsl(elem), self._const_size(size))
         raise TranslationError(f"Unsupported annotation: {ast.dump(node)}")

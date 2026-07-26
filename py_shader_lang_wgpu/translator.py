@@ -765,6 +765,19 @@ class _WGSLTranslator:
         kw = "var" if mutable else "let"
         return f"{kw} {name} = {value};"
 
+    def _const_size(self, node: ast.expr) -> int:
+        """Array length must be a literal (or a folded const)."""
+        if isinstance(node, ast.Name) and node.id in self._consts:
+            return int(self._consts[node.id])
+        n = _const_int(node)
+        if n is None or n < 1:
+            raise TranslationError("PrivateArray length must be a positive literal")
+        return n
+
+    def _array_decl(self, elem: str, size: int) -> str:
+        """WGSL spells the type; MSL puts the length after the NAME (see msl.py)."""
+        return f"array<{elem}, {size}>"
+
     def _decl_typed(self, target: str, type_str: str, value: str | None) -> str:
         if value is None:
             return f"var {target}: {type_str};"
@@ -827,6 +840,9 @@ class _WGSLTranslator:
         if isinstance(node, ast.Subscript):
             if isinstance(node.value, ast.Name) and node.value.id in _VEC_NAMES:
                 return f"{node.value.id}<{self._ann_to_wgsl(node.slice)}>"
+            if isinstance(node.value, ast.Name) and node.value.id == "PrivateArray":
+                elem, size = node.slice.elts
+                return self._array_decl(self._ann_to_wgsl(elem), self._const_size(size))
             raise TranslationError(f"Unsupported generic annotation: {ast.dump(node)}")
         if isinstance(node, ast.Attribute):
             raise TranslationError(

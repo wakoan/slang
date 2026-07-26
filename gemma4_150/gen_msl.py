@@ -63,6 +63,7 @@ SPECS = {
     "smax_b": ((256, 1, 1), {}),
     "kvnorm_b": ((256, 1, 1), {"HD": 256, "HALF": 128}),
     "qprep_b": ((512, 1, 1), {"HEAD_DIM": 512, "HALF_DIM": 256}),
+    "dq_f16": ((256, 1, 1), {"BITS": 2}),
     "attn_prefill": ((256, 1, 1), {"HEAD_DIM": 512, "HALF_DIM": 256, "HD4": 128,
                                    "J_GROUPS": 2,
                                    "OUT_Q": 0.014886821620166302}),

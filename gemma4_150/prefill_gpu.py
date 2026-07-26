@@ -81,10 +81,16 @@ class PrefillGPU:
             # looks like a win on the clock and is simply wrong.
             pso, _ = g.kernels["gemm_tiled"]
             g.kernels["gemm_tiled"] = (pso, Metal.MTLSizeMake(*gemm_tiled.workgroup_size))
-        src = open(DQ).read()
+        # dq_f16 comes from the DSL like everything else; the research .metal
+        # in prefill_research/ is now only the parity reference.
+        from py_shader_lang_wgpu import translate
+        from gemma4_150.kernels_dsl import dq_f16
         for nb in (2, 4, 8):
             if f"dq{nb}" not in g.kernels:
-                g._compile_one(src.replace("BITS = 2u", f"BITS = {nb}u"), "dq_f16", f"dq{nb}")
+                src = (translate(dq_f16, workgroup_size=(256, 1, 1), target="msl",
+                                 consts={"BITS": nb}) if g.USE_DSL
+                       else open(DQ).read().replace("BITS = 2u", f"BITS = {nb}u"))
+                g._compile_one(src, "dq_f16", f"dq{nb}")
         kf = lambda n: os.path.join(KDIR, n + ".metal")
         seen = set()
         for l in range(g.nL):

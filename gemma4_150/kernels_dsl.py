@@ -2079,3 +2079,43 @@ def attn_prefill(
             invd: f32 = f32(1.0) / st[1]
             for d5 in range(tid, HEAD_DIM, 256):
                 out[qBase + d5] = srq(out_acc[d5] * invd, f32(OUT_Q))
+
+
+@kernel(workgroup_size=(256, 1, 1), consts={"BITS": 2})
+def dq_f16(
+    bits: StorageBuffer[u32, "read"],
+    scale: StorageBuffer[f32, "read"],
+    out: StorageBuffer[f16],
+    p: Uniform[vec4[u32]],               # (n_in, n_out, _, _)
+    gid: Builtin.global_invocation_id,
+):
+    """Dequantize a QAT weight matrix to plain f16 so a GEMM can consume it.
+
+    One kernel for all three widths; BITS is a const (2 / 4 / 8).
+
+        w = row_scale[o] * (q - ZP),   ZP = 1 << (BITS-1)   -> 2 / 8 / 128
+
+    Values are byte-major then low-bits-first within the byte, so value i sits
+    at bit 8*(i/(8/BITS)) + BITS*(i%(8/BITS)). Getting that order wrong is
+    silent — the dot products just pair the wrong operands — which is why the
+    test checks it EXACTLY against a float64 reconstruction rather than to a
+    tolerance.
+
+    One thread per packed word.
+    """
+    VPW: u32 = u32(32) / u32(BITS)
+    PER_BYTE: u32 = u32(8) / u32(BITS)
+    ZP: f32 = f32(1 << (BITS - 1))
+    MASK: u32 = u32((1 << BITS) - 1)
+    WPR: u32 = p.x / VPW
+    if gid.x < p.y * WPR:
+        o: u32 = gid.x / WPR
+        w: u32 = gid.x % WPR
+        packed: u32 = bits[gid.x]
+        s: f32 = scale[o]
+        base: u32 = o * p.x + w * VPW
+        i: u32 = u32(0)
+        while i < VPW:
+            q: u32 = (packed >> (u32(8) * (i / PER_BYTE) + u32(BITS) * (i % PER_BYTE))) & MASK
+            out[base + i] = f16(s * (f32(q) - ZP))
+            i = i + u32(1)

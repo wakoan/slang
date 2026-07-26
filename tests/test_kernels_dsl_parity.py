@@ -779,3 +779,47 @@ def test_attn_101_bit_exact(dev, hd, key_len):
     assert np.array_equal(got_c, ref_c), f"counters {got_c} vs {ref_c}"
     assert np.count_nonzero(ref_c) == 0, "counters must self-reset for the next token"
     assert np.count_nonzero(got_o), "attention wrote nothing"
+
+
+@pytest.mark.parametrize("nbits", [2, 4, 8])
+def test_dq_f16_bit_exact(dev, nbits):
+    """Dequant at all three widths, against the hand-written research kernel.
+
+    Also checked EXACTLY against a float64 reconstruction: a wrong lane order is
+    silent (the dot products merely pair the wrong operands), so a tolerance
+    test would not catch it.
+    """
+    import os as _os
+    n_in, n_out = 256, 64
+    vpw, per_byte = 32 // nbits, 8 // nbits
+    zp, mask = 1 << (nbits - 1), (1 << nbits) - 1
+    wpr = n_in // vpw
+    nwords = n_out * wpr
+    rng = np.random.default_rng(131)
+    bits = rng.integers(0, 2 ** 32, size=nwords, dtype=np.uint64).astype(np.uint32)
+    scale = (rng.random(n_out).astype(np.float32) * 0.01 + 0.001)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        bb = dev.newBufferWithBytes_length_options_(bits.tobytes(), bits.nbytes, SH)
+        bs = dev.newBufferWithBytes_length_options_(scale.tobytes(), scale.nbytes, SH)
+        bo = dev.newBufferWithLength_options_(n_out * n_in * 2, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<4I", n_in, n_out, 0, 0), 16, SH)
+        _run(dev, _pso(dev, src, "dq_f16"), (bb, bs, bo, bp), (nwords + 255) // 256, WG)
+        return np.frombuffer(bo.contents().as_buffer(n_out * n_in * 2),
+                             np.float16).reshape(n_out, n_in).copy()
+
+    research = os.path.join(os.path.dirname(KDIR), "prefill_research", "dq_f16.metal")
+    ref = go(open(research).read().replace("BITS = 2u", f"BITS = {nbits}u"))
+    got = go(translate(kernels_dsl.dq_f16, workgroup_size=(256, 1, 1),
+                       target="msl", consts={"BITS": nbits}))
+    assert np.array_equal(got, ref), f"vs hand-written: {np.abs(got - ref).max():.3e}"
+
+    raw = bits.reshape(n_out, wpr)
+    sh = np.array([8 * (i // per_byte) + nbits * (i % per_byte) for i in range(vpw)],
+                  dtype=np.uint64)
+    for o in (0, 1, n_out - 1):
+        q = ((raw[o].astype(np.uint64)[:, None] >> sh[None, :]) & mask).astype(np.float64)
+        oracle = (scale[o].astype(np.float64) * (q.reshape(-1) - zp)).astype(np.float16)
+        assert np.array_equal(got[o], oracle), f"row {o} vs float64 oracle"

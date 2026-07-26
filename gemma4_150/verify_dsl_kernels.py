@@ -28,7 +28,12 @@ from gemma4_150.metal_runner import G4, TOKJSON
 
 # Kernels ported to gemma4_150/kernels_dsl.py, by the key the runner compiles
 # them under. Add a name here once its parity test passes.
-PORTED = ["rmssrq_69", "combine", "srqh_b", "srq_b", "geglu_b", "down_75"]
+PORTED = ["rmssrq_69", "combine", "srqh_b", "srq_b", "geglu_b", "down_75",
+          "embed_00", "plegather_01", "argmax1_34", "argmax2_35"]
+
+# Shape-parameterized kernels: one DSL source, one variant per layer geometry.
+# The runner registers these under keys like "kvnorm_256".
+SPECIALIZED = {"kvnorm": [{"HD": hd, "HALF": hd // 2} for hd in (256, 512)]}
 
 PROMPT = "Write a 200-word essay about the sea."
 
@@ -49,6 +54,14 @@ def main():
     for name in PORTED:
         fn = getattr(kernels_dsl, name)
         g._compile_one(translate(fn, target="msl"), name, name)
+    for name, variants in SPECIALIZED.items():
+        fn = getattr(kernels_dsl, name)
+        for consts in variants:
+            hd = consts["HD"]
+            key = f"{name}_{hd}"
+            if key in g.kernels:
+                g._compile_one(translate(fn, workgroup_size=(hd, 1, 1),
+                                         target="msl", consts=consts), name, key)
     g._pf = None                           # rebuild batched prefill against them
 
     run()
@@ -56,7 +69,9 @@ def main():
 
     same = base_out == dsl_out
     slow = dsl_tps < base_tps * 0.95
-    print(f"\nswapped {len(PORTED)} kernels: {', '.join(PORTED)}")
+    n_spec = sum(len(v) for v in SPECIALIZED.values())
+    print(f"\nswapped {len(PORTED)} kernels + {n_spec} specialized variants")
+    print(f"  {', '.join(PORTED)}, {', '.join(SPECIALIZED)}")
     print(f"  stock : {len(base_out):3d} tokens, {base_tps:6.1f} tok/s")
     print(f"  DSL   : {len(dsl_out):3d} tokens, {dsl_tps:6.1f} tok/s")
     print(f"  tokens identical : {same}")

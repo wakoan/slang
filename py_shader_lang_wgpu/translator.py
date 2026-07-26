@@ -210,8 +210,10 @@ class _WGSLTranslator:
         func: Callable,
         annotations: dict[str, WGSLType],
         workgroup_size: tuple[int, ...],
+        consts: dict[str, int | float] | None = None,
     ) -> None:
         self._func = func
+        self._consts = consts or {}
         self._annotations = annotations
         self._workgroup_size = workgroup_size
         self._lines: list[str] = []
@@ -575,6 +577,13 @@ class _WGSLTranslator:
         the rendered node wraps itself in parentheses when it binds looser.
         """
         if isinstance(node, ast.Name):
+            # Shape constants substituted at translate time. Kernels differ only
+            # by dimensions across layers (head_dim 256/512, intermediate
+            # 6144/12288), and the runners have been string-patching the shader
+            # TEXT to specialize them. Folding named constants here does the same
+            # job on the AST, where "HD" cannot accidentally match a substring.
+            if node.id in self._consts:
+                return self._literal(self._consts[node.id])
             if node.id in self._ever_declared and not self._visible(node.id):
                 raise TranslationError(
                     f"Variable '{node.id}' is used outside the block where it was "
@@ -827,7 +836,7 @@ class _WGSLTranslator:
 
 
 def translate(func: Callable, workgroup_size: tuple[int, ...] | None = None,
-              target: str = "wgsl") -> str:
+              target: str = "wgsl", consts: dict | None = None) -> str:
     """Translate a Python function to a WGSL compute shader string.
 
     Parameters
@@ -883,13 +892,14 @@ def translate(func: Callable, workgroup_size: tuple[int, ...] | None = None,
         cls = _MSLTranslator
     else:
         raise TranslationError(f"Unknown target {target!r}; use 'wgsl' or 'msl'")
-    return cls(func, annotations, workgroup_size).run()
+    return cls(func, annotations, workgroup_size, consts).run()
 
 
 def kernel(
     func: Callable | None = None,
     *,
     workgroup_size: tuple[int, ...] = (1,),
+    consts: dict | None = None,
 ) -> Callable:
     """Decorator that translates a Python kernel function to WGSL.
 
@@ -907,9 +917,10 @@ def kernel(
     as ``func.wgsl``.
     """
     def _wrap(f: Callable) -> Callable:
-        f.wgsl = translate(f, workgroup_size)
-        f.msl = translate(f, workgroup_size, target="msl")
+        f.wgsl = translate(f, workgroup_size, consts=consts)
+        f.msl = translate(f, workgroup_size, target="msl", consts=consts)
         f.workgroup_size = workgroup_size
+        f.consts = dict(consts or {})
         return f
 
     if func is not None:

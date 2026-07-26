@@ -254,3 +254,112 @@ def test_down_75_bit_exact(dev):
     # the counter must self-reset, or the NEXT token's merge never fires
     assert got_ctr == 0 == ref_ctr, f"counter left at {got_ctr} (ref {ref_ctr})"
     assert not np.array_equal(got_h, hidden0), "kernel did not write hidden"
+
+
+def _gather_case(dev, name, hidden, wpr, vals_per_word, n_scale):
+    rng = np.random.default_rng(31)
+    seq = 3
+    ids = rng.integers(0, 262144, size=seq, dtype=np.uint64).astype(np.uint32)
+    nrows = int(ids.max()) + 1
+    bits = rng.integers(0, 2 ** 32, size=nrows * wpr, dtype=np.uint64).astype(np.uint32)
+    scale = (rng.random(nrows * n_scale).astype(np.float32) * 0.01 + 0.001)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        bi = dev.newBufferWithBytes_length_options_(ids.tobytes(), ids.nbytes, SH)
+        bb = dev.newBufferWithBytes_length_options_(bits.tobytes(), bits.nbytes, SH)
+        bsc = dev.newBufferWithBytes_length_options_(scale.tobytes(), scale.nbytes, SH)
+        by = dev.newBufferWithLength_options_(seq * hidden * 4, SH)
+        bp = dev.newBufferWithBytes_length_options_(struct.pack("<4I", seq, 0, 0, 0), 16, SH)
+        _run(dev, _pso(dev, src, name), (bi, bb, bsc, by, bp), seq, 64)
+        return np.frombuffer(by.contents().as_buffer(seq * hidden * 4), np.float32).copy()
+
+    ref = go(open(os.path.join(KDIR, name + ".metal")).read())
+    got = go(translate(getattr(kernels_dsl, name), target="msl"))
+    assert np.array_equal(got, ref), f"{name}: max |d| {np.abs(got - ref).max():.3e}"
+    assert np.count_nonzero(got), f"{name} wrote nothing"
+
+
+def test_embed_00_bit_exact(dev):
+    _gather_case(dev, "embed_00", hidden=1536, wpr=96, vals_per_word=16, n_scale=1)
+
+
+def test_plegather_01_bit_exact(dev):
+    _gather_case(dev, "plegather_01", hidden=8960, wpr=1120, vals_per_word=8, n_scale=35)
+
+
+def test_argmax_bit_exact(dev):
+    """Both passes, including the tie rule: ties must break to the LOWER index,
+    or the sampled token depends on scheduling."""
+    COUNT, SLICE = 262144, 1024
+    NWG = COUNT // SLICE
+    rng = np.random.default_rng(41)
+    x = rng.standard_normal(COUNT).astype(np.float32)
+    x[12345] = 50.0
+    x[200000] = 50.0                      # exact tie: lower index must win
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src1, src2):
+        bx = dev.newBufferWithBytes_length_options_(x.tobytes(), x.nbytes, SH)
+        bv = dev.newBufferWithLength_options_(NWG * 4, SH)
+        bi = dev.newBufferWithLength_options_(NWG * 4, SH)
+        bo = dev.newBufferWithLength_options_(4, SH)
+        _run(dev, _pso(dev, src1, "argmax1_34"), (bx, bv, bi), NWG, WG)
+        _run(dev, _pso(dev, src2, "argmax2_35"), (bv, bi, bo), 1, WG)
+        return int(np.frombuffer(bo.contents().as_buffer(4), np.uint32)[0])
+
+    ref = go(open(os.path.join(KDIR, "argmax1_34.metal")).read(),
+             open(os.path.join(KDIR, "argmax2_35.metal")).read())
+    got = go(translate(kernels_dsl.argmax1_34, target="msl"),
+             translate(kernels_dsl.argmax2_35, target="msl"))
+    assert got == ref, f"argmax {got} != {ref}"
+    assert got == 12345, f"tie should break to the lower index, got {got}"
+
+
+@pytest.mark.parametrize("hd", [256, 512])
+def test_kvnorm_bit_exact(dev, hd):
+    """Shape-parameterized: both head_dim variants come from one DSL source.
+
+    The reference is produced the way the runner does it — by string-patching
+    the hand-written .metal — so this also checks the consts mechanism lands on
+    the same specialization the patching produced.
+    """
+    half = hd // 2
+    rng = np.random.default_rng(51)
+    ink = rng.standard_normal(hd).astype(np.float32)
+    invv = rng.standard_normal(hd).astype(np.float32)
+    knorm = rng.standard_normal(hd).astype(np.float32)
+    cosT = rng.standard_normal(half).astype(np.float32)
+    sinT = rng.standard_normal(half).astype(np.float32)
+    OFF = 3 * hd
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        bs = [dev.newBufferWithBytes_length_options_(a.tobytes(), a.nbytes, SH)
+              for a in (ink, invv, knorm, cosT, sinT)]
+        bk = dev.newBufferWithLength_options_(8 * hd * 4, SH)
+        bv = dev.newBufferWithLength_options_(8 * hd * 4, SH)
+        bp = dev.newBufferWithBytes_length_options_(struct.pack("<4I", OFF, 0, 0, 0), 16, SH)
+        _run(dev, _pso(dev, src, "kvnorm"), (*bs, bk, bv, bp), 1, hd)
+        k = np.frombuffer(bk.contents().as_buffer(8 * hd * 4), np.float32).copy()
+        v = np.frombuffer(bv.contents().as_buffer(8 * hd * 4), np.float32).copy()
+        return k, v
+
+    ref_src = (open(os.path.join(KDIR, "kvnorm.metal")).read()
+               .replace("HD=256u", f"HD={hd}u").replace("HALF=128u", f"HALF={half}u")
+               .replace("threadsPerThreadgroup = (256)", f"threadsPerThreadgroup = ({hd})"))
+    ref_k, ref_v = go(ref_src)
+    got_k, got_v = go(translate(kernels_dsl.kvnorm, workgroup_size=(hd, 1, 1),
+                                target="msl", consts={"HD": hd, "HALF": half}))
+    assert np.array_equal(got_k, ref_k), f"k differs: {np.abs(got_k - ref_k).max():.3e}"
+    assert np.array_equal(got_v, ref_v), f"v differs: {np.abs(got_v - ref_v).max():.3e}"
+    assert np.count_nonzero(got_k[OFF:OFF + hd]), "wrote nothing at the cache offset"
+
+
+def test_consts_actually_specialize():
+    """A const must change the emitted code, not merely be accepted."""
+    from py_shader_lang_wgpu import translate as tr
+    a = tr(kernels_dsl.kvnorm, workgroup_size=(256, 1, 1), consts={"HD": 256, "HALF": 128})
+    b = tr(kernels_dsl.kvnorm, workgroup_size=(512, 1, 1), consts={"HD": 512, "HALF": 256})
+    assert a != b
+    assert "512" in b and "@workgroup_size(512, 1, 1)" in b

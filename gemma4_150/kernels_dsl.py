@@ -431,3 +431,192 @@ def down_75(
         rms: f32 = inverseSqrt(t1 / f32(1536.0) + f32(1e-6))
         for o3 in range(tid, 1536, 256):
             hidden[o3] = hidden[o3] + dsh[o3] * rms * nw[o3]
+
+
+@kernel(workgroup_size=(64, 1, 1))
+def embed_00(
+    ids: StorageBuffer[u32, "read"],
+    bits_buf: StorageBuffer[u32, "read"],
+    scale: StorageBuffer[f32, "read"],
+    y: StorageBuffer[f32],
+    params: Uniform[vec4[u32]],          # (seq, _, _, _)
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """2-bit embedding gather, one workgroup per token."""
+    t: u32 = wg.x
+    if t < params.x:
+        id: u32 = ids[t]
+        if id < u32(262144):
+            for w in range(tid, 96, 64):
+                packed: u32 = bits_buf[id * u32(96) + w]
+                s: f32 = scale[id]                 # NUM_GROUPS == 1
+                for v in range(16):
+                    q: f32 = f32((packed >> (u32(v) * u32(2))) & u32(3))
+                    y[t * u32(1536) + w * u32(16) + u32(v)] = \
+                        f32(39.191835884530846) * s * (q - f32(2.0))
+
+
+@kernel(workgroup_size=(64, 1, 1))
+def plegather_01(
+    ids: StorageBuffer[u32, "read"],
+    bits_buf: StorageBuffer[u32, "read"],
+    scale: StorageBuffer[f32, "read"],
+    y: StorageBuffer[f32],
+    params: Uniform[vec4[u32]],          # (seq, _, _, _)
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """4-bit per-layer-embedding gather. 35 scale groups of 256 per row, so the
+    scale index moves with the column — unlike embed_00's single group."""
+    t: u32 = wg.x
+    if t < params.x:
+        id: u32 = ids[t]
+        if id < u32(262144):
+            for w in range(tid, 1120, 64):
+                packed: u32 = bits_buf[id * u32(1120) + w]
+                for v in range(8):
+                    c: u32 = w * u32(8) + u32(v)
+                    s: f32 = scale[id * u32(35) + c / u32(256)]
+                    q: f32 = f32((packed >> (u32(v) * u32(4))) & u32(15))
+                    y[t * u32(8960) + c] = f32(16.0) * s * (q - f32(8.0))
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def argmax1_34(
+    x: StorageBuffer[f32, "read"],
+    cand_val: StorageBuffer[f32],
+    cand_idx: StorageBuffer[u32],
+    wgVal: WorkgroupArray[f32, 256],
+    wgIdx: WorkgroupArray[u32, 256],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """Argmax pass 1: best candidate per 1024-wide slice of the logits.
+
+    Ties break toward the LOWER index, matching the reference — with 262144
+    logits, ties on -inf rows are common enough that an unspecified rule would
+    make the sampled token depend on scheduling.
+    """
+    base: u32 = wg.x * u32(1024)
+    end: u32 = min(base + u32(1024), u32(262144))
+    bv: f32 = f32(-3.4028234663852886e38)
+    bi: u32 = u32(0)
+    i: u32 = base + tid
+    while i < end:
+        v: f32 = x[i]
+        if v > bv:
+            bv = v
+            bi = i
+        i = i + u32(256)
+    wgVal[tid] = bv
+    wgIdx[tid] = bi
+    barrier()
+    stride: u32 = u32(128)
+    while stride > u32(0):
+        if tid < stride:
+            o: u32 = tid + stride
+            if wgVal[o] > wgVal[tid]:
+                wgVal[tid] = wgVal[o]
+                wgIdx[tid] = wgIdx[o]
+            else:
+                if wgVal[o] == wgVal[tid]:
+                    if wgIdx[o] < wgIdx[tid]:
+                        wgIdx[tid] = wgIdx[o]
+        barrier()
+        stride = stride / u32(2)
+    if tid == u32(0):
+        cand_val[wg.x] = wgVal[0]
+        cand_idx[wg.x] = wgIdx[0]
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def argmax2_35(
+    cand_val: StorageBuffer[f32, "read"],
+    cand_idx: StorageBuffer[u32, "read"],
+    out: StorageBuffer[u32],
+    wgVal: WorkgroupArray[f32, 256],
+    wgIdx: WorkgroupArray[u32, 256],
+    tid: Builtin.local_invocation_index,
+):
+    """Argmax pass 2: the winner among the 256 candidates."""
+    bv: f32 = f32(-3.4028234663852886e38)
+    bi: u32 = u32(0)
+    i: u32 = tid
+    while i < u32(256):
+        v: f32 = cand_val[i]
+        idx: u32 = cand_idx[i]
+        if v > bv:
+            bv = v
+            bi = idx
+        else:
+            if v == bv:
+                if idx < bi:
+                    bi = idx
+        i = i + u32(256)
+    wgVal[tid] = bv
+    wgIdx[tid] = bi
+    barrier()
+    stride: u32 = u32(128)
+    while stride > u32(0):
+        if tid < stride:
+            o: u32 = tid + stride
+            if wgVal[o] > wgVal[tid]:
+                wgVal[tid] = wgVal[o]
+                wgIdx[tid] = wgIdx[o]
+            else:
+                if wgVal[o] == wgVal[tid]:
+                    if wgIdx[o] < wgIdx[tid]:
+                        wgIdx[tid] = wgIdx[o]
+        barrier()
+        stride = stride / u32(2)
+    if tid == u32(0):
+        out[0] = wgIdx[0]
+
+
+@kernel(workgroup_size=(256, 1, 1), consts={"HD": 256, "HALF": 128})
+def kvnorm(
+    ink: StorageBuffer[f32, "read"],
+    inv: StorageBuffer[f32, "read"],
+    knorm: StorageBuffer[f32, "read"],
+    cosT: StorageBuffer[f32, "read"],
+    sinT: StorageBuffer[f32, "read"],
+    kcache: StorageBuffer[f32],
+    vcache: StorageBuffer[f32],
+    p: Uniform[vec4[u32]],               # (cacheOffset, _, _, _)
+    rk: WorkgroupArray[f32, 512],        # sized for the widest head_dim
+    rv: WorkgroupArray[f32, 512],
+    tid: Builtin.local_invocation_index,
+):
+    """k: RMSNorm * knorm + split-half RoPE; v: scale-free RMSNorm; -> caches.
+
+    The first SHAPE-PARAMETERIZED kernel: head_dim is 256 on sliding layers and
+    512 on full ones. HD/HALF are `consts`, folded at translate time, so both
+    variants come from this one source — replacing the runner's string-patching
+    of the shader text, where "HD" could match a substring.
+
+    The workgroup arrays are sized for the widest variant because an annotation
+    is evaluated once at definition; the narrow variant simply uses a prefix.
+    """
+    ko: f32 = ink[tid]
+    vo: f32 = inv[tid]
+    rk[tid] = ko * ko
+    rv[tid] = vo * vo
+    barrier()
+    s: u32 = u32(HD) / u32(2)
+    while s > u32(0):
+        if tid < s:
+            rk[tid] = rk[tid] + rk[tid + s]
+            rv[tid] = rv[tid] + rv[tid + s]
+        barrier()
+        s = s / u32(2)
+    rmsk: f32 = inverseSqrt(rk[0] / f32(HD) + f32(1e-6))
+    rmsv: f32 = inverseSqrt(rv[0] / f32(HD) + f32(1e-6))
+    vcache[p.x + tid] = vo * rmsv
+    if tid < u32(HALF):
+        n0: f32 = ink[tid] * rmsk * knorm[tid]
+        n1: f32 = ink[tid + u32(HALF)] * rmsk * knorm[tid + u32(HALF)]
+        c: f32 = cosT[tid]
+        sn: f32 = sinT[tid]
+        kcache[p.x + tid] = n0 * c - n1 * sn
+        kcache[p.x + tid + u32(HALF)] = n1 * c + n0 * sn

@@ -351,31 +351,32 @@ def down_75(
     for w in range(tid, 768, 256):
         av0: vec4[f32] = vec4[f32](a[w * u32(2)])
         av1: vec4[f32] = vec4[f32](a[w * u32(2) + u32(1)])
-        sumA = sumA + (av0.x + av0.y + av0.z + av0.w) + (av1.x + av1.y + av1.z + av1.w)
+        sumA = sumA + ((av0.x + av0.y + av0.z + av0.w)
+                       + (av1.x + av1.y + av1.z + av1.w))
         if rowBase < u32(1536):
             p0: u32 = bits_buf[rowBase * u32(768) + w]
             lo0: vec4[f32] = unpack4x8unorm(p0 & u32(0x0F0F0F0F))
             hi0: vec4[f32] = unpack4x8unorm((p0 >> u32(4)) & u32(0x0F0F0F0F))
-            q0 = q0 + dot(vec4[f32](lo0.x, hi0.x, lo0.y, hi0.y), av0) \
-                    + dot(vec4[f32](lo0.z, hi0.z, lo0.w, hi0.w), av1)
+            q0 = q0 + (dot(vec4[f32](lo0.x, hi0.x, lo0.y, hi0.y), av0)
+                     + dot(vec4[f32](lo0.z, hi0.z, lo0.w, hi0.w), av1))
         if rowBase + u32(1) < u32(1536):
             p1: u32 = bits_buf[(rowBase + u32(1)) * u32(768) + w]
             lo1: vec4[f32] = unpack4x8unorm(p1 & u32(0x0F0F0F0F))
             hi1: vec4[f32] = unpack4x8unorm((p1 >> u32(4)) & u32(0x0F0F0F0F))
-            q1 = q1 + dot(vec4[f32](lo1.x, hi1.x, lo1.y, hi1.y), av0) \
-                    + dot(vec4[f32](lo1.z, hi1.z, lo1.w, hi1.w), av1)
+            q1 = q1 + (dot(vec4[f32](lo1.x, hi1.x, lo1.y, hi1.y), av0)
+                     + dot(vec4[f32](lo1.z, hi1.z, lo1.w, hi1.w), av1))
         if rowBase + u32(2) < u32(1536):
             p2: u32 = bits_buf[(rowBase + u32(2)) * u32(768) + w]
             lo2: vec4[f32] = unpack4x8unorm(p2 & u32(0x0F0F0F0F))
             hi2: vec4[f32] = unpack4x8unorm((p2 >> u32(4)) & u32(0x0F0F0F0F))
-            q2 = q2 + dot(vec4[f32](lo2.x, hi2.x, lo2.y, hi2.y), av0) \
-                    + dot(vec4[f32](lo2.z, hi2.z, lo2.w, hi2.w), av1)
+            q2 = q2 + (dot(vec4[f32](lo2.x, hi2.x, lo2.y, hi2.y), av0)
+                     + dot(vec4[f32](lo2.z, hi2.z, lo2.w, hi2.w), av1))
         if rowBase + u32(3) < u32(1536):
             p3: u32 = bits_buf[(rowBase + u32(3)) * u32(768) + w]
             lo3: vec4[f32] = unpack4x8unorm(p3 & u32(0x0F0F0F0F))
             hi3: vec4[f32] = unpack4x8unorm((p3 >> u32(4)) & u32(0x0F0F0F0F))
-            q3 = q3 + dot(vec4[f32](lo3.x, hi3.x, lo3.y, hi3.y), av0) \
-                    + dot(vec4[f32](lo3.z, hi3.z, lo3.w, hi3.w), av1)
+            q3 = q3 + (dot(vec4[f32](lo3.x, hi3.x, lo3.y, hi3.y), av0)
+                     + dot(vec4[f32](lo3.z, hi3.z, lo3.w, hi3.w), av1))
 
     red: vec4[f32] = subgroupAdd(vec4[f32](q0, q1, q2, q3))
     redA: f32 = subgroupAdd(sumA)
@@ -857,7 +858,7 @@ def plegate_76(
             kb: u32 = wd * u32(4)
             av: vec4[f32] = srq4(vec4[f32](a[kb], a[kb + u32(1)],
                                            a[kb + u32(2)], a[kb + u32(3)]), inScale)
-            aAcc = aAcc + (av.x + av.y) + (av.z + av.w)
+            aAcc = aAcc + ((av.x + av.y) + (av.z + av.w))
             acc = acc + dot(unpack4x8unorm(codes[o * u32(384) + wd]), av)
         aSum: f32 = subgroupAdd(aAcc)
         s: f32 = subgroupAdd(acc)
@@ -871,3 +872,121 @@ def plegate_76(
                 gv = gelu_lut[u32(clamp(round(qv / linOutScale),
                                         f32(-128.0), f32(127.0)) + f32(128.0))]
             out[o] = gv * ple[params.z + o]
+
+
+@kernel(workgroup_size=(256, 1, 1), consts={"WPR": 256})
+def oproj_73(
+    a: StorageBuffer[vec4[f32], "read"],
+    bits_buf: StorageBuffer[u32, "read"],
+    scale: StorageBuffer[f32, "read"],
+    pp: AtomicBuffer[u32],
+    hidden: StorageBuffer[f32],
+    w12: StorageBuffer[f32, "read"],
+    y2: StorageBuffer[f16],
+    sum2: StorageBuffer[f32],
+    params: Uniform[vec4[u32]],          # (outScale, inScale2, _, _)
+    sgp: WorkgroupArray[f32, 8],
+    lastFlag: WorkgroupArray[u32, 1],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """o-proj (4-bit) + post-attn norm-add + pre-FFN norm, all in one dispatch.
+
+    One subgroup per output row for the GEMV, then the last-arriver runs BOTH
+    norms: RMSNorm the projection, add it to the residual, then RMSNorm again
+    for the FFN input. Two fused norms behind one atomic counter.
+
+    WPR is a const (256 on sliding layers, 512 on full ones).
+
+    DEVIATION, deliberate and bit-exact: the reference caches its 6 per-thread
+    residual values in `float hloc[6]` between the two norms. The DSL has no
+    local arrays, so the second pass RE-READS hidden[j] instead. That value was
+    written by the same thread earlier in the same kernel and f32 storage is
+    lossless, so the arithmetic is identical — it costs 1536 extra f32 reads per
+    token and nothing else. The parity test is what makes that claim checkable
+    rather than a hope.
+    """
+    sgId: u32 = tid / u32(32)
+    lane: u32 = tid & u32(31)
+    outScale: f32 = bitcast_f32(params.x)
+    o: u32 = wg.x * u32(8) + sgId
+    sumQA: f32 = f32(0.0)
+    sumA: f32 = f32(0.0)
+    for w in range(lane, WPR, 32):
+        avc0: vec4[f32] = a[w * u32(2)]
+        avc1: vec4[f32] = a[w * u32(2) + u32(1)]
+        # NB the inner parens are load-bearing: the reference writes
+        # `sumA += X + Y`, i.e. sumA + (X+Y). Dropping them gives (sumA+X)+Y,
+        # which differs in the last ulp — enough to flip an srq rounding
+        # eventually, and the model then takes a different path.
+        sumA = sumA + ((avc0.x + avc0.y + avc0.z + avc0.w)
+                       + (avc1.x + avc1.y + avc1.z + avc1.w))
+        if o < u32(1536):
+            p: u32 = bits_buf[o * u32(WPR) + w]
+            lo: vec4[f32] = vec4[f32](unpack4xU8(p & u32(0x0F0F0F0F)))
+            hi: vec4[f32] = vec4[f32](unpack4xU8((p >> u32(4)) & u32(0x0F0F0F0F)))
+            sumQA = sumQA + (dot(vec4[f32](lo.x, hi.x, lo.y, hi.y), avc0)
+                             + dot(vec4[f32](lo.z, hi.z, lo.w, hi.w), avc1))
+    rA: f32 = subgroupAdd(sumA)
+    rQA: f32 = subgroupAdd(sumQA)
+    if lane == u32(0):
+        if o < u32(1536):
+            atomicStore(pp, o, bitcast_u32(
+                srq(scale[o] * (rQA - f32(8.0) * rA), outScale)))
+    storageBarrier()
+    if tid == u32(0):
+        tk: u32 = atomicAdd(pp, u32(1536), u32(1))
+        lastFlag[0] = u32(0)
+        if tk == u32(191):
+            lastFlag[0] = u32(1)
+    barrier()
+    if lastFlag[0] == u32(1):
+        if tid == u32(0):
+            atomicStore(pp, u32(1536), u32(0))
+        inScale2: f32 = bitcast_f32(params.y)
+        acc1: f32 = f32(0.0)
+        for i in range(tid, 1536, 256):
+            v: f32 = bitcast_f32(atomicLoad(pp, i))
+            acc1 = acc1 + v * v
+        r1: f32 = subgroupAdd(acc1)
+        if (tid & u32(31)) == u32(0):
+            sgp[tid >> u32(5)] = r1
+        barrier()
+        t1: f32 = f32(0.0)
+        for k1 in range(8):
+            t1 = t1 + sgp[k1]
+        barrier()
+        rms1: f32 = inverseSqrt(t1 / f32(1536.0) + f32(1e-6))
+
+        acc2: f32 = f32(0.0)
+        for j in range(tid, 1536, 256):
+            normed: f32 = bitcast_f32(atomicLoad(pp, j)) * rms1 * w12[j]
+            hv: f32 = hidden[j] + normed
+            hidden[j] = hv
+            acc2 = acc2 + hv * hv
+        r2: f32 = subgroupAdd(acc2)
+        if (tid & u32(31)) == u32(0):
+            sgp[tid >> u32(5)] = r2
+        barrier()
+        t2: f32 = f32(0.0)
+        for k2 in range(8):
+            t2 = t2 + sgp[k2]
+        barrier()
+        rms2: f32 = inverseSqrt(t2 / f32(1536.0) + f32(1e-6))
+
+        qAcc: f32 = f32(0.0)
+        for j2 in range(tid, 1536, 256):
+            n2: f32 = hidden[j2] * rms2 * w12[u32(1536) + j2]
+            qv: f16 = f16(srq(f32(f16(n2)), inScale2))
+            y2[j2] = qv
+            qAcc = qAcc + f32(qv)
+        r3: f32 = subgroupAdd(qAcc)
+        if (tid & u32(31)) == u32(0):
+            sgp[tid >> u32(5)] = r3
+        barrier()
+        t3: f32 = f32(0.0)
+        for k3 in range(8):
+            t3 = t3 + sgp[k3]
+        barrier()
+        if tid == u32(0):
+            sum2[0] = t3

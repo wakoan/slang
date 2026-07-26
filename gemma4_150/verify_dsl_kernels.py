@@ -33,8 +33,18 @@ PORTED = ["rmssrq_69", "combine", "srqh_b", "srq_b", "geglu_b", "down_75",
           "rmsadd_b", "rmssrqh_b", "combine_b", "proj_68", "plegate_76"]
 
 # Shape-parameterized kernels: one DSL source, one variant per layer geometry.
-# The runner registers these under keys like "kvnorm_256".
-SPECIALIZED = {"kvnorm": [{"HD": hd, "HALF": hd // 2} for hd in (256, 512)]}
+# (dsl name, runner key, consts, threads) — the runner registers these under
+# keys like "kvnorm_256" / "oproj_2048", built by string-patching the .metal.
+SPECIALIZED = (
+    [("kvnorm", f"kvnorm_{hd}", {"HD": hd, "HALF": hd // 2}, hd) for hd in (256, 512)]
+    # NB oproj_73 is NOT here. It is bit-exact against the reference in the
+    # parity tests (10 seeds, both q_dim shapes, and a single dispatch on the
+    # model's own buffers for a sliding AND a full layer) — yet swapping it
+    # alone changes greedy decode from token 161 onward, reproducibly, while
+    # stock-vs-stock is deterministic over 4 runs. Something input-dependent
+    # differs that synthetic and single-dispatch checks do not reach; until it
+    # is found the kernel stays out of the runner. See PORT_NOTES.md.
+)
 
 PROMPT = "Write a 200-word essay about the sea."
 
@@ -55,14 +65,11 @@ def main():
     for name in PORTED:
         fn = getattr(kernels_dsl, name)
         g._compile_one(translate(fn, target="msl"), name, name)
-    for name, variants in SPECIALIZED.items():
-        fn = getattr(kernels_dsl, name)
-        for consts in variants:
-            hd = consts["HD"]
-            key = f"{name}_{hd}"
-            if key in g.kernels:
-                g._compile_one(translate(fn, workgroup_size=(hd, 1, 1),
-                                         target="msl", consts=consts), name, key)
+    for name, key, consts, threads in SPECIALIZED:
+        if key in g.kernels:
+            g._compile_one(translate(getattr(kernels_dsl, name),
+                                     workgroup_size=(threads, 1, 1),
+                                     target="msl", consts=consts), name, key)
     g._pf = None                           # rebuild batched prefill against them
 
     run()
@@ -70,9 +77,9 @@ def main():
 
     same = base_out == dsl_out
     slow = dsl_tps < base_tps * 0.95
-    n_spec = sum(len(v) for v in SPECIALIZED.values())
-    print(f"\nswapped {len(PORTED)} kernels + {n_spec} specialized variants")
-    print(f"  {', '.join(PORTED)}, {', '.join(SPECIALIZED)}")
+    print(f"\nswapped {len(PORTED)} kernels + {len(SPECIALIZED)} specialized variants")
+    print(f"  {', '.join(PORTED)}")
+    print(f"  specialized: {', '.join(k for _, k, _, _ in SPECIALIZED)}")
     print(f"  stock : {len(base_out):3d} tokens, {base_tps:6.1f} tok/s")
     print(f"  DSL   : {len(dsl_out):3d} tokens, {dsl_tps:6.1f} tok/s")
     print(f"  tokens identical : {same}")

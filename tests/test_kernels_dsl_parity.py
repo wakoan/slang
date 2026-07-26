@@ -490,3 +490,54 @@ def test_plegate_76_bit_exact(dev, lin_scale):
     ref = go(open(os.path.join(KDIR, "plegate_76.metal")).read())
     got = go(translate(kernels_dsl.plegate_76, target="msl"))
     assert np.array_equal(got, ref), f"max |d| {np.abs(got - ref).max():.3e}"
+
+
+@pytest.mark.parametrize("wpr", [256, 512])
+def test_oproj_73_bit_exact(dev, wpr):
+    """Both q_dim variants, and the hloc->re-read deviation.
+
+    The reference caches 6 per-thread values in a local array between its two
+    fused norms; the DSL version re-reads hidden[]. Same arithmetic if and only
+    if the re-read returns exactly what was written — which is what this checks.
+    """
+    OUT_F, ROWS, TOTAL_WGS = 1536, 8, 1536 // 8
+    IN_F = wpr * 8
+    rng = np.random.default_rng(81)
+    a = rng.standard_normal(IN_F).astype(np.float32)
+    bits = rng.integers(0, 2 ** 32, size=OUT_F * wpr, dtype=np.uint64).astype(np.uint32)
+    scale = (rng.random(OUT_F).astype(np.float32) * 0.01 + 0.001)
+    hidden0 = rng.standard_normal(OUT_F).astype(np.float32)
+    w12 = rng.standard_normal(2 * OUT_F).astype(np.float32)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        ba = dev.newBufferWithBytes_length_options_(a.tobytes(), a.nbytes, SH)
+        bb = dev.newBufferWithBytes_length_options_(bits.tobytes(), bits.nbytes, SH)
+        bsc = dev.newBufferWithBytes_length_options_(scale.tobytes(), scale.nbytes, SH)
+        bpp = dev.newBufferWithLength_options_((OUT_F + 1) * 4, SH)
+        bpp.contents().as_buffer((OUT_F + 1) * 4)[:] = b"\x00" * ((OUT_F + 1) * 4)
+        bh = dev.newBufferWithBytes_length_options_(hidden0.tobytes(), hidden0.nbytes, SH)
+        bw = dev.newBufferWithBytes_length_options_(w12.tobytes(), w12.nbytes, SH)
+        by = dev.newBufferWithLength_options_(OUT_F * 2, SH)
+        bs2 = dev.newBufferWithLength_options_(4, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<ffII", 0.03125, 0.0234375, 0, 0), 16, SH)
+        _run(dev, _pso(dev, src, "oproj_73"),
+             (ba, bb, bsc, bpp, bh, bw, by, bs2, bp), TOTAL_WGS, WG)
+        return (np.frombuffer(bh.contents().as_buffer(OUT_F * 4), np.float32).copy(),
+                np.frombuffer(by.contents().as_buffer(OUT_F * 2), np.float16).copy(),
+                float(np.frombuffer(bs2.contents().as_buffer(4), np.float32)[0]),
+                int(np.frombuffer(bpp.contents().as_buffer((OUT_F + 1) * 4),
+                                  np.uint32)[OUT_F]))
+
+    ref_src = (open(os.path.join(KDIR, "oproj_73.metal")).read()
+               .replace("IN_FEATURES=2048u", f"IN_FEATURES={IN_F}u")
+               .replace("WPR=256u", f"WPR={wpr}u"))
+    ref = go(ref_src)
+    got = go(translate(kernels_dsl.oproj_73, target="msl", consts={"WPR": wpr}))
+
+    assert np.array_equal(got[0], ref[0]), f"hidden: {np.abs(got[0]-ref[0]).max():.3e}"
+    assert np.array_equal(got[1], ref[1]), "y2 differs"
+    assert got[2] == ref[2], f"sum2 {got[2]} != {ref[2]}"
+    assert got[3] == 0 == ref[3], "counter must self-reset"
+    assert not np.array_equal(got[0], hidden0), "kernel did not write hidden"

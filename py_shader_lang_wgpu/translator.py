@@ -211,9 +211,15 @@ class _WGSLTranslator:
         annotations: dict[str, WGSLType],
         workgroup_size: tuple[int, ...],
         consts: dict[str, int | float] | None = None,
+        consts_as_decls: bool = False,
     ) -> None:
         self._func = func
         self._consts = consts or {}
+        # False folds each const to a literal at its use site. True instead
+        # declares them at module scope and leaves the NAME in the body, so a
+        # host can re-specialize the shader text afterwards — which is how the
+        # browser bundle patches per-layer shapes client-side.
+        self._consts_as_decls = consts_as_decls
         self._annotations = annotations
         self._workgroup_size = workgroup_size
         self._lines: list[str] = []
@@ -348,6 +354,14 @@ class _WGSLTranslator:
         )
         if uses_packed_dot:
             self._emit("requires packed_4x8_integer_dot_product;")
+            self._emit()
+
+        if self._consts_as_decls and self._consts:
+            for cname, cval in self._consts.items():
+                if isinstance(cval, int) and not isinstance(cval, bool):
+                    self._emit(f"const {cname}: u32 = {cval}u;")
+                else:
+                    self._emit(f"const {cname}: f32 = {float(cval)!r};")
             self._emit()
 
         # Emit @group/@binding declarations
@@ -582,7 +596,7 @@ class _WGSLTranslator:
             # 6144/12288), and the runners have been string-patching the shader
             # TEXT to specialize them. Folding named constants here does the same
             # job on the AST, where "HD" cannot accidentally match a substring.
-            if node.id in self._consts:
+            if node.id in self._consts and not self._consts_as_decls:
                 return self._literal(self._consts[node.id])
             if node.id in self._ever_declared and not self._visible(node.id):
                 raise TranslationError(
@@ -852,7 +866,8 @@ class _WGSLTranslator:
 
 
 def translate(func: Callable, workgroup_size: tuple[int, ...] | None = None,
-              target: str = "wgsl", consts: dict | None = None) -> str:
+              target: str = "wgsl", consts: dict | None = None,
+              consts_as_decls: bool = False) -> str:
     """Translate a Python function to a WGSL compute shader string.
 
     Parameters
@@ -908,7 +923,7 @@ def translate(func: Callable, workgroup_size: tuple[int, ...] | None = None,
         cls = _MSLTranslator
     else:
         raise TranslationError(f"Unknown target {target!r}; use 'wgsl' or 'msl'")
-    return cls(func, annotations, workgroup_size, consts).run()
+    return cls(func, annotations, workgroup_size, consts, consts_as_decls).run()
 
 
 def kernel(

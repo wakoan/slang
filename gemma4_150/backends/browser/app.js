@@ -237,7 +237,13 @@ function layer(L, pos, hidden, pleBuf, pleOff) {
   } else {
     dispatch(`k70_${qd}_${hd}`, k70, [a, b[`L${L}.q_bits`], b[`L${L}.k_bits`], b[`L${L}.v_bits`],
       b[`L${L}.qkv_scales`], suma, outq, outk, outv, par70], [total, 1, 1], `k70|${hk}`);
-    const kvn = K("_KVNORM").replace("%du", hd + "u").replace("%du", half + "u");
+    // The captured template uses %du placeholders; the DSL-generated one
+    // declares named consts instead. Without this branch the DSL version would
+    // silently keep HD=256 and quietly corrupt every 512-wide layer.
+    const kvnSrc = K("_KVNORM");
+    const kvn = kvnSrc.includes("%du")
+      ? kvnSrc.replace("%du", hd + "u").replace("%du", half + "u")
+      : patch(kvnSrc, { HD: hd, HALF: half });
     dispatch(`kvnorm_${hd}`, kvn, [outk, outv, b[`L${L}.k_norm`], cb, sb, kc, vc, UNIS[`pkv_${hd}`]], [1, 1, 1], `kvn|${hk}`);
   }
   // attention

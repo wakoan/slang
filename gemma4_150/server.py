@@ -12,6 +12,8 @@ the reference's 150.
 from __future__ import annotations
 
 import json
+import re
+import os
 import shutil
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -28,7 +30,61 @@ REF_KERNELS = ["00_main", "01_main", "68_reduce", "69_sg_sum", "70_srq", "73_sg_
                "101_srq", "33_srq", "34_main", "35_main"]
 
 
+# DSL kernel per bundle key, with the consts app.js patches client-side. They
+# are emitted as NAMED constants rather than folded (consts_as_decls) precisely
+# so that patching still works — app.js rewrites `const NAME: u32 = ...;`.
+DSL_KERNELS = {
+    "00_main": ("embed_00", (64, 1, 1), {}),
+    "01_main": ("plegather_01", (64, 1, 1), {}),
+    "68_reduce": ("proj_68", (32, 1, 1), {}),
+    "69_sg_sum": ("rmssrq_69", (256, 1, 1), {}),
+    "70_srq": ("qkv_70", (32, 1, 1),
+               {"Q_OUT": 2048, "KV_OUT": 256, "Q_WGS": 1024, "KV_WGS": 128,
+                "TOTAL_WGS": 1280, "GRID_X": 1280}),
+    "73_sg_sum": ("oproj_73", (256, 1, 1), {"WPR": 256}),
+    "74_sg_sum": ("gateup_74", (64, 1, 1), {}),
+    "95_sg_sum": ("gateup_95", (64, 1, 1), {}),
+    "75_srq": ("down_75", (256, 1, 1), {}),
+    "96_srq": ("down_96", (256, 1, 1), {}),
+    "76_reduce": ("plegate_76", (32, 1, 1), {}),
+    "77_sg_sum": ("pleproj_77", (256, 1, 1), {}),
+    "101_srq": ("attn_101", (256, 1, 1),
+                {"HEAD_DIM": 512, "HALF_DIM": 256, "HD4": 128, "J_GROUPS": 2,
+                 "PP_COUNTER_BASE": 8 * 32 * 514, "OUT_Q": 0.014886821620166302}),
+    "33_srq": ("logits_33", (128, 1, 1), {}),
+    "34_main": ("argmax1_34", (256, 1, 1), {}),
+    "35_main": ("argmax2_35", (256, 1, 1), {}),
+}
+
+# Defaults to the CAPTURED kernels, not the DSL ones. The DSL bundle is served
+# correctly (18 kernels, `fn main`, patchable consts) and every kernel compiles
+# under naga, but the page renders empty output under Dawn while the captured
+# bundle produces "**Paris**" — an unresolved failure, so the browser stays on
+# the path that works. G4_KERNEL_SOURCE=dsl to reproduce and debug it.
+USE_DSL = os.environ.get("G4_KERNEL_SOURCE", "ref") == "dsl"
+
+
+def _dsl_wgsl(dsl_name, threads, consts):
+    """DSL kernel as WGSL, with the entry point renamed to `main`.
+
+    app.js hardcodes entryPoint "main" and has a 569-op dispatch plan that is
+    verified against the runner; renaming here keeps the bundle contract
+    unchanged rather than perturbing that file.
+    """
+    from gemma4_150 import kernels_dsl
+    from py_shader_lang_wgpu import translate
+    fn = getattr(kernels_dsl, dsl_name)
+    src = translate(fn, workgroup_size=threads, consts=consts or None,
+                    consts_as_decls=True)
+    return re.sub(rf"\bfn {dsl_name}\s*\(", "fn main(", src)
+
+
 def build_kernels_json() -> str:
+    if USE_DSL:
+        ks = {key: _dsl_wgsl(*spec) for key, spec in DSL_KERNELS.items()}
+        ks["_COMBINE"] = _dsl_wgsl("combine", (256, 1, 1), {})
+        ks["_KVNORM"] = _dsl_wgsl("kvnorm", (256, 1, 1), {"HD": 256, "HALF": 128})
+        return json.dumps(ks)
     ks = {name: _kernel(name) for name in REF_KERNELS}
     ks["_COMBINE"] = G4Runner._COMBINE       # PLE-input norm/combine (has one %.9e slot)
     ks["_KVNORM"] = G4Runner._KVNORM         # fused k/v cache norm (has %d,%d slots)

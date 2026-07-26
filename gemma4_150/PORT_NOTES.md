@@ -28,6 +28,42 @@ retained as evidence for that retraction, not production kernels, and porting
 them would be work with no consumer. If they are ever deleted, the falsification
 record in `prefill_research/README.md` should go with them.
 
+## Backend adoption
+
+Porting the kernels and switching a backend to USE them are separate jobs. Where
+each backend loads its kernels from today:
+
+| backend | source | verified |
+|---|---|---|
+| `metal_runner.py` (PyObjC) | **kernels_dsl** | tokens identical, KV bit-identical |
+| `runner.py` (wgpu) | **kernels_dsl** | tokens identical vs captured WGSL |
+| browser (`server.py` + `app.js`) | captured WGSL | DSL bundle serves but FAILS — see below |
+| Swift, Rust | `kernels_msl/*.metal` | not started |
+
+Each gate compares the DEFAULT against the other source, so the direction flips
+when a backend switches over. Getting that wrong turns a gate into a no-op that
+passes unconditionally.
+
+### OPEN: the browser does not work on DSL kernels
+
+`G4_KERNEL_SOURCE=dsl python -m gemma4_150.server` serves a correct-looking
+bundle — 18 kernels, entry point renamed to `main`, consts emitted as named
+declarations (`consts_as_decls`) so app.js can still patch per-layer shapes —
+and every one compiles under naga. But the page produces EMPTY output with an
+implausible 1860 tok/s, where the captured bundle gives
+"The capital of France is **Paris**." at 156.9. So dispatches are failing or
+being skipped rather than computing.
+
+The default is therefore the captured bundle: shipping the browser broken to
+claim a milestone would be worse than not claiming it.
+
+Leads, in order: Dawn is stricter than naga and has caught translator bugs it
+tolerated before (the shift/paren fix in `translator._binop` came from exactly
+this), so the first step is reading the browser console rather than guessing —
+drive.mjs currently swallows it. Also worth checking that the device requests
+`shader-f16` for the kernels that emit `enable f16;`, and that no workgroup
+array exceeds Dawn's limits.
+
 ## The lesson this port paid for
 
 **Bit-exactness on synthetic inputs is necessary but NOT sufficient.** Kernels

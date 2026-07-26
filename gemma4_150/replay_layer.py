@@ -27,6 +27,23 @@ from gemma4_150.metal_runner import G4, TOKJSON, Batch, _SHARED
 
 # kernel -> (runner key prefix, input buffers to capture, output buffers to diff)
 SPECS = {
+    "qkv_70": {
+        "prefix": "qkv_",
+        "inputs": [("a", 1536, np.float32), ("suma", 1, np.float32)],
+        "outputs": [("outq", 4096, np.float32), ("outk", 512, np.float32),
+                    ("outv", 512, np.float32)],
+        "consts": lambda key: (lambda qd, hd: {
+            "Q_OUT": qd, "KV_OUT": hd, "Q_WGS": qd // 2, "KV_WGS": hd // 2,
+            "TOTAL_WGS": qd // 2 + hd, "GRID_X": qd // 2 + hd,
+        })(*(int(x) for x in key.split("_")[1:3])),
+        "threads": 32,
+    },
+    "logits_33": {
+        "prefix": "logits_33",
+        "inputs": [("normed", 1536, np.float32)],
+        "outputs": [("logits", 262144, np.float32)],
+        "consts": lambda key: None, "threads": 128,
+    },
     "down_96": {
         "prefix": "down_96",
         "inputs": [("geglu", 12288, np.float16), ("hidden", 1536, np.float32),
@@ -134,7 +151,12 @@ def sweep(g, spec, which, ids, n_tokens):
     has to ride along with a real multi-token decode rather than replay one step.
     """
     fn = getattr(kernels_dsl, which)
+    # _compile_all also registers every .metal under its bare basename, which
+    # the runner never dispatches — drop it when shape variants exist, or its
+    # key fails to parse as a geometry.
     stock = {k: v for k, v in g.kernels.items() if k.startswith(spec["prefix"])}
+    if len(stock) > 1:
+        stock.pop(which, None)
     dsl = {}
     for key in stock:
         g._compile_one(translate(fn, workgroup_size=(spec["threads"], 1, 1),

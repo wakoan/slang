@@ -652,3 +652,72 @@ def test_gateup_74_bit_exact(dev, qs):
 @pytest.mark.parametrize("qs", [0.0, 0.0234375])
 def test_gateup_95_bit_exact(dev, qs):
     _gateup_case(dev, "gateup_95", inter=12288, wpr=96, chunks=4, n_rows=2, qs=qs)
+
+
+@pytest.mark.parametrize("qd,hd", [(2048, 256), (4096, 512)])
+def test_qkv_70_bit_exact(dev, qd, hd):
+    """All three branches (q/k/v) at both layer geometries."""
+    WPR, N_ROWS = 192, 2
+    q_wgs, kv_wgs = qd // 2, hd // 2
+    # Q_WGS + 2*KV_WGS: k and v each get their own KV_WGS slice of the grid.
+    # (= the runner's qd//2 + hd)
+    total = q_wgs + 2 * kv_wgs
+    rng = np.random.default_rng(111)
+    a = rng.standard_normal(WPR * 2 * 4).astype(np.float32)
+    qb = rng.integers(0, 2 ** 32, size=qd * WPR, dtype=np.uint64).astype(np.uint32)
+    kb = rng.integers(0, 2 ** 32, size=hd * WPR, dtype=np.uint64).astype(np.uint32)
+    vb = rng.integers(0, 2 ** 32, size=hd * WPR, dtype=np.uint64).astype(np.uint32)
+    scales = (rng.random(qd + 2 * hd).astype(np.float32) * 0.01 + 0.001)
+    suma = np.array([9.75], np.float32)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        bs = [dev.newBufferWithBytes_length_options_(x.tobytes(), x.nbytes, SH)
+              for x in (a, qb, kb, vb, scales, suma)]
+        oq = dev.newBufferWithLength_options_(qd * 4, SH)
+        ok = dev.newBufferWithLength_options_(hd * 4, SH)
+        ov = dev.newBufferWithLength_options_(hd * 4, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<fffI", 0.03125, 0.0234375, 0.0156, 0), 16, SH)
+        _run(dev, _pso(dev, src, "qkv_70"), (*bs, oq, ok, ov, bp), total, 32)
+        return tuple(np.frombuffer(b.contents().as_buffer(n * 4), np.float32).copy()
+                     for b, n in ((oq, qd), (ok, hd), (ov, hd)))
+
+    ref_src = (open(os.path.join(KDIR, "qkv_70.metal")).read()
+               .replace("Q_OUT=2048u", f"Q_OUT={qd}u").replace("KV_OUT=256u", f"KV_OUT={hd}u")
+               .replace("Q_WGS=1024u", f"Q_WGS={q_wgs}u").replace("KV_WGS=128u", f"KV_WGS={kv_wgs}u")
+               .replace("TOTAL_WGS=1280u", f"TOTAL_WGS={total}u")
+               .replace("GRID_X=1280u", f"GRID_X={total}u"))
+    consts = {"Q_OUT": qd, "KV_OUT": hd, "Q_WGS": q_wgs, "KV_WGS": kv_wgs,
+              "TOTAL_WGS": total, "GRID_X": total}
+    ref = go(ref_src)
+    got = go(translate(kernels_dsl.qkv_70, workgroup_size=(32, 1, 1),
+                       target="msl", consts=consts))
+    for nm, r, g in zip("qkv", ref, got):
+        assert np.array_equal(g, r), f"out_{nm}: max |d| {np.abs(g-r).max():.3e}"
+        assert np.count_nonzero(g), f"out_{nm} empty"
+
+
+def test_logits_33_bit_exact(dev):
+    """Block-major 2-bit GEMV over the full 262144-wide vocabulary."""
+    K, N, TILE, NUM_BLK = 1536, 262144, 128, 24
+    rng = np.random.default_rng(112)
+    a = rng.standard_normal(K).astype(np.float32)
+    bits = rng.integers(0, 2 ** 32, size=NUM_BLK * N * 4, dtype=np.uint64).astype(np.uint32)
+    scale = (rng.random(N).astype(np.float32) * 0.01 + 0.001)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        ba = dev.newBufferWithBytes_length_options_(a.tobytes(), a.nbytes, SH)
+        bb = dev.newBufferWithBytes_length_options_(bits.tobytes(), bits.nbytes, SH)
+        bsc = dev.newBufferWithBytes_length_options_(scale.tobytes(), scale.nbytes, SH)
+        bo = dev.newBufferWithLength_options_(N * 4, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<ffII", 0.0234375, 0.03125, 0, 0), 16, SH)
+        _run(dev, _pso(dev, src, "logits_33"), (ba, bb, bsc, bo, bp), N // TILE, TILE)
+        return np.frombuffer(bo.contents().as_buffer(N * 4), np.float32).copy()
+
+    ref = go(open(os.path.join(KDIR, "logits_33.metal")).read())
+    got = go(translate(kernels_dsl.logits_33, target="msl"))
+    assert np.array_equal(got, ref), f"max |d| {np.abs(got-ref).max():.3e}"
+    assert np.count_nonzero(got) > N // 2

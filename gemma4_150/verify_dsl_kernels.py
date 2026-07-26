@@ -32,7 +32,7 @@ PORTED = ["rmssrq_69", "combine", "srqh_b", "srq_b", "geglu_b", "down_75",
           "embed_00", "plegather_01", "argmax1_34", "argmax2_35",
           "rmsadd_b", "rmssrqh_b", "combine_b", "proj_68", "plegate_76",
           "pleproj_77",
-          "down_96", "gateup_74", "gateup_95"]
+          "down_96", "gateup_74", "gateup_95", "logits_33"]
 
 # Shape-parameterized kernels: one DSL source, one variant per layer geometry.
 # (dsl name, runner key, consts, threads) — the runner registers these under
@@ -40,6 +40,10 @@ PORTED = ["rmssrq_69", "combine", "srqh_b", "srq_b", "geglu_b", "down_75",
 SPECIALIZED = (
     [("kvnorm", f"kvnorm_{hd}", {"HD": hd, "HALF": hd // 2}, hd) for hd in (256, 512)]
     + [("oproj_73", f"oproj_{qd}", {"WPR": qd // 8}, 256) for qd in (2048, 4096)]
+    + [("qkv_70", f"qkv_{qd}_{hd}",
+        {"Q_OUT": qd, "KV_OUT": hd, "Q_WGS": qd // 2, "KV_WGS": hd // 2,
+         "TOTAL_WGS": qd // 2 + hd, "GRID_X": qd // 2 + hd}, 32)
+       for qd, hd in ((2048, 256), (4096, 512))]
 )
 
 PROMPT = "Write a 200-word essay about the sea."

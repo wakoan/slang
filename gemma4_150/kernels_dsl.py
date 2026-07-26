@@ -1353,3 +1353,156 @@ def gateup_95(
                 else:
                     out[o2] = f16(clamp(round(dq / qs), f32(-128.0), f32(127.0)))
     barrier()
+
+
+@kernel(workgroup_size=(32, 1, 1),
+        consts={"Q_OUT": 2048, "KV_OUT": 256, "Q_WGS": 1024, "KV_WGS": 128,
+                "TOTAL_WGS": 1280, "GRID_X": 1280})
+def qkv_70(
+    a: StorageBuffer[vec4[f32], "read"],
+    q_bits: StorageBuffer[u32, "read"],
+    k_bits: StorageBuffer[u32, "read"],
+    v_bits: StorageBuffer[u32, "read"],
+    scales: StorageBuffer[f32, "read"],
+    sum_a: StorageBuffer[f32, "read"],
+    out_q: StorageBuffer[f32],
+    out_k: StorageBuffer[f32],
+    out_v: StorageBuffer[f32],
+    params: Uniform[vec4[u32]],          # (qOutScale, kOutScale, vOutScale, _)
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """q, k and v projections in ONE dispatch, split by workgroup id.
+
+    The three matrices have different row counts, so rather than three dispatches
+    the grid is partitioned: the first Q_WGS workgroups do q, the next KV_WGS do
+    k, the rest do v. All six shape constants are per-layer consts.
+
+    Raw-byte unpacking here (no /255) with the matching zero-point subtraction
+    `rQA - ZP*rA` — unlike the MLP kernels, which use the unorm form and undo it
+    with fma(...,255,...).
+    """
+    wgId: u32 = wg.y * u32(GRID_X) + wg.x
+    if wgId < u32(TOTAL_WGS):
+        sumQA: PrivateArray[f32, 2]
+        for r0 in range(2):
+            sumQA[r0] = f32(0.0)
+        if wgId < u32(Q_WGS):
+            rowBase: u32 = wgId * u32(2)
+            for w in range(tid, 192, 32):
+                avc0: vec4[f32] = a[w * u32(2)]
+                avc1: vec4[f32] = a[w * u32(2) + u32(1)]
+                for r in range(2):
+                    o: u32 = rowBase + u32(r)
+                    if o < u32(Q_OUT):
+                        p: u32 = q_bits[o * u32(192) + w]
+                        lo: vec4[f32] = vec4[f32](unpack4xU8(p & u32(0x0F0F0F0F)))
+                        hi: vec4[f32] = vec4[f32](unpack4xU8((p >> u32(4)) & u32(0x0F0F0F0F)))
+                        sumQA[r] = sumQA[r] + (dot(vec4[f32](lo.x, hi.x, lo.y, hi.y), avc0)
+                                               + dot(vec4[f32](lo.z, hi.z, lo.w, hi.w), avc1))
+            rA: f32 = sum_a[0]
+            for r2 in range(2):
+                rQA: f32 = subgroupAdd(sumQA[r2])
+                o2: u32 = rowBase + u32(r2)
+                if tid == u32(0):
+                    if o2 < u32(Q_OUT):
+                        out_q[o2] = srq(scales[o2] * (rQA - f32(8.0) * rA),
+                                        bitcast_f32(params.x))
+        else:
+            if wgId < u32(Q_WGS) + u32(KV_WGS):
+                rowBaseK: u32 = (wgId - u32(Q_WGS)) * u32(2)
+                for wk in range(tid, 192, 32):
+                    kvc0: vec4[f32] = a[wk * u32(2)]
+                    kvc1: vec4[f32] = a[wk * u32(2) + u32(1)]
+                    for rk in range(2):
+                        ok: u32 = rowBaseK + u32(rk)
+                        if ok < u32(KV_OUT):
+                            pk: u32 = k_bits[ok * u32(192) + wk]
+                            klo: vec4[f32] = vec4[f32](unpack4xU8(pk & u32(0x0F0F0F0F)))
+                            khi: vec4[f32] = vec4[f32](unpack4xU8((pk >> u32(4)) & u32(0x0F0F0F0F)))
+                            sumQA[rk] = sumQA[rk] + (dot(vec4[f32](klo.x, khi.x, klo.y, khi.y), kvc0)
+                                                     + dot(vec4[f32](klo.z, khi.z, klo.w, khi.w), kvc1))
+                rAk: f32 = sum_a[0]
+                for rk2 in range(2):
+                    rQAk: f32 = subgroupAdd(sumQA[rk2])
+                    ok2: u32 = rowBaseK + u32(rk2)
+                    if tid == u32(0):
+                        if ok2 < u32(KV_OUT):
+                            out_k[ok2] = srq(scales[u32(Q_OUT) + ok2] * (rQAk - f32(8.0) * rAk),
+                                             bitcast_f32(params.y))
+            else:
+                rowBaseV: u32 = (wgId - u32(Q_WGS) - u32(KV_WGS)) * u32(2)
+                for wv in range(tid, 192, 32):
+                    vvc0: vec4[f32] = a[wv * u32(2)]
+                    vvc1: vec4[f32] = a[wv * u32(2) + u32(1)]
+                    for rv in range(2):
+                        ov: u32 = rowBaseV + u32(rv)
+                        if ov < u32(KV_OUT):
+                            pv: u32 = v_bits[ov * u32(192) + wv]
+                            vlo: vec4[f32] = vec4[f32](unpack4xU8(pv & u32(0x0F0F0F0F)))
+                            vhi: vec4[f32] = vec4[f32](unpack4xU8((pv >> u32(4)) & u32(0x0F0F0F0F)))
+                            sumQA[rv] = sumQA[rv] + (dot(vec4[f32](vlo.x, vhi.x, vlo.y, vhi.y), vvc0)
+                                                     + dot(vec4[f32](vlo.z, vhi.z, vlo.w, vhi.w), vvc1))
+                rAv: f32 = sum_a[0]
+                for rv2 in range(2):
+                    rQAv: f32 = subgroupAdd(sumQA[rv2])
+                    ov2: u32 = rowBaseV + u32(rv2)
+                    if tid == u32(0):
+                        if ov2 < u32(KV_OUT):
+                            out_v[ov2] = srq(scales[u32(Q_OUT) + u32(KV_OUT) + ov2]
+                                             * (rQAv - f32(8.0) * rAv),
+                                             bitcast_f32(params.z))
+
+
+@kernel(workgroup_size=(128, 1, 1))
+def logits_33(
+    a: StorageBuffer[f32, "read"],
+    bits_buf: StorageBuffer[vec4[u32], "read"],
+    scale: StorageBuffer[f32, "read"],
+    out: StorageBuffer[f32],
+    params: Uniform[vec4[u32]],          # (inScale, outScale, _, _)
+    at: WorkgroupArray[f32, 1536],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """Dense 2-bit block-major logits GEMV, one thread per output column.
+
+    The weights are block-major — 24 blocks of 64 values, each block a uint4 —
+    so a thread reads its whole column with no reduction at all, which is why
+    262144 outputs are affordable. The activation row is staged in workgroup
+    memory once and reused by all 128 columns.
+
+    block_dot is inlined because DSL helpers cannot take a threadgroup pointer.
+    """
+    inScale: f32 = bitcast_f32(params.x)
+    col: u32 = (wg.y * u32(2048) + wg.x) * u32(128) + tid
+    for i in range(tid, 1536, 128):
+        at[i] = srq(a[i], inScale)
+    barrier()
+    if col < u32(262144):
+        acc: f32 = f32(0.0)
+        for blk in range(24):
+            bv: vec4[u32] = bits_buf[u32(blk) * u32(262144) + col]
+            aBase: u32 = u32(blk) * u32(64)
+            s: f32 = f32(0.0)
+            for j in range(4):
+                packed: u32 = bv[j]
+                d0: vec4[f32] = vec4[f32](unpack4xU8(packed & u32(0x03030303))) \
+                    - vec4[f32](f32(2.0), f32(2.0), f32(2.0), f32(2.0))
+                d1: vec4[f32] = vec4[f32](unpack4xU8((packed >> u32(2)) & u32(0x03030303))) \
+                    - vec4[f32](f32(2.0), f32(2.0), f32(2.0), f32(2.0))
+                d2: vec4[f32] = vec4[f32](unpack4xU8((packed >> u32(4)) & u32(0x03030303))) \
+                    - vec4[f32](f32(2.0), f32(2.0), f32(2.0), f32(2.0))
+                d3: vec4[f32] = vec4[f32](unpack4xU8((packed >> u32(6)) & u32(0x03030303))) \
+                    - vec4[f32](f32(2.0), f32(2.0), f32(2.0), f32(2.0))
+                b: u32 = aBase + u32(j) * u32(16)
+                s = s + (dot(vec4[f32](d0.x, d1.x, d2.x, d3.x),
+                             vec4[f32](at[b], at[b + u32(1)], at[b + u32(2)], at[b + u32(3)]))
+                         + dot(vec4[f32](d0.y, d1.y, d2.y, d3.y),
+                               vec4[f32](at[b + u32(4)], at[b + u32(5)], at[b + u32(6)], at[b + u32(7)]))
+                         + dot(vec4[f32](d0.z, d1.z, d2.z, d3.z),
+                               vec4[f32](at[b + u32(8)], at[b + u32(9)], at[b + u32(10)], at[b + u32(11)]))
+                         + dot(vec4[f32](d0.w, d1.w, d2.w, d3.w),
+                               vec4[f32](at[b + u32(12)], at[b + u32(13)], at[b + u32(14)], at[b + u32(15)])))
+            acc = acc + s
+        out[col] = srq(scale[col] * acc, bitcast_f32(params.y))

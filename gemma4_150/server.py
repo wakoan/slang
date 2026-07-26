@@ -56,12 +56,11 @@ DSL_KERNELS = {
     "35_main": ("argmax2_35", (256, 1, 1), {}),
 }
 
-# Defaults to the CAPTURED kernels, not the DSL ones. The DSL bundle is served
-# correctly (18 kernels, `fn main`, patchable consts) and every kernel compiles
-# under naga, but the page renders empty output under Dawn while the captured
-# bundle produces "**Paris**" — an unresolved failure, so the browser stays on
-# the path that works. G4_KERNEL_SOURCE=dsl to reproduce and debug it.
-USE_DSL = os.environ.get("G4_KERNEL_SOURCE", "ref") == "dsl"
+# Serves the DSL-generated bundle: 18 kernels from gemma4_150/kernels_dsl.py,
+# entry point renamed to `main`, consts emitted as named declarations so app.js
+# can still patch per-layer shapes client-side. Verified in headless Chrome
+# against the captured bundle. G4_KERNEL_SOURCE=ref for the captured kernels.
+USE_DSL = os.environ.get("G4_KERNEL_SOURCE", "dsl") != "ref"
 
 
 def _dsl_wgsl(dsl_name, threads, consts):

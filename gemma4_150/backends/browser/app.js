@@ -251,11 +251,19 @@ function layer(L, pos, hidden, pleBuf, pleOff) {
     dispatch(`kvnorm_${hd}`, kvn, [outk, outv, b[`L${L}.k_norm`], cb, sb, kc, vc, UNIS[`pkv_${hd}`]], [1, 1, 1], `kvn|${hk}`);
   }
   // attention
-  let att = patch(K("101_srq"), { HEAD_DIM: hd, HALF_DIM: half });
-  att = att.replace("const OUT_Q: f32 = 0.014886821620166302;", `const OUT_Q: f32 = ${sc.o_in};`);
+  // Patch the union of both const sets: the captured kernel declares
+  // HEAD_DIM/HALF_DIM, the DSL one also declares HD4/J_GROUPS/PP_COUNTER_BASE.
+  // A name that is absent simply does not match, so one call serves both —
+  // whereas MISSING one leaves 256-wide layers running 512-wide constants, which
+  // computes at full speed and returns nonsense.
+  const att = patch(K("101_srq"), {
+    HEAD_DIM: hd, HALF_DIM: half, HD4: hd / 4, J_GROUPS: 256 / (hd / 4),
+    PP_COUNTER_BASE: 8 * 32 * (hd + 2), OUT_Q: sc.o_in,
+  });
   dispatch(`att_${hd}_${sc.o_in}`, att, [outq, b[`L${L}.q_norm`], cb, sb, kc, vc, partials, attn, UNIS[`parA_${hd}`]], [nH, 32, 1], `att|${hk}`);
   // 73 o-proj + norms
-  const k73 = patch(K("73_sg_sum"), { IN_FEATURES: qd, WORDS_PER_ROW: qd / 8 });
+  // WPR is the DSL kernel's name for WORDS_PER_ROW; patch both.
+  const k73 = patch(K("73_sg_sum"), { IN_FEATURES: qd, WORDS_PER_ROW: qd / 8, WPR: qd / 8 });
   const par73 = uniStatic(`p73_${L}`, new Float32Array([sc.o_out, sc.gate_in, 0, 0]));
   dispatch(`k73_${qd}`, k73, [attn, b[`L${L}.o_bits`], b[`L${L}.o_scale`], pp73, hidden, b[`L${L}.o_w12`], y2, sum2, par73], [192, 1, 1], `k73|${hk}`);
   // 74/95 gate-up ; 75/96 down

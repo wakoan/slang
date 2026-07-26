@@ -37,7 +37,7 @@ each backend loads its kernels from today:
 |---|---|---|
 | `metal_runner.py` (PyObjC) | **kernels_dsl** | tokens identical, KV bit-identical |
 | `runner.py` (wgpu) | **kernels_dsl** | tokens identical vs captured WGSL |
-| browser (`server.py` + `app.js`) | captured WGSL | DSL bundle serves but FAILS — see below |
+| browser (`server.py` + `app.js`) | **kernels_dsl** | headless Chrome: "**Paris**" at ~160 tok/s |
 | Swift, Rust | `kernels_msl/*.metal` | not started |
 
 Each gate compares the DEFAULT against the other source, so the direction flips
@@ -59,33 +59,30 @@ only surfaced under Dawn** -- the same "Dawn is stricter than naga" pattern that
 caught a translator bug earlier in this project. All five now use it, and the
 Metal parity/gates are unchanged.
 
-### OPEN: the browser still computes the wrong answer
+### Browser: RESOLVED
 
-`G4_KERNEL_SOURCE=dsl python -m gemma4_150.server` now serves a bundle where all
-18 kernels COMPILE under Dawn and the page runs at a plausible 161.5 tok/s
-(reference: 156.9) with no validation errors. But the generated text is garbage
-rather than empty, so the remaining fault is numerical, not structural.
+`python -m gemma4_150.server` now serves the DSL bundle by default, and headless
+Chrome produces "The capital of France is **Paris**." at ~160 tok/s sustained
+(captured bundle: 156.9). G4_KERNEL_SOURCE=ref for the captured kernels.
 
-**Most likely cause, not yet confirmed: unpatched shape constants.** app.js
-patches the constant names the CAPTURED kernels use, and the DSL kernels do not
-use the same set:
+Three faults, found in order, each hidden by the previous one:
 
-  * `101_srq` — app.js patches `HEAD_DIM`/`HALF_DIM`; the DSL kernel also needs
-    `HD4`, `J_GROUPS` and `PP_COUNTER_BASE`, which app.js does not know about,
-    so they keep their 512-wide values on every 256-wide layer.
-  * `73_sg_sum` — app.js patches `IN_FEATURES`/`WORDS_PER_ROW`; the DSL kernel
-    calls it `WPR`.
+1. **drive.mjs swallowed console errors**, so a failing shader looked like a
+   successful run with empty output. Nothing else was diagnosable until this was
+   fixed; `checkshaders.mjs` now compiles every served kernel under Dawn and
+   prints the real messages.
+2. **Non-uniform barriers** -- see above. A genuine WGSL bug in five kernels
+   that naga tolerates and Dawn does not.
+3. **Unpatched shape constants.** app.js patched the names the CAPTURED kernels
+   use; the DSL kernels declare a different set (101_srq also has HD4,
+   J_GROUPS, PP_COUNTER_BASE; oproj calls it WPR, not WORDS_PER_ROW). The
+   unpatched ones kept their 512-wide values, so every 256-wide layer ran with
+   512-wide constants -- computing at full speed and returning nonsense. app.js
+   now patches the union of both sets; a name that is absent simply does not
+   match, so one call serves either bundle.
 
-Both would produce exactly this signature: correct speed, wrong numbers. The fix
-is to align the const names (or have app.js patch the DSL set); the diagnosis
-should be confirmed by dumping one layer's intermediate from the page first.
-
-The default stays on the captured bundle until it produces the right answer.
-
-Getting here needed two other fixes, both real: drive.mjs swallowed console
-errors (a failing shader looked like a successful empty run), and app.js created
-uniform buffers without STORAGE usage, which Dawn rejects for attn_101''s 8-word
-params binding.
+The signature is worth remembering: **correct throughput, wrong output** points
+at specialization, not at the kernels. Empty output pointed at compilation.
 
 ## The lesson this port paid for
 

@@ -24,18 +24,46 @@ source in `kernels_dsl.py`. Two gates, both required before a kernel is used:
 * Swapping ONLY the two oproj variants changes greedy decode from token 161,
   reproducibly. So the divergence is real and caused by this kernel.
 
-**What that means:** the difference is input-dependent and does not show up in
-either synthetic data or a single dispatch on one real input. The most likely
-mechanism is a last-ulp difference that flips an `srq` rounding: activations are
-already on a quantization grid, so real inputs sit exactly on `round()`
-boundaries far more often than random data does, and one flip anywhere in
-35 layers x 161 tokens is enough to change the sampled token.
+**CAUSE FOUND — Metal fast-math FMA contraction.** `gemma4_150/replay_layer.py`
+compares stock vs DSL at every dispatch across real decode and reported the
+exact case: **token 98, layer 30**, where ONE element of `y2` (index 1078)
+differs by exactly one quantization step (-0.4966 vs -0.5190) while `pp` and
+`hidden` are bit-identical. So the whole divergence is one `srq` rounding flip
+in the pre-FFN norm, amplified from a last-ulp difference in `n2`.
+
+The ulp difference comes from how the Metal compiler contracts multiply-adds.
+`newLibraryWithSource_options_error_(src, None, None)` compiles with fast math,
+which permits contraction, and the choice depends on the exact expression
+structure. Demonstrated three ways on the captured failing input:
+
+* reference `hloc[e]` (a per-thread ARRAY) vs the same kernel patched to
+  re-read `hidden[j]` — reproduces the divergence exactly, index 1078 and all;
+* rewriting the DSL version to hold the six residuals in SCALARS instead of
+  re-reading — identical divergence, so it is not register-vs-memory;
+* splitting `normed` into its own statement to match the reference
+  line-for-line — made it WORSE, `hidden` itself then differing by 1.9e-6 at
+  token 0.
+
+So matching is not about semantics; it is about emitting an expression tree the
+compiler contracts identically. The reference stores into `float hloc[6]`, and
+an array element is treated differently from a scalar.
+
+**Next step:** DSL support for private (function-scope) arrays —
+`var x: array<f32,6>` in WGSL, `float x[6]` in MSL — so the kernel can be
+written the way the reference is instead of approximated. That is the only
+remaining gap; every other construct oproj_73 needs already works.
+
+An alternative worth measuring first: compile both with fast math DISABLED
+(`MTLCompileOptions.fastMathEnabled = False`). If contraction is off, the
+structure stops mattering — but it would change the stock kernels' numerics
+too, so it is a runner-wide decision, not a port detail.
 
 **Ruled out:**
 
-* The `hloc` -> re-read substitution (the DSL has no local arrays, so the second
-  norm pass re-reads `hidden[j]` instead of a per-thread cache). Patching the
-  HAND-WRITTEN kernel with only that change is bit-identical over 12 seeds.
+* ~~The `hloc` -> re-read substitution.~~ RETRACTED: this was ruled out on 12
+  random seeds, and that control had the same blind spot as the parity test.
+  On the captured failing input it reproduces the divergence exactly. Random
+  data does not land on `round()` boundaries; real activations do constantly.
 * Float addition associativity — a real bug found and fixed here (`a += X + Y`
   is `a + (X+Y)`, not `(a+X)+Y`; the same slip was present in `down_75` and
   `plegate_76` and is fixed in all three). Fixing it did not change the

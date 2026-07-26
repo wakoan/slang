@@ -898,13 +898,14 @@ def oproj_73(
 
     WPR is a const (256 on sliding layers, 512 on full ones).
 
-    DEVIATION, deliberate and bit-exact: the reference caches its 6 per-thread
-    residual values in `float hloc[6]` between the two norms. The DSL has no
-    local arrays, so the second pass RE-READS hidden[j] instead. That value was
-    written by the same thread earlier in the same kernel and f32 storage is
-    lossless, so the arithmetic is identical — it costs 1536 extra f32 reads per
-    token and nothing else. The parity test is what makes that claim checkable
-    rather than a hope.
+    The two norm passes keep their six per-thread residuals in SCALARS, not by
+    re-reading hidden[]. The re-read looks equivalent and is not: the reference
+    holds hv in a register, and the compiler's contraction there differs from a
+    device round-trip by a ulp, which srq's round() turns into a full
+    quantization step. That cost a real debugging cycle — it survived 12 random
+    seeds and a single-dispatch check on real data, and only showed up as a
+    changed token 98 decode steps in (see PORT_NOTES.md). OUT_F/WG is exactly 6,
+    so the loops are unrolled sixfold rather than indexed.
     """
     sgId: u32 = tid / u32(32)
     lane: u32 = tid & u32(31)
@@ -959,11 +960,29 @@ def oproj_73(
         rms1: f32 = inverseSqrt(t1 / f32(1536.0) + f32(1e-6))
 
         acc2: f32 = f32(0.0)
-        for j in range(tid, 1536, 256):
-            normed: f32 = bitcast_f32(atomicLoad(pp, j)) * rms1 * w12[j]
-            hv: f32 = hidden[j] + normed
-            hidden[j] = hv
-            acc2 = acc2 + hv * hv
+        h0: f32 = hidden[tid] + bitcast_f32(atomicLoad(pp, tid)) * rms1 * w12[tid]
+        hidden[tid] = h0
+        acc2 = acc2 + h0 * h0
+        i1: u32 = tid + u32(256)
+        h1: f32 = hidden[i1] + bitcast_f32(atomicLoad(pp, i1)) * rms1 * w12[i1]
+        hidden[i1] = h1
+        acc2 = acc2 + h1 * h1
+        i2: u32 = tid + u32(512)
+        h2: f32 = hidden[i2] + bitcast_f32(atomicLoad(pp, i2)) * rms1 * w12[i2]
+        hidden[i2] = h2
+        acc2 = acc2 + h2 * h2
+        i3: u32 = tid + u32(768)
+        h3: f32 = hidden[i3] + bitcast_f32(atomicLoad(pp, i3)) * rms1 * w12[i3]
+        hidden[i3] = h3
+        acc2 = acc2 + h3 * h3
+        i4: u32 = tid + u32(1024)
+        h4: f32 = hidden[i4] + bitcast_f32(atomicLoad(pp, i4)) * rms1 * w12[i4]
+        hidden[i4] = h4
+        acc2 = acc2 + h4 * h4
+        i5: u32 = tid + u32(1280)
+        h5: f32 = hidden[i5] + bitcast_f32(atomicLoad(pp, i5)) * rms1 * w12[i5]
+        hidden[i5] = h5
+        acc2 = acc2 + h5 * h5
         r2: f32 = subgroupAdd(acc2)
         if (tid & u32(31)) == u32(0):
             sgp[tid >> u32(5)] = r2
@@ -975,11 +994,24 @@ def oproj_73(
         rms2: f32 = inverseSqrt(t2 / f32(1536.0) + f32(1e-6))
 
         qAcc: f32 = f32(0.0)
-        for j2 in range(tid, 1536, 256):
-            n2: f32 = hidden[j2] * rms2 * w12[u32(1536) + j2]
-            qv: f16 = f16(srq(f32(f16(n2)), inScale2))
-            y2[j2] = qv
-            qAcc = qAcc + f32(qv)
+        q0v: f16 = f16(srq(f32(f16(h0 * rms2 * w12[u32(1536) + tid])), inScale2))
+        y2[tid] = q0v
+        qAcc = qAcc + f32(q0v)
+        q1v: f16 = f16(srq(f32(f16(h1 * rms2 * w12[u32(1536) + i1])), inScale2))
+        y2[i1] = q1v
+        qAcc = qAcc + f32(q1v)
+        q2v: f16 = f16(srq(f32(f16(h2 * rms2 * w12[u32(1536) + i2])), inScale2))
+        y2[i2] = q2v
+        qAcc = qAcc + f32(q2v)
+        q3v: f16 = f16(srq(f32(f16(h3 * rms2 * w12[u32(1536) + i3])), inScale2))
+        y2[i3] = q3v
+        qAcc = qAcc + f32(q3v)
+        q4v: f16 = f16(srq(f32(f16(h4 * rms2 * w12[u32(1536) + i4])), inScale2))
+        y2[i4] = q4v
+        qAcc = qAcc + f32(q4v)
+        q5v: f16 = f16(srq(f32(f16(h5 * rms2 * w12[u32(1536) + i5])), inScale2))
+        y2[i5] = q5v
+        qAcc = qAcc + f32(q5v)
         r3: f32 = subgroupAdd(qAcc)
         if (tid & u32(31)) == u32(0):
             sgp[tid >> u32(5)] = r3

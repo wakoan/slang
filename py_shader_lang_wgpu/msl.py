@@ -20,7 +20,8 @@ from __future__ import annotations
 import ast
 
 from .translator import _WGSLTranslator, TranslationError, _P_ATOM
-from .types import StorageBufferType, UniformType, BuiltinValue, WorkgroupArrayType
+from .types import (StorageBufferType, AtomicBufferType, UniformType,
+                    BuiltinValue, WorkgroupArrayType)
 
 _MSL_SCALARS = {
     "u32": "uint",
@@ -40,6 +41,16 @@ _MSL_BUILTIN_ATTRS = {
     "subgroup_invocation_id": ("uint", "thread_index_in_simdgroup"),
     "subgroup_size": ("uint", "threads_per_simdgroup"),
 }
+
+_MSL_ATOMICS = {
+    "atomicAdd": "atomic_fetch_add_explicit",
+    "atomicMax": "atomic_fetch_max_explicit",
+    "atomicMin": "atomic_fetch_min_explicit",
+    "atomicStore": "atomic_store_explicit",
+    "atomicLoad": "atomic_load_explicit",
+}
+
+_MSL_BITCASTS = {"bitcast_u32": "uint", "bitcast_f32": "float", "bitcast_i32": "int"}
 
 _MSL_INTRINSICS = {
     "f32": "float",
@@ -81,6 +92,13 @@ class _MSLTranslator(_WGSLTranslator):
     def _ident(self, name: str) -> str:
         return name + "_" if name in _MSL_RESERVED else name
 
+    def _uses(self, node: ast.AST, fn: str) -> bool:
+        """Is `fn` called anywhere in the kernel or its helpers?"""
+        return any(
+            isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == fn
+            for sn in [node] + [d.node for d in self._device_fns]
+            for n in ast.walk(sn))
+
     # ------------------------------------------------------------------ #
     # Function-level                                                       #
     # ------------------------------------------------------------------ #
@@ -91,12 +109,24 @@ class _MSLTranslator(_WGSLTranslator):
         self._emit("#include <metal_stdlib>")
         self._emit("using namespace metal;")
         self._emit()
+        if self._uses(node, "workgroupUniformLoad"):
+            self._emit("template <typename T> inline T _wgUniformLoad("
+                       "threadgroup T& v) {")
+            self._emit("    threadgroup_barrier(mem_flags::mem_threadgroup);")
+            self._emit("    return v;")
+            self._emit("}")
+            self._emit()
         self._emit_device_fns()
         ws = ", ".join(str(s) for s in self._workgroup_size)
         self._emit(f"// dispatch with threadsPerThreadgroup = ({ws})")
 
         params: list[str] = []
         for group, idx, name, typ in bindings:
+            if isinstance(typ, AtomicBufferType):
+                # atomic_uint / atomic_int; never const -- they are read_write
+                elem = "atomic_uint" if typ.elem_type.wgsl_name == "u32" else "atomic_int"
+                params.append(f"device {elem}* {self._ident(name)} [[buffer({idx})]]")
+                continue
             const = "const " if typ.access == "read" else ""
             elem = _msl_type(typ.elem_type.wgsl_name)
             params.append(f"device {const}{elem}* {self._ident(name)} [[buffer({idx})]]")
@@ -158,6 +188,24 @@ class _MSLTranslator(_WGSLTranslator):
             return "threadgroup_barrier(mem_flags::mem_threadgroup)"
         if fn in ("subgroup_barrier", "subgroupBarrier"):
             return "simdgroup_barrier(mem_flags::mem_device)"
+        # storageBarrier orders DEVICE memory; mem_threadgroup would not make a
+        # workgroup's published partials visible to the last-arriver workgroup.
+        if fn == "storageBarrier":
+            return "threadgroup_barrier(mem_flags::mem_device)"
+        if fn in _MSL_ATOMICS:
+            if len(args) < 2:
+                raise TranslationError(f"{fn} takes (buffer, index[, value])")
+            rest = "".join(", " + a for a in args[2:])
+            return (f"{_MSL_ATOMICS[fn]}(&{args[0]}[{args[1]}]{rest}, "
+                    "memory_order_relaxed)")
+        if fn in _MSL_BITCASTS:
+            return f"as_type<{_MSL_BITCASTS[fn]}>({args[0]})"
+        # WGSL's workgroupUniformLoad carries an implicit barrier; MSL has no
+        # equivalent, so it becomes barrier-then-read via a helper (emitted in
+        # the preamble). Callers must reach it in uniform control flow, exactly
+        # as WGSL already requires.
+        if fn == "workgroupUniformLoad":
+            return f"_wgUniformLoad({args[0]})"
         if fn == "unpack2x16float":
             return f"float2(as_type<half2>({joined}))"
         if fn in _MSL_INTRINSICS:

@@ -68,6 +68,43 @@ class _StorageBufferFactory:
 StorageBuffer = _StorageBufferFactory()
 
 
+class AtomicBufferType(StorageBufferType):
+    """A storage buffer of atomics: `array<atomic<u32>>`.
+
+    Needed because the WGSL memory model only guarantees cross-workgroup
+    visibility through atomics. The fused kernels use this for the
+    "last-arriver" pattern: every workgroup publishes its partial result and
+    bumps a ticket counter, and whichever workgroup takes the last ticket reads
+    all the partials back and finishes the reduction in the same dispatch. f32
+    values ride through as bit patterns (see `bitcast_u32` / `bitcast_f32`),
+    since only integer atomics exist.
+    """
+
+    def __init__(self, elem_type: WGSLType = None) -> None:
+        elem_type = elem_type or u32
+        if elem_type not in (u32, i32):
+            raise TypeError("atomics support only u32 and i32")
+        self.elem_type = elem_type
+        self.access = "read_write"      # an atomic buffer is never read-only
+        WGSLType.__init__(self, f"array<atomic<{elem_type.wgsl_name}>>")
+
+    def __repr__(self) -> str:
+        return f"AtomicBuffer[{self.elem_type!r}]"
+
+
+class _AtomicBufferFactory:
+    """Usage: AtomicBuffer[u32] (or bare AtomicBuffer, which means u32)."""
+
+    def __getitem__(self, elem_type: WGSLType) -> AtomicBufferType:
+        return AtomicBufferType(elem_type)
+
+    def __repr__(self) -> str:
+        return "AtomicBuffer"
+
+
+AtomicBuffer = _AtomicBufferFactory()
+
+
 class UniformType(WGSLType):
     def __init__(self, elem_type: WGSLType) -> None:
         self.elem_type = elem_type

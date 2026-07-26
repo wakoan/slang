@@ -9,10 +9,16 @@ import typing
 from typing import Callable
 
 from .types import (
-    WGSLType, StorageBufferType, UniformType, BuiltinValue, WorkgroupArrayType,
+    WGSLType, StorageBufferType, AtomicBufferType, UniformType, BuiltinValue,
+    WorkgroupArrayType,
 )
 
 # Python-level intrinsics renamed to their WGSL equivalents
+# Atomic/bitcast helpers. These take (buffer, index, ...) rather than a pointer
+# because Python has no address-of operator; each backend re-forms the pointer.
+_ATOMIC_FNS = {"atomicAdd", "atomicStore", "atomicLoad", "atomicMax", "atomicMin"}
+_BITCAST_FNS = {"bitcast_u32": "u32", "bitcast_f32": "f32", "bitcast_i32": "i32"}
+
 _INTRINSIC_RENAMES = {
     "barrier": "workgroupBarrier",
     "subgroup_barrier": "subgroupBarrier",
@@ -28,7 +34,9 @@ distance dot exp exp2 extractBits faceForward firstLeadingBit
 firstTrailingBit floor fma fract insertBits inverseSqrt ldexp length log
 log2 max min mix modf normalize pow radians reflect refract reverseBits
 round saturate sign sin sinh smoothstep sqrt step tan tanh transpose trunc
-select arrayLength
+select arrayLength storageBarrier workgroupUniformLoad
+atomicAdd atomicStore atomicLoad atomicMax atomicMin
+bitcast_u32 bitcast_f32 bitcast_i32
 pack2x16float unpack2x16float pack2x16snorm pack2x16unorm pack4x8snorm
 pack4x8unorm unpack2x16snorm unpack2x16unorm unpack4x8snorm unpack4x8unorm
 pack4xI8 pack4xU8 unpack4xI8 unpack4xU8 dot4I8Packed dot4U8Packed
@@ -343,9 +351,11 @@ class _WGSLTranslator:
         # Emit @group/@binding declarations
         for group, idx, name, typ in bindings:
             access = "read" if typ.access == "read" else "read_write"
+            elem = (f"atomic<{typ.elem_type.wgsl_name}>"
+                    if isinstance(typ, AtomicBufferType) else typ.elem_type.wgsl_name)
             self._emit(
                 f"@group({group}) @binding({idx}) "
-                f"var<storage, {access}> {name}: array<{typ.elem_type.wgsl_name}>;"
+                f"var<storage, {access}> {name}: array<{elem}>;"
             )
         for group, idx, name, typ in uniforms:
             self._emit(
@@ -746,6 +756,17 @@ class _WGSLTranslator:
         special = self._call_special(fn, args)
         if special is not None:
             return special
+        # atomicX(buf, index, ...) -> atomicX(&buf[index], ...); the DSL spells
+        # these with an index because Python has no address-of operator.
+        if fn in _ATOMIC_FNS:
+            if len(args) < 2:
+                raise TranslationError(f"{fn} takes (buffer, index[, value])")
+            rest = "".join(", " + a for a in args[2:])
+            return f"{fn}(&{args[0]}[{args[1]}]{rest})"
+        if fn in _BITCAST_FNS:
+            return f"bitcast<{_BITCAST_FNS[fn]}>({args[0]})"
+        if fn == "workgroupUniformLoad":
+            return f"workgroupUniformLoad(&{args[0]})"
         joined = ", ".join(args)
         if fn in self._device_fn_names:
             return f"{self._ident(fn)}({joined})"

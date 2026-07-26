@@ -1103,3 +1103,253 @@ def pleproj_77(
         barrier()
         if tid == u32(0):
             sum2[0] = t3
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def down_96(
+    a: StorageBuffer[vec4[f16], "read"],
+    bits_buf: StorageBuffer[u32, "read"],
+    pp: AtomicBuffer[u32],
+    scale: StorageBuffer[f32, "read"],
+    hidden: StorageBuffer[f32],
+    nw: StorageBuffer[f32, "read"],
+    params: Uniform[vec4[u32]],
+    sgq: WorkgroupArray[vec4[f32], 8],
+    sgs: WorkgroupArray[f32, 8],
+    dsh: WorkgroupArray[f32, 1536],
+    lastFlag: WorkgroupArray[u32, 1],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """down_75's 2-bit twin for the wide-MLP layers (intermediate 12288).
+
+    Four 2-bit fields per byte instead of two 4-bit ones, so four activation
+    chunks and a ZP of 2 rather than 8. Same last-arriver merge.
+    """
+    rowBase: u32 = wg.x * u32(4)
+    inScale: f32 = bitcast_f32(params.x)
+    q: PrivateArray[f32, 4]
+    for r0 in range(4):
+        q[r0] = f32(0.0)
+    sumA: f32 = f32(0.0)
+
+    for w in range(tid, 768, 256):
+        av0: vec4[f32] = vec4[f32](a[w * u32(4)])
+        av1: vec4[f32] = vec4[f32](a[w * u32(4) + u32(1)])
+        av2: vec4[f32] = vec4[f32](a[w * u32(4) + u32(2)])
+        av3: vec4[f32] = vec4[f32](a[w * u32(4) + u32(3)])
+        sumA = sumA + ((av0.x + av0.y + av0.z + av0.w)
+                       + (av1.x + av1.y + av1.z + av1.w)
+                       + (av2.x + av2.y + av2.z + av2.w)
+                       + (av3.x + av3.y + av3.z + av3.w))
+        for r in range(4):
+            o: u32 = rowBase + u32(r)
+            if o < u32(1536):
+                p: u32 = bits_buf[o * u32(768) + w]
+                c0: vec4[f32] = unpack4x8unorm(p & u32(0x03030303))
+                c1: vec4[f32] = unpack4x8unorm((p >> u32(2)) & u32(0x03030303))
+                c2: vec4[f32] = unpack4x8unorm((p >> u32(4)) & u32(0x03030303))
+                c3: vec4[f32] = unpack4x8unorm((p >> u32(6)) & u32(0x03030303))
+                q[r] = q[r] + (dot(vec4[f32](c0.x, c1.x, c2.x, c3.x), av0)
+                               + dot(vec4[f32](c0.y, c1.y, c2.y, c3.y), av1)
+                               + dot(vec4[f32](c0.z, c1.z, c2.z, c3.z), av2)
+                               + dot(vec4[f32](c0.w, c1.w, c2.w, c3.w), av3))
+
+    red: vec4[f32] = subgroupAdd(vec4[f32](q[0], q[1], q[2], q[3]))
+    redA: f32 = subgroupAdd(sumA)
+    if (tid & u32(31)) == u32(0):
+        sgq[tid >> u32(5)] = red
+        sgs[tid >> u32(5)] = redA
+    barrier()
+    if tid == u32(0):
+        tot: vec4[f32] = vec4[f32](f32(0.0), f32(0.0), f32(0.0), f32(0.0))
+        aSum: f32 = f32(0.0)
+        for i in range(8):
+            tot = tot + sgq[i]
+            aSum = aSum + sgs[i]
+        outScale: f32 = bitcast_f32(params.y)
+        zpA: f32 = f32(2.0) * aSum
+        for r2 in range(4):
+            o2: u32 = rowBase + u32(r2)
+            if o2 < u32(1536):
+                dv: f32 = srq(scale[o2] * (inScale * fma(tot[r2], f32(255.0), -zpA)),
+                              outScale)
+                atomicStore(pp, o2, bitcast_u32(dv))
+    storageBarrier()
+    if tid == u32(0):
+        ticket: u32 = atomicAdd(pp, u32(1536), u32(1))
+        lastFlag[0] = u32(0)
+        if ticket == u32(383):
+            lastFlag[0] = u32(1)
+    barrier()
+    if lastFlag[0] == u32(1):
+        if tid == u32(0):
+            atomicStore(pp, u32(1536), u32(0))
+        acc: f32 = f32(0.0)
+        for o3 in range(tid, 1536, 256):
+            d: f32 = bitcast_f32(atomicLoad(pp, o3))
+            dsh[o3] = d
+            acc = acc + d * d
+        s1: f32 = subgroupAdd(acc)
+        if (tid & u32(31)) == u32(0):
+            sgs[tid >> u32(5)] = s1
+        barrier()
+        t1: f32 = f32(0.0)
+        for i2 in range(8):
+            t1 = t1 + sgs[i2]
+        barrier()
+        rms: f32 = inverseSqrt(t1 / f32(1536.0) + f32(1e-6))
+        for o4 in range(tid, 1536, 256):
+            hidden[o4] = hidden[o4] + dsh[o4] * rms * nw[o4]
+
+
+@kernel(workgroup_size=(64, 1, 1))
+def gateup_74(
+    hidden: StorageBuffer[vec4[f16], "read"],
+    gate_bits: StorageBuffer[u32, "read"],
+    gate_scale: StorageBuffer[f32, "read"],
+    up_bits: StorageBuffer[u32, "read"],
+    up_scale: StorageBuffer[f32, "read"],
+    sum_a: StorageBuffer[f32, "read"],
+    out: StorageBuffer[f16],
+    gelu_lut: StorageBuffer[f32, "read"],
+    params: Uniform[vec4[u32]],
+    lidx: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """Fused gate/up + geglu (4-bit), virtual-subgroup GEMV.
+
+    Two subgroups per workgroup, each owning 4 output rows; gate and up are
+    accumulated together so the shared activation chunk is read once for both.
+    """
+    gOut: f32 = bitcast_f32(params.x)
+    uOut: f32 = bitcast_f32(params.y)
+    sgId: u32 = lidx / u32(32)
+    tid: u32 = lidx & u32(31)
+    rowBase: u32 = (wg.x * u32(2) + sgId) * u32(4)
+    gAcc: PrivateArray[f32, 4]
+    uAcc: PrivateArray[f32, 4]
+    for r0 in range(4):
+        gAcc[r0] = f32(0.0)
+        uAcc[r0] = f32(0.0)
+    for wd in range(tid, 192, 32):
+        a0: vec4[f32] = vec4[f32](hidden[wd * u32(2)])
+        a1: vec4[f32] = vec4[f32](hidden[wd * u32(2) + u32(1)])
+        for r in range(4):
+            o: u32 = rowBase + u32(r)
+            if o < u32(6144):
+                pg: u32 = gate_bits[o * u32(192) + wd]
+                pu: u32 = up_bits[o * u32(192) + wd]
+                glo: vec4[f32] = unpack4x8unorm(pg & u32(0x0F0F0F0F))
+                ghi: vec4[f32] = unpack4x8unorm((pg >> u32(4)) & u32(0x0F0F0F0F))
+                gAcc[r] = gAcc[r] + (dot(vec4[f32](glo.x, ghi.x, glo.y, ghi.y), a0)
+                                     + dot(vec4[f32](glo.z, ghi.z, glo.w, ghi.w), a1))
+                ulo: vec4[f32] = unpack4x8unorm(pu & u32(0x0F0F0F0F))
+                uhi: vec4[f32] = unpack4x8unorm((pu >> u32(4)) & u32(0x0F0F0F0F))
+                uAcc[r] = uAcc[r] + (dot(vec4[f32](ulo.x, uhi.x, ulo.y, uhi.y), a0)
+                                     + dot(vec4[f32](ulo.z, uhi.z, ulo.w, uhi.w), a1))
+    aSum: f32 = sum_a[0]
+    for r2 in range(4):
+        gS: f32 = subgroupAdd(gAcc[r2])
+        uS: f32 = subgroupAdd(uAcc[r2])
+        if tid == u32(0):
+            o2: u32 = rowBase + u32(r2)
+            if o2 < u32(6144):
+                g: f32 = srq(gate_scale[o2] * fma(gS, f32(255.0),
+                                                  -(f32(8.0) * aSum)), gOut)
+                u: f32 = srq(up_scale[o2] * fma(uS, f32(255.0),
+                                                -(f32(8.0) * aSum)), uOut)
+                gv: f32 = f32(0.0)
+                if gOut == f32(0.0):
+                    gv = gelu_tanh(g)
+                else:
+                    gv = gelu_lut[u32(clamp(round(g / gOut),
+                                            f32(-128.0), f32(127.0)) + f32(128.0))]
+                dq: f32 = gv * u
+                qs: f32 = bitcast_f32(params.z)
+                if qs == f32(0.0):
+                    out[o2] = f16(dq)
+                else:
+                    out[o2] = f16(clamp(round(dq / qs), f32(-128.0), f32(127.0)))
+    barrier()
+
+
+@kernel(workgroup_size=(64, 1, 1))
+def gateup_95(
+    hidden: StorageBuffer[vec4[f16], "read"],
+    gate_bits: StorageBuffer[u32, "read"],
+    gate_scale: StorageBuffer[f32, "read"],
+    up_bits: StorageBuffer[u32, "read"],
+    up_scale: StorageBuffer[f32, "read"],
+    sum_a: StorageBuffer[f32, "read"],
+    out: StorageBuffer[f16],
+    gelu_lut: StorageBuffer[f32, "read"],
+    params: Uniform[vec4[u32]],
+    lidx: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """gateup_74's 2-bit twin for the wide-MLP layers (intermediate 12288).
+
+    Two rows per subgroup instead of four — the rows are twice as many, so the
+    grid grows rather than the per-thread work.
+    """
+    gOut: f32 = bitcast_f32(params.x)
+    uOut: f32 = bitcast_f32(params.y)
+    sgId: u32 = lidx / u32(32)
+    tid: u32 = lidx & u32(31)
+    rowBase: u32 = (wg.x * u32(2) + sgId) * u32(2)
+    gAcc: PrivateArray[f32, 2]
+    uAcc: PrivateArray[f32, 2]
+    for r0 in range(2):
+        gAcc[r0] = f32(0.0)
+        uAcc[r0] = f32(0.0)
+    for wd in range(tid, 96, 32):
+        a0: vec4[f32] = vec4[f32](hidden[wd * u32(4)])
+        a1: vec4[f32] = vec4[f32](hidden[wd * u32(4) + u32(1)])
+        a2: vec4[f32] = vec4[f32](hidden[wd * u32(4) + u32(2)])
+        a3: vec4[f32] = vec4[f32](hidden[wd * u32(4) + u32(3)])
+        for r in range(2):
+            o: u32 = rowBase + u32(r)
+            if o < u32(12288):
+                pg: u32 = gate_bits[o * u32(96) + wd]
+                pu: u32 = up_bits[o * u32(96) + wd]
+                g0: vec4[f32] = unpack4x8unorm(pg & u32(0x03030303))
+                g1: vec4[f32] = unpack4x8unorm((pg >> u32(2)) & u32(0x03030303))
+                g2: vec4[f32] = unpack4x8unorm((pg >> u32(4)) & u32(0x03030303))
+                g3: vec4[f32] = unpack4x8unorm((pg >> u32(6)) & u32(0x03030303))
+                gAcc[r] = gAcc[r] + (dot(vec4[f32](g0.x, g1.x, g2.x, g3.x), a0)
+                                     + dot(vec4[f32](g0.y, g1.y, g2.y, g3.y), a1)
+                                     + dot(vec4[f32](g0.z, g1.z, g2.z, g3.z), a2)
+                                     + dot(vec4[f32](g0.w, g1.w, g2.w, g3.w), a3))
+                u0: vec4[f32] = unpack4x8unorm(pu & u32(0x03030303))
+                u1: vec4[f32] = unpack4x8unorm((pu >> u32(2)) & u32(0x03030303))
+                u2: vec4[f32] = unpack4x8unorm((pu >> u32(4)) & u32(0x03030303))
+                u3: vec4[f32] = unpack4x8unorm((pu >> u32(6)) & u32(0x03030303))
+                uAcc[r] = uAcc[r] + (dot(vec4[f32](u0.x, u1.x, u2.x, u3.x), a0)
+                                     + dot(vec4[f32](u0.y, u1.y, u2.y, u3.y), a1)
+                                     + dot(vec4[f32](u0.z, u1.z, u2.z, u3.z), a2)
+                                     + dot(vec4[f32](u0.w, u1.w, u2.w, u3.w), a3))
+    aSum: f32 = sum_a[0]
+    for r2 in range(2):
+        gS: f32 = subgroupAdd(gAcc[r2])
+        uS: f32 = subgroupAdd(uAcc[r2])
+        if tid == u32(0):
+            o2: u32 = rowBase + u32(r2)
+            if o2 < u32(12288):
+                g: f32 = srq(gate_scale[o2] * fma(gS, f32(255.0),
+                                                  -(f32(2.0) * aSum)), gOut)
+                u: f32 = srq(up_scale[o2] * fma(uS, f32(255.0),
+                                                -(f32(2.0) * aSum)), uOut)
+                gv: f32 = f32(0.0)
+                if gOut == f32(0.0):
+                    gv = gelu_tanh(g)
+                else:
+                    gv = gelu_lut[u32(clamp(round(g / gOut),
+                                            f32(-128.0), f32(127.0)) + f32(128.0))]
+                dq: f32 = gv * u
+                qs: f32 = bitcast_f32(params.z)
+                if qs == f32(0.0):
+                    out[o2] = f16(dq)
+                else:
+                    out[o2] = f16(clamp(round(dq / qs), f32(-128.0), f32(127.0)))
+    barrier()

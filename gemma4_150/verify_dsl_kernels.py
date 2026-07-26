@@ -31,7 +31,8 @@ from gemma4_150.metal_runner import G4, TOKJSON
 PORTED = ["rmssrq_69", "combine", "srqh_b", "srq_b", "geglu_b", "down_75",
           "embed_00", "plegather_01", "argmax1_34", "argmax2_35",
           "rmsadd_b", "rmssrqh_b", "combine_b", "proj_68", "plegate_76",
-          "pleproj_77"]
+          "pleproj_77",
+          "down_96", "gateup_74", "gateup_95"]
 
 # Shape-parameterized kernels: one DSL source, one variant per layer geometry.
 # (dsl name, runner key, consts, threads) — the runner registers these under

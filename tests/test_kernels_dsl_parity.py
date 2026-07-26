@@ -580,3 +580,75 @@ def test_pleproj_77_bit_exact(dev):
     assert np.array_equal(got[1], ref[1]), "y2 differs"
     assert got[2] == ref[2], f"sum2 {got[2]} != {ref[2]}"
     assert got[3] == 0 == ref[3], "counter must self-reset"
+
+
+def test_down_96_bit_exact(dev):
+    """2-bit down for the wide-MLP layers (INTER=12288)."""
+    OUT_F, WPR, CHUNKS = 1536, 768, 4
+    TOTAL = OUT_F // 4
+    rng = np.random.default_rng(101)
+    a = (rng.standard_normal(WPR * CHUNKS * 4) * 2.0).astype(np.float16)
+    bits = rng.integers(0, 2 ** 32, size=OUT_F * WPR, dtype=np.uint64).astype(np.uint32)
+    scale = (rng.random(OUT_F).astype(np.float32) * 0.01 + 0.001)
+    hidden0 = rng.standard_normal(OUT_F).astype(np.float32)
+    nw = rng.standard_normal(OUT_F).astype(np.float32)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        ba = dev.newBufferWithBytes_length_options_(a.tobytes(), a.nbytes, SH)
+        bb = dev.newBufferWithBytes_length_options_(bits.tobytes(), bits.nbytes, SH)
+        bpp = dev.newBufferWithLength_options_((OUT_F + 1) * 4, SH)
+        bpp.contents().as_buffer((OUT_F + 1) * 4)[:] = b"\x00" * ((OUT_F + 1) * 4)
+        bsc = dev.newBufferWithBytes_length_options_(scale.tobytes(), scale.nbytes, SH)
+        bh = dev.newBufferWithBytes_length_options_(hidden0.tobytes(), hidden0.nbytes, SH)
+        bn = dev.newBufferWithBytes_length_options_(nw.tobytes(), nw.nbytes, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<ffII", 0.00787, 0.0234375, 0, 0), 16, SH)
+        _run(dev, _pso(dev, src, "down_96"), (ba, bb, bpp, bsc, bh, bn, bp), TOTAL, WG)
+        return (np.frombuffer(bh.contents().as_buffer(OUT_F * 4), np.float32).copy(),
+                int(np.frombuffer(bpp.contents().as_buffer((OUT_F + 1) * 4),
+                                  np.uint32)[OUT_F]))
+
+    ref = go(open(os.path.join(KDIR, "down_96.metal")).read())
+    got = go(translate(kernels_dsl.down_96, target="msl"))
+    assert np.array_equal(got[0], ref[0]), f"max |d| {np.abs(got[0]-ref[0]).max():.3e}"
+    assert got[1] == 0 == ref[1], "counter must self-reset"
+    assert not np.array_equal(got[0], hidden0)
+
+
+def _gateup_case(dev, name, inter, wpr, chunks, n_rows, qs):
+    rng = np.random.default_rng(102)
+    grid = inter // (2 * n_rows)
+    hid = (rng.standard_normal(wpr * chunks * 4) * 2.0).astype(np.float16)
+    gb = rng.integers(0, 2 ** 32, size=inter * wpr, dtype=np.uint64).astype(np.uint32)
+    ub = rng.integers(0, 2 ** 32, size=inter * wpr, dtype=np.uint64).astype(np.uint32)
+    gs = (rng.random(inter).astype(np.float32) * 0.01 + 0.001)
+    us = (rng.random(inter).astype(np.float32) * 0.01 + 0.001)
+    suma = np.array([12.5], np.float32)
+    lut = rng.standard_normal(256).astype(np.float32)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        bs = [dev.newBufferWithBytes_length_options_(x.tobytes(), x.nbytes, SH)
+              for x in (hid, gb, gs, ub, us, suma)]
+        bo = dev.newBufferWithLength_options_(inter * 2, SH)
+        bl = dev.newBufferWithBytes_length_options_(lut.tobytes(), lut.nbytes, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<fffI", 0.03125, 0.0234375, qs, 0), 16, SH)
+        _run(dev, _pso(dev, src, name), (*bs, bo, bl, bp), grid, 64)
+        return np.frombuffer(bo.contents().as_buffer(inter * 2), np.float16).copy()
+
+    ref = go(open(os.path.join(KDIR, name + ".metal")).read())
+    got = go(translate(getattr(kernels_dsl, name), target="msl"))
+    assert np.array_equal(got, ref), f"{name}: max |d| {np.abs(got-ref).max():.3e}"
+    assert np.count_nonzero(got), f"{name} wrote nothing"
+
+
+@pytest.mark.parametrize("qs", [0.0, 0.0234375])
+def test_gateup_74_bit_exact(dev, qs):
+    _gateup_case(dev, "gateup_74", inter=6144, wpr=192, chunks=2, n_rows=4, qs=qs)
+
+
+@pytest.mark.parametrize("qs", [0.0, 0.0234375])
+def test_gateup_95_bit_exact(dev, qs):
+    _gateup_case(dev, "gateup_95", inter=12288, wpr=96, chunks=4, n_rows=2, qs=qs)

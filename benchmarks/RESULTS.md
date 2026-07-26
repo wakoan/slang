@@ -46,6 +46,38 @@ Prefill is the sounder comparison: it is compute-bound at large M, so it is far
 less sensitive to the weight format, and it is where the batched-GEMM work
 (`gemma4_150/prefill_gpu.py`) actually shows up.
 
+## Portable prefill: what the non-Metal backends can reach
+
+Prefill's 1208 tok/s uses `MPSMatrixMultiplication`, an Apple library with no
+WGSL equivalent — so it cannot be "written once". `gemma4_150/kernels_dsl.py`
+holds a DSL-authored tiled GEMM that can, and `PrefillGPU.GEMM` selects between
+them (`"mps"` / `"dsl"`). One kernel source, two implementations.
+
+Measured on the same 1024-token prefill, Metal, so the comparison isolates the
+GEMM rather than the backend:
+
+| GEMM | prefill | vs MPS |
+|---|---:|---:|
+| MPS (Apple-only) | 1217 tok/s | 1.00× |
+| DSL `gemm_tiled` (portable) | 623 tok/s | 0.51× |
+| per-token (what wgpu/browser do today) | 158 tok/s | 0.13× |
+
+The two produce **bit-identical KV caches**, so this is purely a speed tradeoff.
+
+Isolated GEMM throughput on the dominant prefill shape (12288×1536 f16):
+
+| M | DSL | MPS |
+|---:|---:|---:|
+| 64 | 1.48 | 2.41 |
+| 256 | 2.50 | 5.22 |
+| 1024 | **2.61** | **5.64** |
+
+So the portable path is ~half of MPS and ~4× what the non-Metal backends have
+today. `gemm_tiled` is a first tiled implementation (32×32×16 tiles, 2×2 per
+thread); the gap to MPS is tuning headroom, not a hard limit — though the
+earlier `simdgroup_matrix` prototype also landed at 2.59, which suggests ~2.6 is
+where straightforward Metal-level tiling sits on this machine.
+
 ## Measurement notes
 
 Both hazards below produce large, confident, wrong numbers, and both were hit

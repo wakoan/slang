@@ -50,6 +50,13 @@ class PrefillGPU:
     ATTN_GEMM = True     # False falls back to the fused attn_prefill kernel; see
                          # _attn_gemm() for why the GEMM form exists
     MAXSEQ = 2048
+    # Which GEMM backs the weight matmuls:
+    #   "mps" — MPSMatrixMultiplication, 5.64 TFLOP/s, Apple-only
+    #   "dsl" — kernels_dsl.gemm_tiled, 2.61 TFLOP/s, runs anywhere the DSL does
+    # Metal defaults to MPS because it is there and it is 2.2x faster; wgpu and
+    # the browser have no equivalent and must use the DSL kernel. The kernel
+    # SOURCE is shared either way — this picks an implementation, not a codebase.
+    GEMM = "mps"
 
     def __init__(self, g: G4):
         self.g = g
@@ -65,6 +72,15 @@ class PrefillGPU:
     # ---- kernels -----------------------------------------------------------
     def _compile(self):
         g = self.g
+        if "gemm_tiled" not in g.kernels:
+            from gemma4_150.kernels_dsl import gemm_tiled
+            g._compile_one(gemm_tiled.msl, "gemm_tiled", "gemm_tiled")
+            # _compile_one parses "threadsPerThreadgroup = (N)" and builds a 1-D
+            # MTLSize, so a 2-D kernel silently gets 16 threads instead of 16x16
+            # — which computes a quarter of each tile and runs FASTER, i.e. it
+            # looks like a win on the clock and is simply wrong.
+            pso, _ = g.kernels["gemm_tiled"]
+            g.kernels["gemm_tiled"] = (pso, Metal.MTLSizeMake(*gemm_tiled.workgroup_size))
         src = open(DQ).read()
         for nb in (2, 4, 8):
             if f"dq{nb}" not in g.kernels:
@@ -118,6 +134,10 @@ class PrefillGPU:
         acols/ccols give A and C a row stride wider than the operation, which the
         attention GEMMs need: the score matrix is padded to a 16-byte-aligned row
         so MPS is happy, while the operation itself covers only the T real keys."""
+        # The DSL kernel has no row-stride parameter and no non-transposed form,
+        # so it takes the plain weight matmuls and MPS keeps the rest.
+        if self.GEMM == "dsl" and tr and acols is None and ccols is None:
+            return self._gemm_dsl(b, A, Wb, C, M, N, K, alpha)
         key = (M, N, K, alpha, tr)
         mm = self._mm.get(key)
         if mm is None:
@@ -127,6 +147,18 @@ class PrefillGPU:
             self._mm[key] = mm
         Bm = self._matrix(Wb, N, K) if tr else self._matrix(Wb, K, N)
         _mps_encode(b, mm, self._matrix(A, M, acols or K), Bm, self._matrix(C, M, ccols or N))
+
+    def _gemm_dsl(self, b, A, Wb, C, M, N, K, alpha=1.0):
+        """The portable GEMM: gemma4_150/kernels_dsl.py, emitted for this backend.
+
+        Transposed-right only (C = A @ W^T), which covers every weight matmul.
+        Attention's PV product is the one non-transposed GEMM and still needs a
+        variant, so it stays on MPS for now — see _attn_gemm."""
+        from gemma4_150.kernels_dsl import gemm_groups
+        gx, gy = gemm_groups(M, N)
+        b.dg2d("gemm_tiled",
+               [(A, 0), (Wb, 0), (C, 0),
+                self._uni(struct.pack("<3If", M, N, K, alpha))], gx, gy)
 
     def _dq(self, b, bits, scale, scale_off, dst, n_in, n_out):
         """Dequantize [n_out][n_in] to f16, deriving the bit width from the packed

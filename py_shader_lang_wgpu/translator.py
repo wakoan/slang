@@ -407,6 +407,14 @@ class _WGSLTranslator:
         elif isinstance(node, ast.Continue):
             self._emit("continue;")
         elif isinstance(node, ast.Expr):
+            # A bare string is a docstring/comment, not an expression statement.
+            # Carry it into the generated shader as a comment — the emitted WGSL
+            # and MSL are read directly when debugging, so the explanation of
+            # what a kernel does is worth more there than in the Python source.
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                for line in node.value.value.strip().splitlines():
+                    self._emit(("// " + line.strip()).rstrip())
+                return
             self._emit(self._expr(node.value) + ";")
         elif isinstance(node, ast.Pass):
             pass
@@ -806,7 +814,7 @@ class _WGSLTranslator:
         raise TranslationError(f"Unsupported annotation: {ast.dump(node)}")
 
 
-def translate(func: Callable, workgroup_size: tuple[int, ...] = (1,),
+def translate(func: Callable, workgroup_size: tuple[int, ...] | None = None,
               target: str = "wgsl") -> str:
     """Translate a Python function to a WGSL compute shader string.
 
@@ -823,6 +831,12 @@ def translate(func: Callable, workgroup_size: tuple[int, ...] = (1,),
     str
         Complete WGSL source for the compute shader (bindings + entry point).
     """
+    # Default to the size @kernel already recorded. Without this, re-translating
+    # a decorated kernel silently reverts to a 1-thread workgroup — and that is
+    # invisible on MSL, where the host supplies threadsPerThreadgroup at
+    # dispatch, so only the WGSL side breaks and it breaks quietly.
+    if workgroup_size is None:
+        workgroup_size = getattr(func, "workgroup_size", (1,))
     if not 1 <= len(workgroup_size) <= 3:
         raise TranslationError(
             f"workgroup_size must have 1–3 dimensions, got {len(workgroup_size)}"

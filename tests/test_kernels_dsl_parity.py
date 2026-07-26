@@ -541,3 +541,42 @@ def test_oproj_73_bit_exact(dev, wpr):
     assert got[2] == ref[2], f"sum2 {got[2]} != {ref[2]}"
     assert got[3] == 0 == ref[3], "counter must self-reset"
     assert not np.array_equal(got[0], hidden0), "kernel did not write hidden"
+
+
+def test_pleproj_77_bit_exact(dev):
+    """Atomic tail + three PrivateArrays (float4[2], float[2], float[6])."""
+    OUT_F, KV4, IN_F, TOTAL_WGS = 1536, 64, 256, 96
+    rng = np.random.default_rng(91)
+    a = rng.standard_normal(IN_F).astype(np.float32)
+    codes = rng.integers(0, 2 ** 32, size=OUT_F * KV4, dtype=np.uint64).astype(np.uint32)
+    row_scale = (rng.random(OUT_F).astype(np.float32) * 0.01 + 0.001)
+    hidden0 = rng.standard_normal(OUT_F).astype(np.float32)
+    w12s = rng.standard_normal(2 * OUT_F + 1).astype(np.float32)
+    w12s[2 * OUT_F] = 1.25                     # sv, the per-layer scalar
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        bs = [dev.newBufferWithBytes_length_options_(x.tobytes(), x.nbytes, SH)
+              for x in (a, codes, row_scale)]
+        bpp = dev.newBufferWithLength_options_((OUT_F + 1) * 4, SH)
+        bpp.contents().as_buffer((OUT_F + 1) * 4)[:] = b"\x00" * ((OUT_F + 1) * 4)
+        bh = dev.newBufferWithBytes_length_options_(hidden0.tobytes(), hidden0.nbytes, SH)
+        bw = dev.newBufferWithBytes_length_options_(w12s.tobytes(), w12s.nbytes, SH)
+        by = dev.newBufferWithLength_options_(OUT_F * 4, SH)
+        bs2 = dev.newBufferWithLength_options_(4, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<fffI", 0.0234375, 0.03125, 0.0156, 0), 16, SH)
+        _run(dev, _pso(dev, src, "pleproj_77"),
+             (*bs, bpp, bh, bw, by, bs2, bp), TOTAL_WGS, WG)
+        return (np.frombuffer(bh.contents().as_buffer(OUT_F * 4), np.float32).copy(),
+                np.frombuffer(by.contents().as_buffer(OUT_F * 4), np.float32).copy(),
+                float(np.frombuffer(bs2.contents().as_buffer(4), np.float32)[0]),
+                int(np.frombuffer(bpp.contents().as_buffer((OUT_F + 1) * 4),
+                                  np.uint32)[OUT_F]))
+
+    ref = go(open(os.path.join(KDIR, "pleproj_77.metal")).read())
+    got = go(translate(kernels_dsl.pleproj_77, target="msl"))
+    assert np.array_equal(got[0], ref[0]), f"hidden: {np.abs(got[0]-ref[0]).max():.3e}"
+    assert np.array_equal(got[1], ref[1]), "y2 differs"
+    assert got[2] == ref[2], f"sum2 {got[2]} != {ref[2]}"
+    assert got[3] == 0 == ref[3], "counter must self-reset"

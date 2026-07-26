@@ -995,3 +995,130 @@ def oproj_73(
         barrier()
         if tid == u32(0):
             sum2[0] = t3
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def pleproj_77(
+    a: StorageBuffer[f32, "read"],
+    codes: StorageBuffer[u32, "read"],
+    row_scale: StorageBuffer[f32, "read"],
+    pp: AtomicBuffer[u32],
+    hidden: StorageBuffer[f32],
+    w12s: StorageBuffer[f32, "read"],
+    y2: StorageBuffer[f32],
+    sum2: StorageBuffer[f32],
+    params: Uniform[vec4[u32]],          # (inScale, projInScale, projOutScale, _)
+    sgp: WorkgroupArray[f32, 8],
+    lastFlag: WorkgroupArray[u32, 1],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """PLE projection (int8) + norm-add * layer_scalar + next norm, one dispatch.
+
+    Same last-arriver shape as oproj_73, with three per-thread arrays kept as
+    PrivateArrays to match the reference's expression tree exactly — see
+    PORT_NOTES.md for why substituting scalars or a re-read is not safe here.
+
+    `sv` is the learned per-layer scalar, stored just past the two norm weight
+    vectors in w12s.
+    """
+    projInScale: f32 = bitcast_f32(params.y)
+    projOutScale: f32 = bitcast_f32(params.z)
+    sgId: u32 = tid / u32(32)
+    lane: u32 = tid & u32(31)
+    rowBase: u32 = wg.x * u32(16) + sgId * u32(2)
+
+    av: PrivateArray[vec4[f32], 2]
+    aAcc: f32 = f32(0.0)
+    for ki in range(2):
+        k4: u32 = lane + u32(ki) * u32(32)
+        av[ki] = vec4[f32](f32(0.0), f32(0.0), f32(0.0), f32(0.0))
+        if k4 < u32(64):
+            kb: u32 = k4 * u32(4)
+            av[ki] = srq4(vec4[f32](a[kb], a[kb + u32(1)], a[kb + u32(2)],
+                                    a[kb + u32(3)]), projInScale)
+            aAcc = aAcc + ((av[ki].x + av[ki].y) + (av[ki].z + av[ki].w))
+
+    accs: PrivateArray[f32, 2]
+    for r in range(2):
+        o: u32 = rowBase + u32(r)
+        acc: f32 = f32(0.0)
+        if o < u32(1536):
+            for ki2 in range(2):
+                k42: u32 = lane + u32(ki2) * u32(32)
+                if k42 < u32(64):
+                    acc = acc + dot(unpack4x8unorm(codes[o * u32(64) + k42]), av[ki2])
+        accs[r] = acc
+    aSum: f32 = subgroupAdd(aAcc)
+    for r2 in range(2):
+        s: f32 = subgroupAdd(accs[r2])
+        o2: u32 = rowBase + u32(r2)
+        if lane == u32(0):
+            if o2 < u32(1536):
+                atomicStore(pp, o2, bitcast_u32(srq(
+                    row_scale[o2] * fma(s, f32(255.0), f32(-128.0) * aSum),
+                    projOutScale)))
+    storageBarrier()
+    if tid == u32(0):
+        tk: u32 = atomicAdd(pp, u32(1536), u32(1))
+        lastFlag[0] = u32(0)
+        if tk == u32(95):
+            lastFlag[0] = u32(1)
+    barrier()
+    if lastFlag[0] == u32(1):
+        if tid == u32(0):
+            atomicStore(pp, u32(1536), u32(0))
+        inScale: f32 = bitcast_f32(params.x)
+        sv: f32 = w12s[u32(3072)]
+        acc1: f32 = f32(0.0)
+        for i in range(tid, 1536, 256):
+            v: f32 = bitcast_f32(atomicLoad(pp, i))
+            acc1 = acc1 + v * v
+        r1: f32 = subgroupAdd(acc1)
+        if (tid & u32(31)) == u32(0):
+            sgp[tid >> u32(5)] = r1
+        barrier()
+        t1: f32 = f32(0.0)
+        for k1 in range(8):
+            t1 = t1 + sgp[k1]
+        barrier()
+        rms1: f32 = inverseSqrt(t1 / f32(1536.0) + f32(1e-6))
+
+        hloc: PrivateArray[f32, 6]
+        acc2: f32 = f32(0.0)
+        e: u32 = u32(0)
+        for j in range(tid, 1536, 256):
+            normed: f32 = bitcast_f32(atomicLoad(pp, j)) * rms1 * w12s[j]
+            hv: f32 = (hidden[j] + normed) * sv
+            hidden[j] = hv
+            hloc[e] = hv
+            acc2 = acc2 + hv * hv
+            e = e + u32(1)
+        r2v: f32 = subgroupAdd(acc2)
+        if (tid & u32(31)) == u32(0):
+            sgp[tid >> u32(5)] = r2v
+        barrier()
+        t2: f32 = f32(0.0)
+        for k2 in range(8):
+            t2 = t2 + sgp[k2]
+        barrier()
+        rms2: f32 = inverseSqrt(t2 / f32(1536.0) + f32(1e-6))
+
+        qAcc: f32 = f32(0.0)
+        e2: u32 = u32(0)
+        for j2 in range(tid, 1536, 256):
+            n2: f32 = hloc[e2] * rms2 * w12s[u32(1536) + j2]
+            qv: f32 = srq(n2, inScale)
+            y2[j2] = qv
+            qAcc = qAcc + qv
+            e2 = e2 + u32(1)
+        r3: f32 = subgroupAdd(qAcc)
+        if (tid & u32(31)) == u32(0):
+            sgp[tid >> u32(5)] = r3
+        barrier()
+        t3: f32 = f32(0.0)
+        for k3 in range(8):
+            t3 = t3 + sgp[k3]
+        barrier()
+        if tid == u32(0):
+            sum2[0] = t3

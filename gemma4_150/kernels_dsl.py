@@ -336,16 +336,16 @@ def down_75(
     The counter self-resets at [CTR] so the next token starts clean without a
     host-side clear.
 
-    N_ROWS is unrolled into four accumulators rather than a loop over a local
-    array: the DSL has no local arrays, and the four sums are independent, so
-    unrolling preserves the arithmetic exactly.
+    The four row accumulators live in a PrivateArray, matching the reference's
+    `float q[4]`. They were scalars at first, which passes both gates here — but
+    it is the same substitution that silently broke oproj_73, and there is no
+    gain to offset the risk (see PORT_NOTES.md).
     """
     rowBase: u32 = wg.x * u32(4)
     inScale: f32 = bitcast_f32(params.x)
-    q0: f32 = f32(0.0)
-    q1: f32 = f32(0.0)
-    q2: f32 = f32(0.0)
-    q3: f32 = f32(0.0)
+    q: PrivateArray[f32, 4]
+    for r0 in range(4):
+        q[r0] = f32(0.0)
     sumA: f32 = f32(0.0)
 
     for w in range(tid, 768, 256):
@@ -353,32 +353,19 @@ def down_75(
         av1: vec4[f32] = vec4[f32](a[w * u32(2) + u32(1)])
         sumA = sumA + ((av0.x + av0.y + av0.z + av0.w)
                        + (av1.x + av1.y + av1.z + av1.w))
-        if rowBase < u32(1536):
-            p0: u32 = bits_buf[rowBase * u32(768) + w]
-            lo0: vec4[f32] = unpack4x8unorm(p0 & u32(0x0F0F0F0F))
-            hi0: vec4[f32] = unpack4x8unorm((p0 >> u32(4)) & u32(0x0F0F0F0F))
-            q0 = q0 + (dot(vec4[f32](lo0.x, hi0.x, lo0.y, hi0.y), av0)
-                     + dot(vec4[f32](lo0.z, hi0.z, lo0.w, hi0.w), av1))
-        if rowBase + u32(1) < u32(1536):
-            p1: u32 = bits_buf[(rowBase + u32(1)) * u32(768) + w]
-            lo1: vec4[f32] = unpack4x8unorm(p1 & u32(0x0F0F0F0F))
-            hi1: vec4[f32] = unpack4x8unorm((p1 >> u32(4)) & u32(0x0F0F0F0F))
-            q1 = q1 + (dot(vec4[f32](lo1.x, hi1.x, lo1.y, hi1.y), av0)
-                     + dot(vec4[f32](lo1.z, hi1.z, lo1.w, hi1.w), av1))
-        if rowBase + u32(2) < u32(1536):
-            p2: u32 = bits_buf[(rowBase + u32(2)) * u32(768) + w]
-            lo2: vec4[f32] = unpack4x8unorm(p2 & u32(0x0F0F0F0F))
-            hi2: vec4[f32] = unpack4x8unorm((p2 >> u32(4)) & u32(0x0F0F0F0F))
-            q2 = q2 + (dot(vec4[f32](lo2.x, hi2.x, lo2.y, hi2.y), av0)
-                     + dot(vec4[f32](lo2.z, hi2.z, lo2.w, hi2.w), av1))
-        if rowBase + u32(3) < u32(1536):
-            p3: u32 = bits_buf[(rowBase + u32(3)) * u32(768) + w]
-            lo3: vec4[f32] = unpack4x8unorm(p3 & u32(0x0F0F0F0F))
-            hi3: vec4[f32] = unpack4x8unorm((p3 >> u32(4)) & u32(0x0F0F0F0F))
-            q3 = q3 + (dot(vec4[f32](lo3.x, hi3.x, lo3.y, hi3.y), av0)
-                     + dot(vec4[f32](lo3.z, hi3.z, lo3.w, hi3.w), av1))
+        for r in range(4):
+            o: u32 = rowBase + u32(r)
+            if o < u32(1536):
+                p: u32 = bits_buf[o * u32(768) + w]
+                # unorm (÷255), NOT unpack4xU8: the epilogue's fma(...,255,...)
+                # is what undoes it. oproj_73 uses the raw-byte form and has no
+                # 255 factor — the two are not interchangeable.
+                lo: vec4[f32] = unpack4x8unorm(p & u32(0x0F0F0F0F))
+                hi: vec4[f32] = unpack4x8unorm((p >> u32(4)) & u32(0x0F0F0F0F))
+                q[r] = q[r] + (dot(vec4[f32](lo.x, hi.x, lo.y, hi.y), av0)
+                               + dot(vec4[f32](lo.z, hi.z, lo.w, hi.w), av1))
 
-    red: vec4[f32] = subgroupAdd(vec4[f32](q0, q1, q2, q3))
+    red: vec4[f32] = subgroupAdd(vec4[f32](q[0], q[1], q[2], q[3]))
     redA: f32 = subgroupAdd(sumA)
     if (tid & u32(31)) == u32(0):
         sgq[tid >> u32(5)] = red
@@ -393,18 +380,12 @@ def down_75(
             aSum = aSum + sgs[i]
         outScale: f32 = bitcast_f32(params.y)
         zpA: f32 = f32(8.0) * aSum
-        if rowBase < u32(1536):
-            d0: f32 = srq(scale[rowBase] * (inScale * fma(tot.x, f32(255.0), -zpA)), outScale)
-            atomicStore(pp, rowBase, bitcast_u32(d0))
-        if rowBase + u32(1) < u32(1536):
-            d1: f32 = srq(scale[rowBase + u32(1)] * (inScale * fma(tot.y, f32(255.0), -zpA)), outScale)
-            atomicStore(pp, rowBase + u32(1), bitcast_u32(d1))
-        if rowBase + u32(2) < u32(1536):
-            d2: f32 = srq(scale[rowBase + u32(2)] * (inScale * fma(tot.z, f32(255.0), -zpA)), outScale)
-            atomicStore(pp, rowBase + u32(2), bitcast_u32(d2))
-        if rowBase + u32(3) < u32(1536):
-            d3: f32 = srq(scale[rowBase + u32(3)] * (inScale * fma(tot.w, f32(255.0), -zpA)), outScale)
-            atomicStore(pp, rowBase + u32(3), bitcast_u32(d3))
+        for r2 in range(4):
+            o2: u32 = rowBase + u32(r2)
+            if o2 < u32(1536):
+                dv: f32 = srq(scale[o2] * (inScale * fma(tot[r2], f32(255.0), -zpA)),
+                              outScale)
+                atomicStore(pp, o2, bitcast_u32(dv))
 
     storageBarrier()
     if tid == u32(0):

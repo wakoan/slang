@@ -27,6 +27,14 @@ from gemma4_150.metal_runner import G4, TOKJSON, Batch, _SHARED
 
 # kernel -> (runner key prefix, input buffers to capture, output buffers to diff)
 SPECS = {
+    "down_75": {
+        "prefix": "down_75",
+        "inputs": [("geglu", 12288, np.float16), ("hidden", 1536, np.float32),
+                   ("pp75", 1537, np.uint32)],
+        "outputs": [("pp75", 1536, np.float32), ("hidden", 1536, np.float32)],
+        "consts": lambda key: None,
+        "threads": 256,
+    },
     "pleproj_77": {
         "prefix": "pleproj_77",
         "inputs": [("gate", 256, np.float32), ("hidden", 1536, np.float32),

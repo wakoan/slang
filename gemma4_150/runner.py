@@ -13,6 +13,7 @@ reference.py before the next is wired.
 from __future__ import annotations
 
 import json
+import os
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -27,6 +28,16 @@ _BIND = re.compile(r"@group\(0\)\s*@binding\((\d+)\)\s*var<(storage|uniform)(?:,
 @lru_cache(maxsize=None)
 def _kernel(name: str) -> str:
     return (REF_DIR / f"{name}.wgsl").read_text()
+
+
+_ENTRY = re.compile(r"@compute[\s\S]*?fn\s+(\w+)\s*\(")
+
+
+def _entry(wgsl: str) -> str:
+    """Entry-point name. The captured kernels all use `main`; DSL-generated ones
+    use the Python function name, so read it out rather than assuming."""
+    m = _ENTRY.search(wgsl)
+    return m.group(1) if m else "main"
 
 
 def _access(wgsl: str):
@@ -102,8 +113,13 @@ class G4Runner:
         data = np.ascontiguousarray(arr).tobytes()
         b = self._unis.get(name)
         if b is None or b.size < len(data):
-            b = self.device.create_buffer(size=max(len(data), 16),
-                                          usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST)
+            # STORAGE as well as UNIFORM: a couple of the DSL kernels take their
+            # 8-word params struct as a read-only storage binding (vec4 uniforms
+            # only hold four words), and the same buffer serves both.
+            b = self.device.create_buffer(
+                size=max(len(data), 16),
+                usage=(wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.STORAGE
+                       | wgpu.BufferUsage.COPY_DST))
             self._unis[name] = b
         self.queue.write_buffer(b, 0, data)
         return b
@@ -126,7 +142,7 @@ class G4Runner:
             layout = self.device.create_bind_group_layout(entries=entries)
             pipe = self.device.create_compute_pipeline(
                 layout=self.device.create_pipeline_layout(bind_group_layouts=[layout]),
-                compute={"module": self._shader(code), "entry_point": "main"})
+                compute={"module": self._shader(code), "entry_point": _entry(code)})
             self._pipes[key] = (pipe, layout)
         return self._pipes[key]
 
@@ -174,7 +190,7 @@ class G4Runner:
         y = out if out is not None else self._scratch("hidden", H * 4)
         idb = ids if ids is not None else self._ids_buf(token_id)   # resident: read a GPU token
         par = self._uni("embed_par", np.array([1, 0, 0, 0], np.uint32))
-        self.dispatch("embed", _kernel("00_main"),
+        self.dispatch("embed", self._k("00_main", "embed_00", (64, 1, 1)),
                       [idb, self._bufs["embed_q"], self._bufs["embed_scale"], y, par],
                       (1, 1, 1), bgkey=("embed", id(y), id(idb)))
         return y
@@ -204,14 +220,15 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         idb = ids if ids is not None else self._ids_buf(token_id)
         par0 = self._uni("ple_par0", np.array([0, 0, 0, 0], np.float32))   # kernel 68 inScale/outScale
         seq1 = self._uni("ple_seq1", np.array([1, 0, 0, 0], np.uint32))    # kernel 01 seq=1
-        self.dispatch("proj68", _kernel("68_reduce"),
+        self.dispatch("proj68", self._k("68_reduce", "proj_68", (32, 1, 1)),
                       [embed_buf, self._bufs["pl_model_proj"], ctx, par0], (nL * d // 8, 1, 1),
                       bgkey=("proj68", id(embed_buf)))
-        self.dispatch("plegather", _kernel("01_main"),
+        self.dispatch("plegather", self._k("01_main", "plegather_01", (64, 1, 1)),
                       [idb, self._bufs["ple_q"], self._bufs["ple_scale"], ple, seq1],
                       (1, 1, 1), bgkey=("plegather", id(idb)))
         out = self._scratch("ple", nL * d * 4)
-        code = self._COMBINE % (H ** -0.5)
+        code = (self._k(None, "combine", (256, 1, 1)) if self.USE_DSL
+                else self._COMBINE % (H ** -0.5))
         self.dispatch("combine", code, [ctx, ple, self._bufs["pl_proj_norm"], out], (nL, 1, 1),
                       bgkey=("combine",))
         return out
@@ -265,6 +282,21 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             self.queue.write_buffer(self._scratch(f"rsin{half}", half * 4), 0, np.sin(ang).astype(np.float32).tobytes())
             self._uni(f"parA_{hd}", np.array([1, pos + 1, pos, nH, 1, win if sliding else 0, 0, 0], np.uint32))
             self._uni(f"pkv_{hd}", np.array([pos * hd, 0, 0, 0], np.uint32))
+
+    # Kernel source: "dsl" compiles from gemma4_150/kernels_dsl.py (the same
+    # Python source the Metal runner uses); "ref" uses the captured webml WGSL.
+    USE_DSL = os.environ.get("G4_KERNEL_SOURCE", "dsl") != "ref"
+
+    def _k(self, ref, dsl, threads=None, consts=None, patch=None):
+        """WGSL for a kernel, from the DSL when ported, else the captured file."""
+        if self.USE_DSL:
+            from gemma4_150 import kernels_dsl
+            from py_shader_lang_wgpu import translate
+            fn = getattr(kernels_dsl, dsl, None)
+            if fn is not None:
+                return translate(fn, workgroup_size=threads, consts=consts)
+        code = _kernel(ref)
+        return self._patch(code, **patch) if patch else code
 
     @lru_cache(maxsize=None)
     def _patch(self, code, **consts):
@@ -334,7 +366,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         # norm(x), this-layer qkv_in) + its sum — the reference's cross-layer fusion.
         if L == 0:
             a, suma = self._scratch("a", H * 4), self._scratch("suma", 4)
-            self.dispatch("k69", _kernel("69_sg_sum"),
+            self.dispatch("k69", self._k("69_sg_sum", "rmssrq_69", (256, 1, 1)),
                           [hidden, b[f"L{L}.in_norm"], a, suma,
                            self._uni_static(f"p69_{L}", np.array([1, 0, np.float32(sc["qkv_in"]).view(np.uint32), 0], np.uint32))],
                           (1, 1, 1), bgkey=("k69",)+hk)
@@ -342,8 +374,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             a, suma = self._scratch("y2n", H * 4), self._scratch("sum2n", 4)
         # 70: qkv (shared: q-only). KV head_dim == q head_dim -> patch KV_OUT/KV_WGS too.
         total = qd // 2 + hd
-        k70 = self._patch(_kernel("70_srq"), Q_OUT=qd, Q_WGS=qd // 2, KV_OUT=hd,
-                          KV_WGS=hd // 2, TOTAL_WGS=total, GRID_X=total)
+        k70 = self._k("70_srq", "qkv_70", (32, 1, 1),
+                      consts={"Q_OUT": qd, "KV_OUT": hd, "Q_WGS": qd // 2,
+                              "KV_WGS": hd // 2, "TOTAL_WGS": total, "GRID_X": total},
+                      patch={"Q_OUT": qd, "Q_WGS": qd // 2, "KV_OUT": hd,
+                             "KV_WGS": hd // 2, "TOTAL_WGS": total, "GRID_X": total})
         par70 = self._uni_static(f"p70_{L}", np.array([sc["q_out"], sc.get("k_out", 0), sc.get("v_out", 0), 0], np.float32))
         if shared:
             self.dispatch(f"k70_{qd}_{hd}", k70,
@@ -354,43 +389,53 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
                           [a, b[f"L{L}.q_bits"], b[f"L{L}.k_bits"], b[f"L{L}.v_bits"],
                            b[f"L{L}.qkv_scales"], suma, outq, outk, outv, par70], (total, 1, 1), bgkey=("k70",)+hk)
             # fused k-norm+rope + v-norm -> caches (one dispatch; dstOffset shared per type)
-            self.dispatch(f"kvnorm_{hd}", self._KVNORM % (hd, half),
+            kvn = (self._k(None, "kvnorm", (hd, 1, 1), consts={"HD": hd, "HALF": half})
+                   if self.USE_DSL else self._KVNORM % (hd, half))
+            self.dispatch(f"kvnorm_{hd}", kvn,
                           [outk, outv, b[f"L{L}.k_norm"], cb, sb, kc, vc,
                            self._unis[f"pkv_{hd}"]], (1, 1, 1), bgkey=("kvn",)+hk)
         # attention (patch HEAD_DIM/HALF/OUT_Q); parA has pos -> dynamic
-        att = self._patch(_kernel("101_srq"), HEAD_DIM=hd, HALF_DIM=half)
-        att = att.replace("const OUT_Q: f32 = 0.014886821620166302;",
-                          f"const OUT_Q: f32 = {sc['o_in']!r};")
+        att = self._k("101_srq", "attn_101", (256, 1, 1),
+                      consts={"HEAD_DIM": hd, "HALF_DIM": half, "HD4": hd // 4,
+                              "J_GROUPS": 256 // (hd // 4),
+                              "PP_COUNTER_BASE": 8 * 32 * (hd + 2), "OUT_Q": sc["o_in"]},
+                      patch={"HEAD_DIM": hd, "HALF_DIM": half})
+        if not self.USE_DSL:
+            att = att.replace("const OUT_Q: f32 = 0.014886821620166302;",
+                              f"const OUT_Q: f32 = {sc['o_in']!r};")
         self.dispatch(f"att_{hd}_{sc['o_in']}", att,
                       [outq, b[f"L{L}.q_norm"], cb, sb, kc, vc, partials, attn, self._unis[f"parA_{hd}"]],
                       (nH, 32, 1), bgkey=("att",)+hk)
         # 73: o-proj + post-attn norm-add + pre-ffn norm
-        k73 = self._patch(_kernel("73_sg_sum"), IN_FEATURES=qd, WORDS_PER_ROW=qd // 8)
+        k73 = self._k("73_sg_sum", "oproj_73", (256, 1, 1), consts={"WPR": qd // 8},
+                      patch={"IN_FEATURES": qd, "WORDS_PER_ROW": qd // 8})
         par73 = self._uni_static(f"p73_{L}", np.array([sc["o_out"], sc["gate_in"], 0, 0], np.float32))
         self.dispatch(f"k73_{qd}", k73, [attn, b[f"L{L}.o_bits"], b[f"L{L}.o_scale"], pp73,
                       hidden, b[f"L{L}.o_w12"], y2, sum2, par73], (192, 1, 1), bgkey=("k73",)+hk)
         # 74/95: gate/up geglu (4-bit kernel 74 / 2-bit double-wide kernel 95)
         gu_kern, gu_grid = ("74_sg_sum", 768) if inter == 6144 else ("95_sg_sum", 3072)
         par74 = self._uni_static(f"p74_{L}", np.array([sc["gate_out"], sc["up_out"], sc["down_in"], 0], np.float32))
-        self.dispatch(f"gu_{inter}", _kernel(gu_kern), [y2, b[f"L{L}.gate_bits"], b[f"L{L}.gate_scale"],
+        gu_src = self._k(gu_kern, "gateup_74" if inter == 6144 else "gateup_95", (64, 1, 1))
+        self.dispatch(f"gu_{inter}", gu_src, [y2, b[f"L{L}.gate_bits"], b[f"L{L}.gate_scale"],
                       b[f"L{L}.up_bits"], b[f"L{L}.up_scale"], sum2, geglu, b[f"L{L}.gelu_gate"], par74],
                       (gu_grid, 1, 1), bgkey=("gu",)+hk)
         # 75/96: down + post-ffn norm-add (4-bit -> 75, 2-bit -> 96)
         down_kern = "75_srq" if inter == 6144 else "96_srq"
         par75 = self._uni_static(f"p75_{L}", np.array([sc["down_in"], sc["down_out"], 0, 0], np.float32))
-        self.dispatch(f"down_{inter}", _kernel(down_kern), [geglu, b[f"L{L}.down_bits"], pp75,
+        down_src = self._k(down_kern, "down_75" if inter == 6144 else "down_96", (256, 1, 1))
+        self.dispatch(f"down_{inter}", down_src, [geglu, b[f"L{L}.down_bits"], pp75,
                       b[f"L{L}.down_scale"], hidden, b[f"L{L}.down_nw"], par75], (H // 4, 1, 1), bgkey=("down",)+hk)
         # 76: PLE input gate (reads its 256-slice at ple_off; static param)
         parP = np.zeros(4, np.uint32)
         parP[:2] = np.array([sc["plegate_in"], sc["plegate_out"]], np.float32).view(np.uint32)
         parP[2] = ple_off
-        self.dispatch("k76", _kernel("76_reduce"), [hidden, b[f"L{L}.plegate_codes"],
+        self.dispatch("k76", self._k("76_reduce", "plegate_76", (32, 1, 1)), [hidden, b[f"L{L}.plegate_codes"],
                       b[f"L{L}.plegate_rowscale"], ple_buf, gate, b[f"L{L}.gelu_plegate"],
                       self._uni_static(f"p76_{L}", parP)], (self.cfg["ple_d"], 1, 1), bgkey=("k76",)+hk)
         # 77: PLE proj + residual*layer_scalar + next-layer norm
         nxt_in = self.man["layers"][L + 1]["scales"]["qkv_in"] if L + 1 < self.cfg["nL"] else 0.0
         par77 = self._uni_static(f"p77_{L}", np.array([nxt_in, sc["pleproj_in"], sc["pleproj_out"], 0], np.float32))
-        self.dispatch("k77", _kernel("77_sg_sum"), [gate, b[f"L{L}.pleproj_codes"],
+        self.dispatch("k77", self._k("77_sg_sum", "pleproj_77", (256, 1, 1)), [gate, b[f"L{L}.pleproj_codes"],
                       b[f"L{L}.pleproj_rowscale"], pp77, hidden, b[f"L{L}.pleproj_w12s"],
                       y2n, sum2n, par77], (96, 1, 1), bgkey=("k77",)+hk)
         return hidden
@@ -411,20 +456,20 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
             self.layer(L, pos, hidden, ple, L * d)
         # final norm (kernel 69, srq passthrough inScale=0) -> normed
         normed, sa = self._scratch("normed", H * 4), self._scratch("sa", 4)
-        self.dispatch("finalnorm", _kernel("69_sg_sum"),
+        self.dispatch("finalnorm", self._k("69_sg_sum", "rmssrq_69", (256, 1, 1)),
                       [hidden, self._bufs["final_norm"], normed, sa,
                        self._uni_static("pfn", np.array([1, 0, 0, 0], np.uint32))], (1, 1, 1),
                       bgkey=("finalnorm", id(hidden)))
         # logits (kernel 33), lm_head act scales are 0 -> weight-only
-        self.dispatch("logits", _kernel("33_srq"),
+        self.dispatch("logits", self._k("33_srq", "logits_33", (128, 1, 1)),
                       [normed, self._bufs["lmhead_blk"], self._bufs["lmhead_scale"], logits,
                        self._uni_static("plog", np.array([0, 0, 0, 0], np.float32))], (vocab // 128, 1, 1),
                       bgkey=("logits",))
         if argmax:
             # GPU argmax (softcap is monotonic -> skipped): 34 -> 256 candidates -> 35 -> token
             cv, ci = self._scratch("cv", 256 * 4), self._scratch("ci", 256 * 4)
-            self.dispatch("amax1", _kernel("34_main"), [logits, cv, ci], (256, 1, 1), bgkey=("amax1",))
-            self.dispatch("amax2", _kernel("35_main"), [cv, ci, argmax], (1, 1, 1), bgkey=("amax2", id(argmax)))
+            self.dispatch("amax1", self._k("34_main", "argmax1_34", (256, 1, 1)), [logits, cv, ci], (256, 1, 1), bgkey=("amax1",))
+            self.dispatch("amax2", self._k("35_main", "argmax2_35", (256, 1, 1)), [cv, ci, argmax], (1, 1, 1), bgkey=("amax2", id(argmax)))
             if gen_ids is not None:      # resident: append the token to the output buffer on-GPU
                 self._enc.copy_buffer_to_buffer(argmax, 0, gen_ids, step * 4, 4)
         self.queue.submit([self._enc.finish()])

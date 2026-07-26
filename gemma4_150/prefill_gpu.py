@@ -90,17 +90,24 @@ class PrefillGPU:
         for l in range(g.nL):
             li = g.layers[l]
             hd, oin = li["head_dim"], g.sc(l, "o_in")
-            g._variant(kf("attn_prefill"), f"attnp_{hd}_{l}", [
-                ("HEAD_DIM=512u, HALF_DIM=256u", f"HEAD_DIM={hd}u, HALF_DIM={hd // 2}u"),
-                ("OUT_Q=0.014886821620166302f", f"OUT_Q={oin!r}f")])
+            if not g._dsl_variant("attn_prefill", f"attnp_{hd}_{l}", {
+                    "HEAD_DIM": hd, "HALF_DIM": hd // 2, "HD4": hd // 4,
+                    "J_GROUPS": 256 // (hd // 4), "OUT_Q": oin}, 256):
+                g._variant(kf("attn_prefill"), f"attnp_{hd}_{l}", [
+                    ("HEAD_DIM=512u, HALF_DIM=256u", f"HEAD_DIM={hd}u, HALF_DIM={hd // 2}u"),
+                    ("OUT_Q=0.014886821620166302f", f"OUT_Q={oin!r}f")])
             if hd not in seen:
                 seen.add(hd)
-                g._variant(kf("kvnorm_b"), f"kvnormb_{hd}", [
-                    ("HD=256u, HALF=128u", f"HD={hd}u, HALF={hd // 2}u"),
-                    ("threadsPerThreadgroup = (HD)", f"threadsPerThreadgroup = ({hd})")])
-                g._variant(kf("qprep_b"), f"qprep_{hd}", [
-                    ("HEAD_DIM=512u, HALF_DIM=256u", f"HEAD_DIM={hd}u, HALF_DIM={hd // 2}u"),
-                    ("threadsPerThreadgroup = (512)", f"threadsPerThreadgroup = ({hd})")])
+                if not g._dsl_variant("kvnorm_b", f"kvnormb_{hd}",
+                                      {"HD": hd, "HALF": hd // 2}, hd):
+                    g._variant(kf("kvnorm_b"), f"kvnormb_{hd}", [
+                        ("HD=256u, HALF=128u", f"HD={hd}u, HALF={hd // 2}u"),
+                        ("threadsPerThreadgroup = (HD)", f"threadsPerThreadgroup = ({hd})")])
+                if not g._dsl_variant("qprep_b", f"qprep_{hd}",
+                                      {"HEAD_DIM": hd, "HALF_DIM": hd // 2}, hd):
+                    g._variant(kf("qprep_b"), f"qprep_{hd}", [
+                        ("HEAD_DIM=512u, HALF_DIM=256u", f"HEAD_DIM={hd}u, HALF_DIM={hd // 2}u"),
+                        ("threadsPerThreadgroup = (512)", f"threadsPerThreadgroup = ({hd})")])
 
     def _new(self, n):
         return self.dev.newBufferWithLength_options_(max(n, 16), _SHARED)

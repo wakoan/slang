@@ -164,31 +164,70 @@ class G4:
         base = os.path.splitext(os.path.basename(path))[0]
         self._compile_one(src, base, name)
 
+    # Kernel source. "dsl" compiles from gemma4_150/kernels_dsl.py (one Python
+    # source, emitted as MSL here and as WGSL for the browser/wgpu backends);
+    # "msl" uses the hand-written kernels_msl/*.metal. They are verified
+    # token-identical -- see verify_dsl_kernels.py, which now uses "msl" as its
+    # reference precisely because "dsl" is the default.
+    USE_DSL = os.environ.get("G4_KERNEL_SOURCE", "dsl") != "msl"
+
+    def _dsl(self, name):
+        """The ported DSL kernel of this name, or None if it is not ported."""
+        if not self.USE_DSL:
+            return None
+        from gemma4_150 import kernels_dsl
+        return getattr(kernels_dsl, name, None)
+
+    def _dsl_variant(self, name, key, consts, threads):
+        """Shape variant from the DSL. Returns False if the kernel isn't ported,
+        so the caller can fall back to string-patching the .metal."""
+        if key in self.kernels:
+            return True
+        fn = self._dsl(name)
+        if fn is None:
+            return False
+        from py_shader_lang_wgpu import translate
+        self._compile_one(translate(fn, workgroup_size=(threads, 1, 1),
+                                    target="msl", consts=consts), name, key)
+        return True
+
     def _compile_all(self):
         for fn in os.listdir(KDIR):
             if fn.endswith(".metal"):
                 base = fn[:-6]
-                self._compile_one(open(os.path.join(KDIR, fn)).read(), base, base)
+                k = self._dsl(base)
+                src = k.msl if k is not None else open(os.path.join(KDIR, fn)).read()
+                self._compile_one(src, base, base)
         kf = lambda n: os.path.join(KDIR, n + ".metal")
         seen = set()
         for l in range(self.nL):
             hd = self.layers[l]["head_dim"]; qd = self.layers[l]["q_dim"]
             total = qd // 2 + hd
-            self._variant(kf("qkv_70"), f"qkv_{qd}_{hd}", [
-                ("Q_OUT=2048u", f"Q_OUT={qd}u"), ("KV_OUT=256u", f"KV_OUT={hd}u"),
-                ("Q_WGS=1024u", f"Q_WGS={qd // 2}u"), ("KV_WGS=128u", f"KV_WGS={hd // 2}u"),
-                ("TOTAL_WGS=1280u", f"TOTAL_WGS={total}u"), ("GRID_X=1280u", f"GRID_X={total}u")])
-            self._variant(kf("oproj_73"), f"oproj_{qd}", [
-                ("IN_FEATURES=2048u", f"IN_FEATURES={qd}u"), ("WPR=256u", f"WPR={qd // 8}u")])
+            if not self._dsl_variant("qkv_70", f"qkv_{qd}_{hd}", {
+                    "Q_OUT": qd, "KV_OUT": hd, "Q_WGS": qd // 2, "KV_WGS": hd // 2,
+                    "TOTAL_WGS": total, "GRID_X": total}, 32):
+                self._variant(kf("qkv_70"), f"qkv_{qd}_{hd}", [
+                    ("Q_OUT=2048u", f"Q_OUT={qd}u"), ("KV_OUT=256u", f"KV_OUT={hd}u"),
+                    ("Q_WGS=1024u", f"Q_WGS={qd // 2}u"), ("KV_WGS=128u", f"KV_WGS={hd // 2}u"),
+                    ("TOTAL_WGS=1280u", f"TOTAL_WGS={total}u"), ("GRID_X=1280u", f"GRID_X={total}u")])
+            if not self._dsl_variant("oproj_73", f"oproj_{qd}", {"WPR": qd // 8}, 256):
+                self._variant(kf("oproj_73"), f"oproj_{qd}", [
+                    ("IN_FEATURES=2048u", f"IN_FEATURES={qd}u"), ("WPR=256u", f"WPR={qd // 8}u")])
             oin = self.sc(l, "o_in")
-            self._variant(kf("attn_101"), f"attn_{hd}_{l}", [
-                ("HEAD_DIM=512u", f"HEAD_DIM={hd}u"), ("HALF_DIM=256u", f"HALF_DIM={hd // 2}u"),
-                ("OUT_Q=0.014886821620166302f", f"OUT_Q={oin!r}f")])
+            if not self._dsl_variant("attn_101", f"attn_{hd}_{l}", {
+                    "HEAD_DIM": hd, "HALF_DIM": hd // 2, "HD4": hd // 4,
+                    "J_GROUPS": 256 // (hd // 4), "PP_COUNTER_BASE": 8 * 32 * (hd + 2),
+                    "OUT_Q": oin}, 256):
+                self._variant(kf("attn_101"), f"attn_{hd}_{l}", [
+                    ("HEAD_DIM=512u", f"HEAD_DIM={hd}u"), ("HALF_DIM=256u", f"HALF_DIM={hd // 2}u"),
+                    ("OUT_Q=0.014886821620166302f", f"OUT_Q={oin!r}f")])
             if hd not in seen:
                 seen.add(hd)
-                self._variant(kf("kvnorm"), f"kvnorm_{hd}", [
-                    ("HD=256u", f"HD={hd}u"), ("HALF=128u", f"HALF={hd // 2}u"),
-                    ("threadsPerThreadgroup = (256)", f"threadsPerThreadgroup = ({hd})")])
+                if not self._dsl_variant("kvnorm", f"kvnorm_{hd}",
+                                         {"HD": hd, "HALF": hd // 2}, hd):
+                    self._variant(kf("kvnorm"), f"kvnorm_{hd}", [
+                        ("HD=256u", f"HD={hd}u"), ("HALF=128u", f"HALF={hd // 2}u"),
+                        ("threadsPerThreadgroup = (256)", f"threadsPerThreadgroup = ({hd})")])
 
     def _setup(self):
         maxseq = 2048

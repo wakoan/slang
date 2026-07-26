@@ -1,56 +1,40 @@
-"""End-to-end gate for the DSL kernel port.
+"""Gate: the runner's DSL kernels must match the hand-written ones exactly.
 
     python -m gemma4_150.verify_dsl_kernels
 
-The unit tests (tests/test_kernels_dsl_parity.py) prove each DSL kernel is
-bit-exact against the hand-written one in isolation. This proves the swap is
-safe in the assembled model, which is a different claim: a kernel can be
-bit-exact on synthetic inputs and still be wrong in place — bound at the wrong
-index, dispatched with the wrong grid, or reading a buffer the runner lays out
-differently.
+NOTE THE DIRECTION. The runner now compiles from `kernels_dsl.py` by DEFAULT,
+so this loads the hand-written `kernels_msl/*.metal` as the REFERENCE and
+compares the default against it. Before the switch it ran the other way round;
+leaving it that way would have made the gate compare DSL against DSL and pass
+unconditionally -- the same self-comparison trap that once reported a triumphant
+0.0 divergence for batched prefill.
 
-Two observables, both of which must hold:
-  * generated tokens IDENTICAL to the stock kernels (not "similar" — greedy
-    decode is deterministic, so any difference is a real defect);
-  * decode throughput unchanged, so the port is not quietly buying correctness
-    with speed.
+Two observables, both required:
+  * generated tokens IDENTICAL -- greedy decode is deterministic, so any
+    difference is a real defect, not drift;
+  * decode throughput held, so the port is not buying correctness with speed.
 
-This does not live in tests/ because it loads the full 2 GB model.
+Not in tests/ because it loads the full 2 GB model.
 """
 import sys
-import time
 
 from tokenizers import Tokenizer
 
-from py_shader_lang_wgpu import translate
-from gemma4_150 import kernels_dsl
 from gemma4_150.metal_runner import G4, TOKJSON
-
-# Kernels ported to gemma4_150/kernels_dsl.py, by the key the runner compiles
-# them under. Add a name here once its parity test passes.
-PORTED = ["rmssrq_69", "combine", "srqh_b", "srq_b", "geglu_b", "down_75",
-          "embed_00", "plegather_01", "argmax1_34", "argmax2_35",
-          "rmsadd_b", "rmssrqh_b", "combine_b", "proj_68", "plegate_76",
-          "pleproj_77",
-          "down_96", "gateup_74", "gateup_95", "logits_33"]
-
-# Shape-parameterized kernels: one DSL source, one variant per layer geometry.
-# (dsl name, runner key, consts, threads) — the runner registers these under
-# keys like "kvnorm_256" / "oproj_2048", built by string-patching the .metal.
-SPECIALIZED = (
-    [("kvnorm", f"kvnorm_{hd}", {"HD": hd, "HALF": hd // 2}, hd) for hd in (256, 512)]
-    + [("oproj_73", f"oproj_{qd}", {"WPR": qd // 8}, 256) for qd in (2048, 4096)]
-    + [("qkv_70", f"qkv_{qd}_{hd}",
-        {"Q_OUT": qd, "KV_OUT": hd, "Q_WGS": qd // 2, "KV_WGS": hd // 2,
-         "TOTAL_WGS": qd // 2 + hd, "GRID_X": qd // 2 + hd}, 32)
-       for qd, hd in ((2048, 256), (4096, 512))]
-)
 
 PROMPT = "Write a 200-word essay about the sea."
 
 
+def recompile(g, use_dsl):
+    """Rebuild every kernel from the chosen source."""
+    g.kernels.clear()
+    g.USE_DSL = use_dsl
+    g._compile_all()
+    g._pf = None            # batched prefill re-derives its variants on next use
+
+
 def main():
-    print("loading model + compiling kernels…")
+    print("loading model...")
     g = G4()
     tok = Tokenizer.from_file(TOKJSON)
     ids = [g.bos] + tok.encode(
@@ -59,42 +43,25 @@ def main():
     def run():
         return g.generate(ids, 192)
 
-    run()                                  # warm the GPU clock and the pipelines
-    base_out, base_tps = run()
-
-    for name in PORTED:
-        fn = getattr(kernels_dsl, name)
-        g._compile_one(translate(fn, target="msl"), name, name)
-    # attn_101 is specialized PER LAYER, not per shape: OUT_Q is that layer's
-    # o-projection input scale, so there are 35 variants rather than 2.
-    variants = list(SPECIALIZED) + [
-        ("attn_101", f"attn_{g.layers[l]['head_dim']}_{l}",
-         (lambda hd: {"HEAD_DIM": hd, "HALF_DIM": hd // 2, "HD4": hd // 4,
-                      "J_GROUPS": 256 // (hd // 4),
-                      "PP_COUNTER_BASE": 8 * 32 * (hd + 2),
-                      "OUT_Q": g.sc(l, "o_in")})(g.layers[l]["head_dim"]), 256)
-        for l in range(g.nL)]
-    for name, key, consts, threads in variants:
-        if key in g.kernels:
-            g._compile_one(translate(getattr(kernels_dsl, name),
-                                     workgroup_size=(threads, 1, 1),
-                                     target="msl", consts=consts), name, key)
-    g._pf = None                           # rebuild batched prefill against them
-
-    run()
+    recompile(g, True)                     # the runner default
+    run()                                  # warm clock + pipelines
     dsl_out, dsl_tps = run()
 
-    same = base_out == dsl_out
-    slow = dsl_tps < base_tps * 0.95
-    print(f"\nswapped {len(PORTED)} kernels + {len(variants)} specialized variants")
-    print(f"  {', '.join(PORTED)}")
-    print(f"  specialized: {', '.join(sorted({k.rsplit('_', 1)[0] if k.startswith('attn') else k for _, k, _, _ in variants}))}")
-    print(f"  stock : {len(base_out):3d} tokens, {base_tps:6.1f} tok/s")
-    print(f"  DSL   : {len(dsl_out):3d} tokens, {dsl_tps:6.1f} tok/s")
+    recompile(g, False)                    # hand-written reference
+    run()
+    ref_out, ref_tps = run()
+
+    recompile(g, True)                     # leave the runner as we found it
+
+    same = ref_out == dsl_out
+    slow = dsl_tps < ref_tps * 0.95
+    print(f"\nkernel source comparison ({len(ref_out)} tokens)")
+    print(f"  kernels_msl (reference) : {ref_tps:6.1f} tok/s")
+    print(f"  kernels_dsl (default)   : {dsl_tps:6.1f} tok/s")
     print(f"  tokens identical : {same}")
-    print(f"  throughput held  : {not slow} ({dsl_tps / base_tps:.3f}x)")
+    print(f"  throughput held  : {not slow} ({dsl_tps / ref_tps:.3f}x)")
     if not same:
-        n = next((i for i, (a, b) in enumerate(zip(base_out, dsl_out)) if a != b), None)
+        n = next((i for i, (a, b) in enumerate(zip(ref_out, dsl_out)) if a != b), None)
         print(f"  FIRST DIVERGENCE at token {n}")
     print(f"\n{'PASS' if same and not slow else 'FAIL'}")
     return 0 if (same and not slow) else 1

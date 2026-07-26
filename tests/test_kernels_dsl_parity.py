@@ -120,3 +120,93 @@ def test_wgsl_also_emits():
     w = kernels_dsl.rmssrq_69.wgsl
     assert "@compute @workgroup_size(256, 1, 1)" in w
     assert "subgroupAdd" in w and "enable subgroups;" in w
+
+
+def _elementwise(dev, msl_src, name, bufs, n, threads=256):
+    _run(dev, _pso(dev, msl_src, name), bufs, (n + threads - 1) // threads, threads)
+
+
+@pytest.mark.parametrize("scale", [0.0, 0.0234375])
+def test_srqh_b_bit_exact(dev, scale):
+    n = 1024
+    rng = np.random.default_rng(1)
+    x = (rng.standard_normal(n) * 4.0).astype(np.float32)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        bx = dev.newBufferWithBytes_length_options_(x.tobytes(), x.nbytes, SH)
+        by = dev.newBufferWithLength_options_(n * 2, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<fIII", scale, n, 0, 0), 16, SH)
+        _elementwise(dev, src, "srqh_b", (bx, by, bp), n)
+        return np.frombuffer(by.contents().as_buffer(n * 2), np.float16).copy()
+
+    ref = go(open(os.path.join(KDIR, "srqh_b.metal")).read())
+    got = go(translate(kernels_dsl.srqh_b, target="msl"))
+    assert np.array_equal(got, ref)
+
+
+@pytest.mark.parametrize("scale", [0.0, 0.0234375])
+def test_srq_b_bit_exact(dev, scale):
+    n = 1024
+    rng = np.random.default_rng(2)
+    x = (rng.standard_normal(n) * 4.0).astype(np.float16)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        bx = dev.newBufferWithBytes_length_options_(x.tobytes(), x.nbytes, SH)
+        by = dev.newBufferWithLength_options_(n * 4, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<fIII", scale, n, 0, 0), 16, SH)
+        _elementwise(dev, src, "srq_b", (bx, by, bp), n)
+        return np.frombuffer(by.contents().as_buffer(n * 4), np.float32).copy()
+
+    ref = go(open(os.path.join(KDIR, "srq_b.metal")).read())
+    got = go(translate(kernels_dsl.srq_b, target="msl"))
+    assert np.array_equal(got, ref)
+
+
+@pytest.mark.parametrize("gate_scale", [0.0, 0.0234375])
+def test_geglu_b_bit_exact(dev, gate_scale):
+    """gate_scale=0 takes the polynomial gelu; nonzero takes the LUT path."""
+    n = 2048
+    rng = np.random.default_rng(4)
+    gate = (rng.standard_normal(n) * 3.0).astype(np.float16)
+    up = (rng.standard_normal(n) * 3.0).astype(np.float16)
+    lut = rng.standard_normal(256).astype(np.float32)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        bg = dev.newBufferWithBytes_length_options_(gate.tobytes(), gate.nbytes, SH)
+        bu = dev.newBufferWithBytes_length_options_(up.tobytes(), up.nbytes, SH)
+        bo = dev.newBufferWithLength_options_(n * 2, SH)
+        bl = dev.newBufferWithBytes_length_options_(lut.tobytes(), lut.nbytes, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<fffI", gate_scale, 0.03125, 0.0234375, n), 16, SH)
+        _elementwise(dev, src, "geglu_b", (bg, bu, bo, bl, bp), n)
+        return np.frombuffer(bo.contents().as_buffer(n * 2), np.float16).copy()
+
+    ref = go(open(os.path.join(KDIR, "geglu_b.metal")).read())
+    got = go(translate(kernels_dsl.geglu_b, target="msl"))
+    assert np.array_equal(got, ref)
+
+
+def test_combine_bit_exact(dev):
+    nL, D = 35, 256
+    rng = np.random.default_rng(6)
+    ctx = (rng.standard_normal(nL * D) * 20.0).astype(np.float32)
+    ple = rng.standard_normal(nL * D).astype(np.float32)
+    nw = rng.standard_normal(D).astype(np.float32)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        bc = dev.newBufferWithBytes_length_options_(ctx.tobytes(), ctx.nbytes, SH)
+        bpl = dev.newBufferWithBytes_length_options_(ple.tobytes(), ple.nbytes, SH)
+        bn = dev.newBufferWithBytes_length_options_(nw.tobytes(), nw.nbytes, SH)
+        bo = dev.newBufferWithLength_options_(nL * D * 4, SH)
+        _run(dev, _pso(dev, src, "combine"), (bc, bpl, bn, bo), nL, D)
+        return np.frombuffer(bo.contents().as_buffer(nL * D * 4), np.float32).copy()
+
+    ref = go(open(os.path.join(KDIR, "combine.metal")).read())
+    got = go(translate(kernels_dsl.combine, target="msl"))
+    assert np.array_equal(got, ref), f"max |d| {np.abs(got - ref).max():.3e}"

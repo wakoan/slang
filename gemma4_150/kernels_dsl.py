@@ -201,3 +201,108 @@ def rmssrq_69(
         barrier()
         if tid == u32(0):
             sum_a[row] = t2
+
+
+def tanh_safe(x: f32) -> f32:
+    """tanh saturated outside +-10 — matches the reference kernels, and keeps
+    the polynomial from overflowing before tanh flattens anyway."""
+    if x > f32(10.0):
+        return f32(1.0)
+    if x < f32(-10.0):
+        return f32(-1.0)
+    return tanh(x)
+
+
+def gelu_tanh(v: f32) -> f32:
+    return f32(0.5) * v * (f32(1.0) + tanh_safe(
+        f32(0.7978845608028654) * (v + f32(0.044715) * v * v * v)))
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def srqh_b(
+    x: StorageBuffer[f32, "read"],
+    y: StorageBuffer[f16],
+    p: Uniform[vec4[u32]],               # (bitcast(scale), n, _, _)
+    gid: Builtin.global_invocation_id,
+):
+    """f32 activations -> f16 for a GEMM's A matrix, optionally SRQ'd.
+    scale == 0 means convert only."""
+    if gid.x < p.y:
+        y[gid.x] = f16(srq(x[gid.x], bitcast_f32(p.x)))
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def srq_b(
+    x: StorageBuffer[f16, "read"],
+    y: StorageBuffer[f32],
+    p: Uniform[vec4[u32]],               # (bitcast(scale), n, _, _)
+    gid: Builtin.global_invocation_id,
+):
+    """f16 GEMM output -> f32, applying the SRQ the decode kernel applied to its
+    own result."""
+    if gid.x < p.y:
+        y[gid.x] = srq(f32(x[gid.x]), bitcast_f32(p.x))
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def geglu_b(
+    gate: StorageBuffer[f16, "read"],
+    up: StorageBuffer[f16, "read"],
+    out: StorageBuffer[f16],
+    lut: StorageBuffer[f32, "read"],
+    p: Uniform[vec4[u32]],               # (gateOutScale, upOutScale, outQuantScale, n)
+    gid: Builtin.global_invocation_id,
+):
+    """The geglu tail, once gate/up are GEMMs.
+
+    gate/up arrive already scaled and zero-point corrected (that folds into the
+    dequantized weights), so only SRQ + gelu + product remain. When the gate is
+    quantized the gelu comes from a 256-entry LUT indexed by the quantization
+    grid — exact for every representable input, and cheaper than the polynomial.
+    The LUT read is inlined because DSL helpers cannot take a buffer.
+    """
+    if gid.x < p.w:
+        gs: f32 = bitcast_f32(p.x)
+        g: f32 = srq(f32(gate[gid.x]), gs)
+        u: f32 = srq(f32(up[gid.x]), bitcast_f32(p.y))
+        gv: f32 = f32(0.0)
+        if gs == f32(0.0):
+            gv = gelu_tanh(g)
+        else:
+            gv = lut[u32(clamp(round(g / gs), f32(-128.0), f32(127.0)) + f32(128.0))]
+        dq: f32 = gv * u
+        qs: f32 = bitcast_f32(p.z)
+        if qs == f32(0.0):
+            out[gid.x] = f16(dq)
+        else:
+            out[gid.x] = f16(clamp(round(dq / qs), f32(-128.0), f32(127.0)))
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def combine(
+    ctx: StorageBuffer[f32, "read"],
+    ple: StorageBuffer[f32, "read"],
+    nw: StorageBuffer[f32, "read"],
+    outp: StorageBuffer[f32],
+    red: WorkgroupArray[f32, 256],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """PLE input: per-row RMSNorm(ctx * H^-0.5) + ple, scaled by 2^-0.5.
+
+    HINV and RS2 stay literals so this is a drop-in replacement for the
+    hand-written kernel's binding layout; promoting them to a uniform would be
+    an improvement but changes the runner's call.
+    """
+    base: u32 = wg.x * u32(256) + tid
+    c: f32 = ctx[base] * f32(2.5515046504e-02)
+    red[tid] = c * c
+    barrier()
+    s: u32 = u32(128)
+    while s > u32(0):
+        if tid < s:
+            red[tid] = red[tid] + red[tid + s]
+        barrier()
+        s = s / u32(2)
+    rms: f32 = inverseSqrt(red[0] / f32(256.0) + f32(1e-6))
+    outp[base] = (c * rms * nw[tid] + ple[base]) * f32(0.7071067811865476)

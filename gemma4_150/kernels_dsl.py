@@ -620,3 +620,119 @@ def kvnorm(
         sn: f32 = sinT[tid]
         kcache[p.x + tid] = n0 * c - n1 * sn
         kcache[p.x + tid + u32(HALF)] = n1 * c + n0 * sn
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def rmsadd_b(
+    x: StorageBuffer[f16, "read"],
+    nw: StorageBuffer[f32, "read"],
+    hidden: StorageBuffer[f32],
+    p: Uniform[vec4[u32]],               # (inScale, sv, dim, _)
+    sgp: WorkgroupArray[f32, 8],
+    dsh: WorkgroupArray[f32, 1536],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """Residual-add + RMSNorm tail, as its own pass over S rows.
+
+    In decode this tail hides behind down_75/oproj_73/pleproj_77's atomic
+    last-arriver counter, which saves a dispatch. Batching that would need S
+    counters, so prefill pays for a separate pass instead.
+    """
+    inScale: f32 = bitcast_f32(p.x)
+    sv: f32 = bitcast_f32(p.y)
+    base: u32 = wg.x * u32(1536)
+    acc: f32 = f32(0.0)
+    for j in range(tid, 1536, 256):
+        d: f32 = srq(f32(x[base + j]), inScale)
+        dsh[j] = d
+        acc = acc + d * d
+    s1: f32 = subgroupAdd(acc)
+    if (tid & u32(31)) == u32(0):
+        sgp[tid >> u32(5)] = s1
+    barrier()
+    t1: f32 = f32(0.0)
+    for i in range(8):
+        t1 = t1 + sgp[i]
+    barrier()
+    rms: f32 = inverseSqrt(t1 / f32(1536.0) + f32(1e-6))
+    for j2 in range(tid, 1536, 256):
+        hidden[base + j2] = (hidden[base + j2] + dsh[j2] * rms * nw[j2]) * sv
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def rmssrqh_b(
+    hidden: StorageBuffer[f32, "read"],
+    w: StorageBuffer[f32, "read"],
+    y: StorageBuffer[f16],
+    sum_a: StorageBuffer[f32],
+    p: Uniform[vec4[u32]],               # (inScale, dim, _, _)
+    sgp: WorkgroupArray[f32, 8],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """Pre-FFN RMSNorm + SRQ over S rows, emitting HALF.
+
+    rmssrq_69 already handles S rows but writes f32, which is right before
+    attention and wrong here — gateup reads half4. Reproduces oproj_73's DOUBLE
+    rounding exactly, f16(srq(f32(f16(n2)), inScale)): the value is narrowed to
+    f16 before quantizing and again after, and collapsing that to a single round
+    changes results on the boundary.
+    """
+    inScale: f32 = bitcast_f32(p.x)
+    base: u32 = wg.x * u32(1536)
+    acc: f32 = f32(0.0)
+    for j in range(tid, 1536, 256):
+        v: f32 = hidden[base + j]
+        acc = acc + v * v
+    s1: f32 = subgroupAdd(acc)
+    if (tid & u32(31)) == u32(0):
+        sgp[tid >> u32(5)] = s1
+    barrier()
+    t1: f32 = f32(0.0)
+    for i in range(8):
+        t1 = t1 + sgp[i]
+    barrier()
+    rms: f32 = inverseSqrt(t1 / f32(1536.0) + f32(1e-6))
+    qAcc: f32 = f32(0.0)
+    for j2 in range(tid, 1536, 256):
+        n2: f32 = hidden[base + j2] * rms * w[j2]
+        qv: f16 = f16(srq(f32(f16(n2)), inScale))
+        y[base + j2] = qv
+        qAcc = qAcc + f32(qv)
+    s2: f32 = subgroupAdd(qAcc)
+    if (tid & u32(31)) == u32(0):
+        sgp[tid >> u32(5)] = s2
+    barrier()
+    t2: f32 = f32(0.0)
+    for i2 in range(8):
+        t2 = t2 + sgp[i2]
+    barrier()
+    if tid == u32(0):
+        sum_a[wg.x] = t2
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def combine_b(
+    ctx: StorageBuffer[f32, "read"],
+    ple: StorageBuffer[f32, "read"],
+    nw: StorageBuffer[f32, "read"],
+    outp: StorageBuffer[f32],
+    p: Uniform[vec4[u32]],               # (nL, _, _, _)
+    red: WorkgroupArray[f32, 256],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """`combine` over S tokens: one workgroup per (layer, token)."""
+    base: u32 = (wg.y * p.x + wg.x) * u32(256) + tid
+    c: f32 = ctx[base] * f32(2.5515046504e-02)
+    red[tid] = c * c
+    barrier()
+    s: u32 = u32(128)
+    while s > u32(0):
+        if tid < s:
+            red[tid] = red[tid] + red[tid + s]
+        barrier()
+        s = s / u32(2)
+    rms: f32 = inverseSqrt(red[0] / f32(256.0) + f32(1e-6))
+    outp[base] = (c * rms * nw[tid] + ple[base]) * f32(0.7071067811865476)

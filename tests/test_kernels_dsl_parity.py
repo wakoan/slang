@@ -363,3 +363,81 @@ def test_consts_actually_specialize():
     b = tr(kernels_dsl.kvnorm, workgroup_size=(512, 1, 1), consts={"HD": 512, "HALF": 256})
     assert a != b
     assert "512" in b and "@workgroup_size(512, 1, 1)" in b
+
+
+def test_rmsadd_b_bit_exact(dev):
+    S = 3
+    rng = np.random.default_rng(61)
+    x = (rng.standard_normal(S * DIM) * 2.0).astype(np.float16)
+    nw = rng.standard_normal(DIM).astype(np.float32)
+    hidden0 = rng.standard_normal(S * DIM).astype(np.float32)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        bx = dev.newBufferWithBytes_length_options_(x.tobytes(), x.nbytes, SH)
+        bn = dev.newBufferWithBytes_length_options_(nw.tobytes(), nw.nbytes, SH)
+        bh = dev.newBufferWithBytes_length_options_(hidden0.tobytes(), hidden0.nbytes, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<ffII", 0.0234375, 1.25, DIM, 0), 16, SH)
+        _run(dev, _pso(dev, src, "rmsadd_b"), (bx, bn, bh, bp), S, WG)
+        return np.frombuffer(bh.contents().as_buffer(S * DIM * 4), np.float32).copy()
+
+    ref = go(open(os.path.join(KDIR, "rmsadd_b.metal")).read())
+    got = go(translate(kernels_dsl.rmsadd_b, target="msl"))
+    assert np.array_equal(got, ref), f"max |d| {np.abs(got - ref).max():.3e}"
+
+
+def test_rmssrqh_b_bit_exact(dev):
+    """Also pins the DOUBLE rounding f16(srq(f32(f16(n)))) — collapsing it to a
+    single round changes results on the boundary."""
+    S = 3
+    rng = np.random.default_rng(62)
+    hidden = rng.standard_normal(S * DIM).astype(np.float32)
+    w = rng.standard_normal(DIM).astype(np.float32)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        bh = dev.newBufferWithBytes_length_options_(hidden.tobytes(), hidden.nbytes, SH)
+        bw = dev.newBufferWithBytes_length_options_(w.tobytes(), w.nbytes, SH)
+        by = dev.newBufferWithLength_options_(S * DIM * 2, SH)
+        bs = dev.newBufferWithLength_options_(S * 4, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<fIII", 0.0234375, DIM, 0, 0), 16, SH)
+        _run(dev, _pso(dev, src, "rmssrqh_b"), (bh, bw, by, bs, bp), S, WG)
+        return (np.frombuffer(by.contents().as_buffer(S * DIM * 2), np.float16).copy(),
+                np.frombuffer(bs.contents().as_buffer(S * 4), np.float32).copy())
+
+    ref_y, ref_s = go(open(os.path.join(KDIR, "rmssrqh_b.metal")).read())
+    got_y, got_s = go(translate(kernels_dsl.rmssrqh_b, target="msl"))
+    assert np.array_equal(got_y, ref_y)
+    assert np.array_equal(got_s, ref_s)
+
+
+def test_combine_b_bit_exact(dev):
+    nL, D, S = 35, 256, 3
+    rng = np.random.default_rng(63)
+    ctx = (rng.standard_normal(S * nL * D) * 20.0).astype(np.float32)
+    ple = rng.standard_normal(S * nL * D).astype(np.float32)
+    nw = rng.standard_normal(D).astype(np.float32)
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        bc = dev.newBufferWithBytes_length_options_(ctx.tobytes(), ctx.nbytes, SH)
+        bpl = dev.newBufferWithBytes_length_options_(ple.tobytes(), ple.nbytes, SH)
+        bn = dev.newBufferWithBytes_length_options_(nw.tobytes(), nw.nbytes, SH)
+        bo = dev.newBufferWithLength_options_(S * nL * D * 4, SH)
+        bp = dev.newBufferWithBytes_length_options_(struct.pack("<4I", nL, 0, 0, 0), 16, SH)
+        pso = _pso(dev, src, "combine_b")
+        cb = dev.newCommandQueue().commandBuffer()
+        enc = cb.computeCommandEncoder()
+        enc.setComputePipelineState_(pso)
+        for i, b in enumerate((bc, bpl, bn, bo, bp)):
+            enc.setBuffer_offset_atIndex_(b, 0, i)
+        enc.dispatchThreadgroups_threadsPerThreadgroup_(
+            Metal.MTLSizeMake(nL, S, 1), Metal.MTLSizeMake(D, 1, 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        return np.frombuffer(bo.contents().as_buffer(S * nL * D * 4), np.float32).copy()
+
+    ref = go(open(os.path.join(KDIR, "combine_b.metal")).read())
+    got = go(translate(kernels_dsl.combine_b, target="msl"))
+    assert np.array_equal(got, ref), f"max |d| {np.abs(got - ref).max():.3e}"

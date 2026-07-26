@@ -1,62 +1,61 @@
-# DSL kernel port — status and open issues
+# DSL kernel port — status
 
-Porting `kernels_msl/*.metal` (and the 111 captured `.wgsl`) to a single Python
-source in `kernels_dsl.py`. Two gates, both required before a kernel is used:
+Porting `kernels_msl/*.metal` to a single Python source in `kernels_dsl.py`,
+which emits both MSL and WGSL. Two gates, both required before a kernel is used:
 
-1. `tests/test_kernels_dsl_parity.py` — bit-exact vs the hand-written kernel.
-2. `python -m gemma4_150.verify_dsl_kernels` — swap into the live runner;
-   generated tokens must be IDENTICAL and throughput must hold.
+1. **Parity** — `tests/test_kernels_dsl_parity.py`, bit-exact vs the
+   hand-written kernel on synthetic inputs.
+2. **End-to-end** — `verify_dsl_kernels.py` (decode: tokens must be identical
+   and throughput must hold) and `verify_dsl_prefill.py` (prefill: KV caches
+   must be BIT-IDENTICAL, stock vs DSL, on both attention paths).
 
-## RESOLVED: oproj_73 (was: passes gate 1, fails gate 2)
+For anything whose output feeds a quantizer, also `replay_layer.py`, which runs
+both kernels at every dispatch of a real multi-token decode. Gate 1 is not
+sufficient on its own — see the lesson below.
 
-Fixed by adding `PrivateArray` to the DSL. Now enabled in the runner; the
-per-layer sweep reports **0 divergences in 7000 dispatches over 200 tokens**.
+## Status: 30 of 32
 
-The story is worth keeping because the failure mode generalises.
+**Ported and enabled (30).** The entire decode path and the entire batched
+prefill path are DSL-authored: embed, PLE gather/gate/proj, qkv, attention
+(decode flash + prefill, both fused and GEMM forms), o-proj, MLP at both bit
+widths, every norm, logits, argmax, and all the batched prefill tails.
 
-**Symptom.** oproj_73 was bit-exact against the reference on 10 random seeds,
-on both q_dim shapes, and on a single dispatch using the model's own buffers for
-a sliding AND a full layer — yet swapping it changed greedy decode from token
-161 onward, reproducibly, while stock decode is deterministic over 4 runs.
+**Not ported (2), deliberately.** `down_96_b` and `gateup_95_b` are used only by
+`prefill_research/bench_batched.py`. They are register-blocked token-batching
+matmuls from a route that was measured, falsified and closed (batching alone
+caps at ~1.3x; the dequant+GEMM route replaced it). They are research artifacts
+retained as evidence for that retraction, not production kernels, and porting
+them would be work with no consumer. If they are ever deleted, the falsification
+record in `prefill_research/README.md` should go with them.
 
-**Diagnosis.** `gemma4_150/replay_layer.py` runs both kernels at every dispatch
-of a real multi-token decode and reports the first difference. It found: token
-98, layer 30, ONE element of `y2` (index 1078) off by exactly one quantization
-step, with `pp` and `hidden` bit-identical. So the whole behavioural change was
-a single `srq` rounding flip amplified from a last-ulp difference.
+## The lesson this port paid for
 
-**Cause.** Metal compiles with fast math by default, so multiply-add contraction
-follows the expression tree. The reference caches six per-thread residuals in
-`float hloc[6]`; the DSL had no local arrays, so the port re-read `hidden[j]`
-instead. That is semantically identical and numerically is not. Confirmed by
-patching ONLY that line in the hand-written kernel — it reproduces the
-divergence exactly, index 1078 and all.
+**Bit-exactness on synthetic inputs is necessary but NOT sufficient.** Kernels
+whose output feeds a quantizer need real-data verification: the failure mode is
+a rounding flip, and random inputs essentially never land on a `round()`
+boundary while real activations — already on a quantization grid — do constantly.
 
-Two substitutes were tried and both failed the same way: six scalars instead of
-an array (identical divergence, so it is not register-vs-memory), and splitting
-`normed` into its own statement to match the reference line-for-line (made it
-WORSE — `hidden` itself then differed at token 0).
+Concretely:
 
-**Fix.** `PrivateArray[f32, 6]` — `var x: array<f32,6>` in WGSL, `float x[6]` in
-MSL — so the kernel is written the way the reference is rather than approximated.
-
-**Retraction.** An earlier revision of this file listed the hloc -> re-read
-substitution as ruled out, on the strength of 12 random seeds. That control had
-exactly the same blind spot as the parity test. It was the cause all along.
-
-## Lesson worth keeping
-
-Bit-exactness on synthetic inputs is necessary but NOT sufficient. Kernels whose
-output feeds a quantizer need real-data verification: the failure mode is a
-rounding flip, and random inputs essentially never land on a `round()` boundary
-while real activations — already on a quantization grid — do constantly.
-
-Concretely, for the rest of the port:
-
-* Do not "simplify" a reference kernel's storage. A per-thread array, a scalar
-  and a device round-trip are semantically equal and numerically distinct under
-  fast math. Port the structure, not the meaning.
-* `replay_layer.py` is the tool that settles these. Run it before enabling any
-  kernel whose output is quantized.
-* A control experiment on random data can inherit the exact blind spot it is
-  meant to rule out. Confirm on captured real inputs.
+* **Port the STRUCTURE, not the meaning.** A per-thread array, a set of scalars
+  and a device round-trip are semantically equal and numerically distinct: Metal
+  compiles with fast math, so multiply-add contraction follows the expression
+  tree. `oproj_73` was bit-exact on 10 seeds and on a single real dispatch, and
+  still changed the generated tokens from step 161 — traced by `replay_layer` to
+  ONE element of `y2` off by one quantization step at token 98, layer 30. The
+  fix was `PrivateArray`, so the kernel could be written the way the reference
+  is instead of approximated.
+* **A control on random data can inherit the blind spot it is meant to rule
+  out.** That substitution was dismissed on 12 random seeds before being
+  confirmed as the cause on captured real inputs.
+* **Check the binding width.** `attn_101`'s and `smax_b`'s params structs are
+  eight words bound as one buffer; `Uniform[vec4[u32]]` is four, so declaring two
+  of them claims two binding slots and the host fills only one. Both became
+  read-only storage bindings.
+* **A parity test that can pass on two empty buffers is not a parity test.** The
+  qkv grid was miscomputed as `Q_WGS + KV_WGS`; both sides came out empty and
+  `array_equal` passed. Every parity test now also asserts the kernel wrote
+  something.
+* `unpack4x8unorm` (divides by 255) and `unpack4xU8` (raw bytes) are not
+  interchangeable — the epilogue's `fma(...,255,...)` is what pairs with the
+  former.

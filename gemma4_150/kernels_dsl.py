@@ -1722,3 +1722,345 @@ def attn_101(
             acc = acc + bitcast_f32(atomicLoad(
                 partials, (h * u32(32) + u32(c2)) * (u32(HEAD_DIM) + u32(2)) + d5)) * wgt_sh[c2]
         out[h * u32(HEAD_DIM) + d5] = srq(acc * invd, f32(OUT_Q))
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def attnout_b(
+    x: StorageBuffer[f16, "read"],
+    denom: StorageBuffer[f32, "read"],
+    y: StorageBuffer[f16],
+    p: Uniform[vec4[u32]],               # (scale, n, hd, _)
+    gid: Builtin.global_invocation_id,
+):
+    """Tail of the GEMM attention path: divide by the softmax denominator smax_b
+    deferred, then apply the SRQ the o-projection expects."""
+    if gid.x < p.y:
+        y[gid.x] = f16(srq(f32(x[gid.x]) / denom[gid.x / p.z], bitcast_f32(p.x)))
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def plegate_b(
+    lin: StorageBuffer[f16, "read"],
+    ple: StorageBuffer[f32, "read"],
+    out: StorageBuffer[f32],
+    lut: StorageBuffer[f32, "read"],
+    p: Uniform[vec4[u32]],               # (linOutScale, pleOffset, pleStride, n)
+    gid: Builtin.global_invocation_id,
+):
+    """Tail of plegate_76 once its matmul is a GEMM: SRQ, gelu, times ple."""
+    if gid.x < p.w:
+        s: u32 = gid.x / u32(256)
+        o: u32 = gid.x % u32(256)
+        ls: f32 = bitcast_f32(p.x)
+        v: f32 = srq(f32(lin[gid.x]), ls)
+        gv: f32 = f32(0.0)
+        if ls == f32(0.0):
+            gv = gelu_tanh(v)
+        else:
+            gv = lut[u32(clamp(round(v / ls), f32(-128.0), f32(127.0)) + f32(128.0))]
+        out[gid.x] = gv * ple[s * p.z + p.y + o]
+
+
+@kernel(workgroup_size=(256, 1, 1), consts={"HD": 256, "HALF": 128})
+def kvnorm_b(
+    ink: StorageBuffer[f16, "read"],
+    inv: StorageBuffer[f16, "read"],
+    knorm: StorageBuffer[f32, "read"],
+    cosT: StorageBuffer[f32, "read"],
+    sinT: StorageBuffer[f32, "read"],
+    kcache: StorageBuffer[f32],
+    vcache: StorageBuffer[f32],
+    p: Uniform[vec4[u32]],               # (startPos, kScale, vScale, _)
+    rk: WorkgroupArray[f32, 512],
+    rv: WorkgroupArray[f32, 512],
+    ksh: WorkgroupArray[f32, 512],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """kvnorm for S positions at once — one workgroup per token, rope indexed by
+    absolute position rather than pre-offset."""
+    s: u32 = wg.x
+    ib: u32 = s * u32(HD)
+    pos: u32 = p.x + s
+    co: u32 = pos * u32(HALF)
+    cache: u32 = pos * u32(HD)
+    ko: f32 = srq(f32(ink[ib + tid]), bitcast_f32(p.y))
+    vo: f32 = srq(f32(inv[ib + tid]), bitcast_f32(p.z))
+    ksh[tid] = ko
+    rk[tid] = ko * ko
+    rv[tid] = vo * vo
+    barrier()
+    st: u32 = u32(HD) / u32(2)
+    while st > u32(0):
+        if tid < st:
+            rk[tid] = rk[tid] + rk[tid + st]
+            rv[tid] = rv[tid] + rv[tid + st]
+        barrier()
+        st = st / u32(2)
+    rmsk: f32 = inverseSqrt(rk[0] / f32(HD) + f32(1e-6))
+    rmsv: f32 = inverseSqrt(rv[0] / f32(HD) + f32(1e-6))
+    vcache[cache + tid] = vo * rmsv
+    if tid < u32(HALF):
+        n0: f32 = ksh[tid] * rmsk * knorm[tid]
+        n1: f32 = ksh[tid + u32(HALF)] * rmsk * knorm[tid + u32(HALF)]
+        c: f32 = cosT[co + tid]
+        sn: f32 = sinT[co + tid]
+        kcache[cache + tid] = n0 * c - n1 * sn
+        kcache[cache + tid + u32(HALF)] = n1 * c + n0 * sn
+
+
+@kernel(workgroup_size=(512, 1, 1), consts={"HEAD_DIM": 512, "HALF_DIM": 256})
+def qprep_b(
+    q: StorageBuffer[f32, "read"],
+    w: StorageBuffer[f32, "read"],
+    cosT: StorageBuffer[f32, "read"],
+    sinT: StorageBuffer[f32, "read"],
+    out: StorageBuffer[f16],
+    p: Uniform[vec4[u32]],               # (startPos, qHeads, _, _)
+    red: WorkgroupArray[f32, 512],
+    qsh: WorkgroupArray[f32, 512],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """q RMSNorm + RoPE for all S*qHeads query vectors, emitted as f16 so the
+    score matrix can be a single GEMM."""
+    h: u32 = wg.x
+    s: u32 = wg.y
+    base: u32 = (s * p.y + h) * u32(HEAD_DIM)
+    v: f32 = q[base + tid]
+    qsh[tid] = v
+    red[tid] = v * v
+    barrier()
+    st: u32 = u32(HEAD_DIM) / u32(2)
+    while st > u32(0):
+        if tid < st:
+            red[tid] = red[tid] + red[tid + st]
+        barrier()
+        st = st / u32(2)
+    ns: f32 = inverseSqrt(red[0] / f32(HEAD_DIM) + f32(1e-6))
+    rb: u32 = (p.x + s) * u32(HALF_DIM)
+    if tid < u32(HALF_DIM):
+        n0: f32 = qsh[tid] * ns * w[tid]
+        n1: f32 = qsh[tid + u32(HALF_DIM)] * ns * w[tid + u32(HALF_DIM)]
+        c: f32 = cosT[rb + tid]
+        sn: f32 = sinT[rb + tid]
+        out[base + tid] = f16(n0 * c - n1 * sn)
+        out[base + tid + u32(HALF_DIM)] = f16(n1 * c + n0 * sn)
+
+
+@kernel(workgroup_size=(256, 1, 1))
+def smax_b(
+    sc: StorageBuffer[f16],
+    denom: StorageBuffer[f32],
+    # PSM is EIGHT words (startPos, qHeads, window, T, stride, ...) bound as ONE
+    # buffer, so this is a storage binding — two vec4 uniforms would claim two
+    # binding slots and the host only fills one.
+    p: StorageBuffer[u32, "read"],       # (startPos, qHeads, window, T, stride)
+    red: WorkgroupArray[f32, 256],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """Causal + sliding-window softmax over a GEMM-produced score matrix.
+
+    Normalisation is deliberately NOT applied: the per-row denominator goes to
+    denom[] and attnout_b folds it in, saving a third pass over the row.
+    """
+    r: u32 = wg.x
+    s: u32 = r / p[1]
+    qPos: u32 = p[0] + s
+    maxKj: u32 = qPos + u32(1)
+    minKj: u32 = u32(0)
+    if p[2] > u32(0):
+        if qPos + u32(1) > p[2]:
+            minKj = qPos + u32(1) - p[2]
+    if maxKj > p[3]:
+        maxKj = p[3]
+    base: u32 = r * p[4]
+
+    m: f32 = f32(-3.4028234663852886e38)
+    j: u32 = minKj + tid
+    while j < maxKj:
+        m = max(m, f32(sc[base + j]))
+        j = j + u32(256)
+    red[tid] = m
+    barrier()
+    st: u32 = u32(128)
+    while st > u32(0):
+        if tid < st:
+            red[tid] = max(red[tid], red[tid + st])
+        barrier()
+        st = st / u32(2)
+    m = red[0]
+    barrier()
+
+    tot: f32 = f32(0.0)
+    j2: u32 = tid
+    while j2 < p[3]:
+        e: f32 = f32(0.0)
+        if j2 >= minKj:
+            if j2 < maxKj:
+                e = exp(f32(sc[base + j2]) - m)
+                tot = tot + e
+        sc[base + j2] = f16(e)
+        j2 = j2 + u32(256)
+    red[tid] = tot
+    barrier()
+    st2: u32 = u32(128)
+    while st2 > u32(0):
+        if tid < st2:
+            red[tid] = red[tid] + red[tid + st2]
+        barrier()
+        st2 = st2 / u32(2)
+    if tid == u32(0):
+        denom[r] = red[0]
+
+
+@kernel(workgroup_size=(256, 1, 1),
+        consts={"HEAD_DIM": 512, "HALF_DIM": 256, "HD4": 128, "J_GROUPS": 2,
+                "OUT_Q": 0.014886821620166302})
+def attn_prefill(
+    q: StorageBuffer[f32, "read"],
+    w: StorageBuffer[f32, "read"],
+    cosTbl: StorageBuffer[f32, "read"],
+    sinTbl: StorageBuffer[f32, "read"],
+    k: StorageBuffer[vec4[f32], "read"],
+    v: StorageBuffer[vec4[f32], "read"],
+    out: StorageBuffer[f32],
+    params: StorageBuffer[u32, "read"],  # (startPos, qHeads, kvHeads, window, seq, ...)
+    qn_sh: WorkgroupArray[f32, 512],
+    out_acc: WorkgroupArray[f32, 512],
+    probs: WorkgroupArray[f32, 256],
+    sval_sh: WorkgroupArray[f32, 256],
+    red: WorkgroupArray[f32, 256],
+    vacc_sh: WorkgroupArray[vec4[f32], 256],
+    st: WorkgroupArray[f32, 2],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """Batched causal attention: S query positions in one dispatch.
+
+    attn_101 splits the KEY axis because a single query gives only nH workgroups
+    of parallelism. Prefill already has S*nH, so that machinery is pure overhead
+    here — one workgroup owns one (head, query token) and walks its keys with a
+    plain online softmax. No partials, no atomics, no cross-workgroup merge.
+
+    Causality is the loop bound, not a mask buffer.
+    """
+    h: u32 = wg.x
+    s: u32 = wg.y
+    if h < params[1]:
+        if s < params[4]:
+            hKv: u32 = h / (params[1] / params[2])
+            qPos: u32 = params[0] + s
+            qBase: u32 = (s * params[1] + h) * u32(HEAD_DIM)
+            maxKj: u32 = qPos + u32(1)
+            minKj: u32 = u32(0)
+            if params[3] > u32(0):
+                if qPos + u32(1) > params[3]:
+                    minKj = qPos + u32(1) - params[3]
+
+            ss: f32 = f32(0.0)
+            for d in range(tid, HEAD_DIM, 256):
+                vv: f32 = q[qBase + d]
+                ss = ss + vv * vv
+            s0: f32 = subgroupAdd(ss)
+            if (tid & u32(31)) == u32(0):
+                red[tid >> u32(5)] = s0
+            barrier()
+            t0: f32 = f32(0.0)
+            for i0 in range(8):
+                t0 = t0 + red[i0]
+            barrier()
+            nscale: f32 = inverseSqrt(t0 / f32(HEAD_DIM) + f32(1e-6))
+            rb: u32 = qPos * u32(HALF_DIM)
+            for p in range(tid, HALF_DIM, 256):
+                n0: f32 = q[qBase + p] * nscale * w[p]
+                n1: f32 = q[qBase + p + u32(HALF_DIM)] * nscale * w[p + u32(HALF_DIM)]
+                c: f32 = cosTbl[rb + p]
+                sn: f32 = sinTbl[rb + p]
+                qn_sh[p] = n0 * c - n1 * sn
+                qn_sh[p + u32(HALF_DIM)] = n1 * c + n0 * sn
+            for i1 in range(tid, HEAD_DIM, 256):
+                out_acc[i1] = f32(0.0)
+            if tid == u32(0):
+                st[0] = f32(-3.4028234663852886e38)
+                st[1] = f32(0.0)
+            barrier()
+
+            tile: u32 = minKj
+            while tile < maxKj:
+                kj: u32 = tile + tid
+                tileCount: u32 = min(u32(256), maxKj - tile)
+                sgRounds: u32 = (tileCount + u32(7)) / u32(8)
+                for rr in range(sgRounds):
+                    j: u32 = u32(rr) * u32(8) + (tid / u32(32))
+                    accS: f32 = f32(0.0)
+                    if j < tileCount:
+                        kBase4: u32 = ((tile + j) * params[2] + hKv) * u32(HD4)
+                        for d4 in range(tid & u32(31), HD4, 32):
+                            kv4: vec4[f32] = k[kBase4 + d4]
+                            accS = accS + dot(vec4[f32](qn_sh[d4 * u32(4)],
+                                                        qn_sh[d4 * u32(4) + u32(1)],
+                                                        qn_sh[d4 * u32(4) + u32(2)],
+                                                        qn_sh[d4 * u32(4) + u32(3)]), kv4)
+                    sj: f32 = subgroupAdd(accS)
+                    if (tid & u32(31)) == u32(0):
+                        if j < tileCount:
+                            sval_sh[j] = sj * f32(1.0)
+                barrier()
+                sval: f32 = f32(-3.4028234663852886e38)
+                if kj < maxKj:
+                    sval = sval_sh[tid]
+                m0: f32 = subgroupMax(sval)
+                if (tid & u32(31)) == u32(0):
+                    red[tid >> u32(5)] = m0
+                barrier()
+                tileMax: f32 = f32(-3.4028234663852886e38)
+                for i2 in range(8):
+                    tileMax = max(tileMax, red[i2])
+                barrier()
+                newMax: f32 = max(st[0], tileMax)
+                correction: f32 = exp(st[0] - newMax)
+                pr: f32 = f32(0.0)
+                if kj < maxKj:
+                    pr = exp(sval - newMax)
+                probs[tid] = pr
+                d0: f32 = subgroupAdd(pr)
+                if (tid & u32(31)) == u32(0):
+                    red[tid >> u32(5)] = d0
+                barrier()
+                tileDenom: f32 = f32(0.0)
+                for i3 in range(8):
+                    tileDenom = tileDenom + red[i3]
+                barrier()
+                if tid == u32(0):
+                    st[1] = st[1] * correction + tileDenom
+                    st[0] = newMax
+                barrier()
+                jg: u32 = tid / u32(HD4)
+                d4v: u32 = tid % u32(HD4)
+                vacc: vec4[f32] = vec4[f32](f32(0.0), f32(0.0), f32(0.0), f32(0.0))
+                jj: u32 = jg
+                while jj < tileCount:
+                    vBase4: u32 = ((tile + jj) * params[2] + hKv) * u32(HD4)
+                    vacc = vacc + probs[jj] * v[vBase4 + d4v]
+                    jj = jj + u32(J_GROUPS)
+                vacc_sh[tid] = vacc
+                barrier()
+                for d4b in range(tid, HD4, 256):
+                    a4: vec4[f32] = vec4[f32](out_acc[d4b * u32(4)],
+                                              out_acc[d4b * u32(4) + u32(1)],
+                                              out_acc[d4b * u32(4) + u32(2)],
+                                              out_acc[d4b * u32(4) + u32(3)]) * correction
+                    for g in range(J_GROUPS):
+                        a4 = a4 + vacc_sh[u32(g) * u32(HD4) + d4b]
+                    out_acc[d4b * u32(4)] = a4.x
+                    out_acc[d4b * u32(4) + u32(1)] = a4.y
+                    out_acc[d4b * u32(4) + u32(2)] = a4.z
+                    out_acc[d4b * u32(4) + u32(3)] = a4.w
+                barrier()
+                tile = tile + u32(256)
+
+            invd: f32 = f32(1.0) / st[1]
+            for d5 in range(tid, HEAD_DIM, 256):
+                out[qBase + d5] = srq(out_acc[d5] * invd, f32(OUT_Q))

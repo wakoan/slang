@@ -378,7 +378,7 @@ def down_75(
         for i in range(8):
             tot = tot + sgq[i]
             aSum = aSum + sgs[i]
-        outScale: f32 = bitcast_f32(params.y)
+        outScale: f32 = bitcast_f32(params[1])
         zpA: f32 = f32(8.0) * aSum
         for r2 in range(4):
             o2: u32 = rowBase + u32(r2)
@@ -746,7 +746,7 @@ def proj_68(
     and the sums are independent, so the arithmetic is unchanged.
     """
     inScale: f32 = bitcast_f32(params.x)
-    outScale: f32 = bitcast_f32(params.y)
+    outScale: f32 = bitcast_f32(params[1])
     rowBase: u32 = (wg.y * u32(1120) + wg.x) * u32(8)
     if rowBase < u32(8960):
         a0: f32 = f32(0.0)
@@ -830,7 +830,7 @@ def plegate_76(
     into one expression over the row sum.
     """
     inScale: f32 = bitcast_f32(params.x)
-    linOutScale: f32 = bitcast_f32(params.y)
+    linOutScale: f32 = bitcast_f32(params[1])
     o: u32 = wg.y * u32(256) + wg.x
     if o < u32(256):
         acc: f32 = f32(0.0)
@@ -852,7 +852,7 @@ def plegate_76(
             else:
                 gv = gelu_lut[u32(clamp(round(qv / linOutScale),
                                         f32(-128.0), f32(127.0)) + f32(128.0))]
-            out[o] = gv * ple[params.z + o]
+            out[o] = gv * ple[params[2] + o]
 
 
 @kernel(workgroup_size=(256, 1, 1), consts={"WPR": 256})
@@ -923,7 +923,7 @@ def oproj_73(
     if lastFlag[0] == u32(1):
         if tid == u32(0):
             atomicStore(pp, u32(1536), u32(0))
-        inScale2: f32 = bitcast_f32(params.y)
+        inScale2: f32 = bitcast_f32(params[1])
         acc1: f32 = f32(0.0)
         for i in range(tid, 1536, 256):
             v: f32 = bitcast_f32(atomicLoad(pp, i))
@@ -1003,8 +1003,8 @@ def pleproj_77(
     `sv` is the learned per-layer scalar, stored just past the two norm weight
     vectors in w12s.
     """
-    projInScale: f32 = bitcast_f32(params.y)
-    projOutScale: f32 = bitcast_f32(params.z)
+    projInScale: f32 = bitcast_f32(params[1])
+    projOutScale: f32 = bitcast_f32(params[2])
     sgId: u32 = tid / u32(32)
     lane: u32 = tid & u32(31)
     rowBase: u32 = wg.x * u32(16) + sgId * u32(2)
@@ -1167,7 +1167,7 @@ def down_96(
         for i in range(8):
             tot = tot + sgq[i]
             aSum = aSum + sgs[i]
-        outScale: f32 = bitcast_f32(params.y)
+        outScale: f32 = bitcast_f32(params[1])
         zpA: f32 = f32(2.0) * aSum
         for r2 in range(4):
             o2: u32 = rowBase + u32(r2)
@@ -1223,7 +1223,7 @@ def gateup_74(
     accumulated together so the shared activation chunk is read once for both.
     """
     gOut: f32 = bitcast_f32(params.x)
-    uOut: f32 = bitcast_f32(params.y)
+    uOut: f32 = bitcast_f32(params[1])
     sgId: u32 = lidx / u32(32)
     tid: u32 = lidx & u32(31)
     rowBase: u32 = (wg.x * u32(2) + sgId) * u32(4)
@@ -1266,7 +1266,7 @@ def gateup_74(
                     gv = gelu_lut[u32(clamp(round(g / gOut),
                                             f32(-128.0), f32(127.0)) + f32(128.0))]
                 dq: f32 = gv * u
-                qs: f32 = bitcast_f32(params.z)
+                qs: f32 = bitcast_f32(params[2])
                 if qs == f32(0.0):
                     out[o2] = f16(dq)
                 else:
@@ -1294,7 +1294,7 @@ def gateup_95(
     grid grows rather than the per-thread work.
     """
     gOut: f32 = bitcast_f32(params.x)
-    uOut: f32 = bitcast_f32(params.y)
+    uOut: f32 = bitcast_f32(params[1])
     sgId: u32 = lidx / u32(32)
     tid: u32 = lidx & u32(31)
     rowBase: u32 = (wg.x * u32(2) + sgId) * u32(2)
@@ -1347,7 +1347,7 @@ def gateup_95(
                     gv = gelu_lut[u32(clamp(round(g / gOut),
                                             f32(-128.0), f32(127.0)) + f32(128.0))]
                 dq: f32 = gv * u
-                qs: f32 = bitcast_f32(params.z)
+                qs: f32 = bitcast_f32(params[2])
                 if qs == f32(0.0):
                     out[o2] = f16(dq)
                 else:
@@ -1429,7 +1429,7 @@ def qkv_70(
                     if tid == u32(0):
                         if ok2 < u32(KV_OUT):
                             out_k[ok2] = srq(scales[u32(Q_OUT) + ok2] * (rQAk - f32(8.0) * rAk),
-                                             bitcast_f32(params.y))
+                                             bitcast_f32(params[1]))
             else:
                 rowBaseV: u32 = (wgId - u32(Q_WGS) - u32(KV_WGS)) * u32(2)
                 for wv in range(tid, 192, 32):
@@ -1451,7 +1451,7 @@ def qkv_70(
                         if ov2 < u32(KV_OUT):
                             out_v[ov2] = srq(scales[u32(Q_OUT) + u32(KV_OUT) + ov2]
                                              * (rQAv - f32(8.0) * rAv),
-                                             bitcast_f32(params.z))
+                                             bitcast_f32(params[2]))
 
 
 @kernel(workgroup_size=(128, 1, 1))
@@ -1505,4 +1505,220 @@ def logits_33(
                          + dot(vec4[f32](d0.w, d1.w, d2.w, d3.w),
                                vec4[f32](at[b + u32(12)], at[b + u32(13)], at[b + u32(14)], at[b + u32(15)])))
             acc = acc + s
-        out[col] = srq(scale[col] * acc, bitcast_f32(params.y))
+        out[col] = srq(scale[col] * acc, bitcast_f32(params[1]))
+
+
+@kernel(workgroup_size=(256, 1, 1),
+        consts={"HEAD_DIM": 512, "HALF_DIM": 256, "HD4": 128, "J_GROUPS": 2,
+                "PP_COUNTER_BASE": 131584, "OUT_Q": 0.014886821620166302})
+def attn_101(
+    q: StorageBuffer[f32, "read"],
+    w: StorageBuffer[f32, "read"],
+    cosTbl: StorageBuffer[f32, "read"],
+    sinTbl: StorageBuffer[f32, "read"],
+    k: StorageBuffer[vec4[f32], "read"],
+    v: StorageBuffer[vec4[f32], "read"],
+    partials: AtomicBuffer[u32],
+    out: StorageBuffer[f32],
+    # P101 is EIGHT words (seqQ, keyLen, qOffset, qHeads, kvHeads, window, _, _)
+    # and the runner binds it as one buffer. Uniform[vec4[u32]] is only four, so
+    # this is a read-only storage binding rather than two uniforms — same single
+    # binding slot, which is what the host requires.
+    params: StorageBuffer[u32, "read"],
+    qn_sh: WorkgroupArray[f32, 512],
+    out_acc: WorkgroupArray[f32, 512],
+    probs: WorkgroupArray[f32, 256],
+    sval_sh: WorkgroupArray[f32, 256],
+    red: WorkgroupArray[f32, 256],
+    wgt_sh: WorkgroupArray[f32, 32],
+    vacc_sh: WorkgroupArray[vec4[f32], 256],
+    st: WorkgroupArray[f32, 2],          # running_max, running_denom
+    lastFlag: WorkgroupArray[u32, 1],
+    tid: Builtin.local_invocation_index,
+    wg: Builtin.workgroup_id,
+):
+    """Decode flash attention: q-norm + RoPE, online softmax, last-arriver merge.
+
+    One query, so parallelism has to come from splitting the KEY axis: each of
+    nActive chunks runs its own online softmax over a slice of the keys and
+    publishes (partial output, running max, running denom) through the atomic
+    buffer. The last chunk to finish rescales every partial by exp(m_c - m) and
+    combines them — a full flash-attention merge inside a single dispatch.
+
+    HEAD_DIM/HALF_DIM/HD4/J_GROUPS/PP_COUNTER_BASE/OUT_Q are consts; the sliding
+    layers are 256-wide and the full ones 512.
+    """
+    h: u32 = wg.x
+    ci: u32 = wg.y
+    if h >= params[3]:
+        return
+    hKv: u32 = h / (params[3] / params[4])
+    qPos: u32 = params[2]
+    qBase: u32 = h * u32(HEAD_DIM)
+    maxKj: u32 = min(params[1], qPos + u32(1))
+    minKj: u32 = u32(0)
+    if params[5] > u32(0):
+        if qPos + u32(1) > params[5]:
+            minKj = qPos + u32(1) - params[5]
+    activeKeys: u32 = maxKj - minKj
+    nActive: u32 = clamp((activeKeys + u32(63)) / u32(64), u32(8), u32(32))
+    if ci >= nActive:
+        return
+
+    ss: f32 = f32(0.0)
+    for d in range(tid, HEAD_DIM, 256):
+        vv: f32 = q[qBase + d]
+        ss = ss + vv * vv
+    s0: f32 = subgroupAdd(ss)
+    if (tid & u32(31)) == u32(0):
+        red[tid >> u32(5)] = s0
+    barrier()
+    t0: f32 = f32(0.0)
+    for i0 in range(8):
+        t0 = t0 + red[i0]
+    barrier()
+    nscale: f32 = inverseSqrt(t0 / f32(HEAD_DIM) + f32(1e-6))
+
+    for p in range(tid, HALF_DIM, 256):
+        n0: f32 = q[qBase + p] * nscale * w[p]
+        n1: f32 = q[qBase + p + u32(HALF_DIM)] * nscale * w[p + u32(HALF_DIM)]
+        c: f32 = cosTbl[p]
+        sn: f32 = sinTbl[p]
+        qn_sh[p] = n0 * c - n1 * sn
+        qn_sh[p + u32(HALF_DIM)] = n1 * c + n0 * sn
+    for i1 in range(tid, HEAD_DIM, 256):
+        out_acc[i1] = f32(0.0)
+    if tid == u32(0):
+        st[0] = f32(-3.4028234663852886e38)
+        st[1] = f32(0.0)
+    barrier()
+
+    chunkLen: u32 = (activeKeys + nActive - u32(1)) / nActive
+    start: u32 = minKj + ci * chunkLen
+    end: u32 = min(start + chunkLen, maxKj)
+    tile: u32 = start
+    while tile < end:
+        kj: u32 = tile + tid
+        tileCountS: u32 = min(u32(256), end - tile)
+        sgRounds: u32 = (tileCountS + u32(7)) / u32(8)
+        for rr in range(sgRounds):
+            j: u32 = u32(rr) * u32(8) + (tid / u32(32))
+            accS: f32 = f32(0.0)
+            if j < tileCountS:
+                kBase4: u32 = ((tile + j) * params[4] + hKv) * u32(HD4)
+                for d4 in range(tid & u32(31), HD4, 32):
+                    kv4: vec4[f32] = k[kBase4 + d4]
+                    accS = accS + dot(vec4[f32](qn_sh[d4 * u32(4)],
+                                                qn_sh[d4 * u32(4) + u32(1)],
+                                                qn_sh[d4 * u32(4) + u32(2)],
+                                                qn_sh[d4 * u32(4) + u32(3)]), kv4)
+            sj: f32 = subgroupAdd(accS)
+            if (tid & u32(31)) == u32(0):
+                if j < tileCountS:
+                    sval_sh[j] = sj * f32(1.0)
+        barrier()
+        sval: f32 = f32(-3.4028234663852886e38)
+        if kj < end:
+            sval = sval_sh[tid]
+        m0: f32 = subgroupMax(sval)
+        if (tid & u32(31)) == u32(0):
+            red[tid >> u32(5)] = m0
+        barrier()
+        tileMax: f32 = f32(-3.4028234663852886e38)
+        for i2 in range(8):
+            tileMax = max(tileMax, red[i2])
+        barrier()
+        newMax: f32 = max(st[0], tileMax)
+        correction: f32 = exp(st[0] - newMax)
+        pr: f32 = f32(0.0)
+        if kj < end:
+            pr = exp(sval - newMax)
+        probs[tid] = pr
+        d0: f32 = subgroupAdd(pr)
+        if (tid & u32(31)) == u32(0):
+            red[tid >> u32(5)] = d0
+        barrier()
+        tileDenom: f32 = f32(0.0)
+        for i3 in range(8):
+            tileDenom = tileDenom + red[i3]
+        barrier()
+        if tid == u32(0):
+            st[1] = st[1] * correction + tileDenom
+            st[0] = newMax
+        barrier()
+        tileCount: u32 = min(u32(256), end - tile)
+        jg: u32 = tid / u32(HD4)
+        d4v: u32 = tid % u32(HD4)
+        vacc: vec4[f32] = vec4[f32](f32(0.0), f32(0.0), f32(0.0), f32(0.0))
+        jj: u32 = jg
+        while jj < tileCount:
+            vBase4: u32 = ((tile + jj) * params[4] + hKv) * u32(HD4)
+            vacc = vacc + probs[jj] * v[vBase4 + d4v]
+            jj = jj + u32(J_GROUPS)
+        vacc_sh[tid] = vacc
+        barrier()
+        for d4b in range(tid, HD4, 256):
+            a4: vec4[f32] = vec4[f32](out_acc[d4b * u32(4)],
+                                      out_acc[d4b * u32(4) + u32(1)],
+                                      out_acc[d4b * u32(4) + u32(2)],
+                                      out_acc[d4b * u32(4) + u32(3)]) * correction
+            for g in range(J_GROUPS):
+                a4 = a4 + vacc_sh[u32(g) * u32(HD4) + d4b]
+            out_acc[d4b * u32(4)] = a4.x
+            out_acc[d4b * u32(4) + u32(1)] = a4.y
+            out_acc[d4b * u32(4) + u32(2)] = a4.z
+            out_acc[d4b * u32(4) + u32(3)] = a4.w
+        barrier()
+        tile = tile + u32(256)
+
+    pBase: u32 = (h * u32(32) + ci) * (u32(HEAD_DIM) + u32(2))
+    for i4 in range(tid, HEAD_DIM, 256):
+        atomicStore(partials, pBase + i4, bitcast_u32(out_acc[i4]))
+    if tid == u32(0):
+        atomicStore(partials, pBase + u32(HEAD_DIM), bitcast_u32(st[0]))
+        atomicStore(partials, pBase + u32(HEAD_DIM) + u32(1), bitcast_u32(st[1]))
+    storageBarrier()
+    if tid == u32(0):
+        tk: u32 = atomicAdd(partials, u32(PP_COUNTER_BASE) + h, u32(1))
+        lastFlag[0] = u32(0)
+        if tk == nActive - u32(1):
+            lastFlag[0] = u32(1)
+    barrier()
+    if lastFlag[0] != u32(1):
+        return
+    if tid == u32(0):
+        atomicStore(partials, u32(PP_COUNTER_BASE) + h, u32(0))
+
+    mloc: f32 = f32(-3.4028234663852886e38)
+    lloc: f32 = f32(0.0)
+    if tid < nActive:
+        pb: u32 = (h * u32(32) + tid) * (u32(HEAD_DIM) + u32(2))
+        mloc = bitcast_f32(atomicLoad(partials, pb + u32(HEAD_DIM)))
+        lloc = bitcast_f32(atomicLoad(partials, pb + u32(HEAD_DIM) + u32(1)))
+    mm: f32 = subgroupMax(mloc)
+    if (tid & u32(31)) == u32(0):
+        red[tid >> u32(5)] = mm
+    barrier()
+    newM: f32 = f32(-3.4028234663852886e38)
+    for i5 in range(8):
+        newM = max(newM, red[i5])
+    barrier()
+    wloc: f32 = f32(0.0)
+    if tid < nActive:
+        wloc = exp(mloc - newM)
+        wgt_sh[tid] = wloc
+    dd: f32 = subgroupAdd(lloc * wloc)
+    if (tid & u32(31)) == u32(0):
+        red[tid >> u32(5)] = dd
+    barrier()
+    denom: f32 = f32(0.0)
+    for i6 in range(8):
+        denom = denom + red[i6]
+    barrier()
+    invd: f32 = f32(1.0) / denom
+    for d5 in range(tid, HEAD_DIM, 256):
+        acc: f32 = f32(0.0)
+        for c2 in range(nActive):
+            acc = acc + bitcast_f32(atomicLoad(
+                partials, (h * u32(32) + u32(c2)) * (u32(HEAD_DIM) + u32(2)) + d5)) * wgt_sh[c2]
+        out[h * u32(HEAD_DIM) + d5] = srq(acc * invd, f32(OUT_Q))

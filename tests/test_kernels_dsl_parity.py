@@ -721,3 +721,61 @@ def test_logits_33_bit_exact(dev):
     got = go(translate(kernels_dsl.logits_33, target="msl"))
     assert np.array_equal(got, ref), f"max |d| {np.abs(got-ref).max():.3e}"
     assert np.count_nonzero(got) > N // 2
+
+
+@pytest.mark.parametrize("hd,key_len", [(512, 90), (256, 90), (512, 1500)])
+def test_attn_101_bit_exact(dev, hd, key_len):
+    """Decode flash attention: online softmax + last-arriver merge.
+
+    Three cases because the chunking is data-dependent: nActive is derived from
+    the number of ACTIVE keys, so a short context and a long one exercise
+    different chunk counts, and the two head widths differ in HD4/J_GROUPS.
+    """
+    NCHUNK, half, nH, kvH = 32, hd // 2, 8, 1
+    maxseq = 2048
+    pp_base = 8 * NCHUNK * (hd + 2)
+    rng = np.random.default_rng(121)
+    q = rng.standard_normal(nH * hd).astype(np.float32)
+    w = rng.standard_normal(hd).astype(np.float32)
+    cos = rng.standard_normal(half).astype(np.float32)
+    sin = rng.standard_normal(half).astype(np.float32)
+    kc = rng.standard_normal(maxseq * hd).astype(np.float32)
+    vc = rng.standard_normal(maxseq * hd).astype(np.float32)
+    n_part = pp_base + nH + 16
+    SH = Metal.MTLResourceStorageModeShared
+
+    def go(src):
+        bs = [dev.newBufferWithBytes_length_options_(x.tobytes(), x.nbytes, SH)
+              for x in (q, w, cos, sin, kc, vc)]
+        bpart = dev.newBufferWithLength_options_(n_part * 4, SH)
+        bpart.contents().as_buffer(n_part * 4)[:] = b"\x00" * (n_part * 4)
+        bo = dev.newBufferWithLength_options_(nH * hd * 4, SH)
+        bp = dev.newBufferWithBytes_length_options_(
+            struct.pack("<8I", 1, key_len, key_len - 1, nH, kvH, 0, 0, 0), 32, SH)
+        pso = _pso(dev, src, "attn_101")
+        cb = dev.newCommandQueue().commandBuffer()
+        enc = cb.computeCommandEncoder()
+        enc.setComputePipelineState_(pso)
+        for i, b in enumerate((*bs, bpart, bo, bp)):
+            enc.setBuffer_offset_atIndex_(b, 0, i)
+        enc.dispatchThreadgroups_threadsPerThreadgroup_(
+            Metal.MTLSizeMake(nH, NCHUNK, 1), Metal.MTLSizeMake(256, 1, 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+        counters = np.frombuffer(bpart.contents().as_buffer(n_part * 4),
+                                 np.uint32)[pp_base:pp_base + nH].copy()
+        return np.frombuffer(bo.contents().as_buffer(nH * hd * 4), np.float32).copy(), counters
+
+    out_q = 0.014886821620166302
+    ref_src = (open(os.path.join(KDIR, "attn_101.metal")).read()
+               .replace("HEAD_DIM=512u", f"HEAD_DIM={hd}u")
+               .replace("HALF_DIM=256u", f"HALF_DIM={half}u"))
+    consts = {"HEAD_DIM": hd, "HALF_DIM": half, "HD4": hd // 4,
+              "J_GROUPS": 256 // (hd // 4), "PP_COUNTER_BASE": pp_base,
+              "OUT_Q": out_q}
+    ref_o, ref_c = go(ref_src)
+    got_o, got_c = go(translate(kernels_dsl.attn_101, workgroup_size=(256, 1, 1),
+                                target="msl", consts=consts))
+    assert np.array_equal(got_o, ref_o), f"out: max |d| {np.abs(got_o-ref_o).max():.3e}"
+    assert np.array_equal(got_c, ref_c), f"counters {got_c} vs {ref_c}"
+    assert np.count_nonzero(ref_c) == 0, "counters must self-reset for the next token"
+    assert np.count_nonzero(got_o), "attention wrote nothing"

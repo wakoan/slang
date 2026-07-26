@@ -65,7 +65,16 @@ def main():
     for name in PORTED:
         fn = getattr(kernels_dsl, name)
         g._compile_one(translate(fn, target="msl"), name, name)
-    for name, key, consts, threads in SPECIALIZED:
+    # attn_101 is specialized PER LAYER, not per shape: OUT_Q is that layer's
+    # o-projection input scale, so there are 35 variants rather than 2.
+    variants = list(SPECIALIZED) + [
+        ("attn_101", f"attn_{g.layers[l]['head_dim']}_{l}",
+         (lambda hd: {"HEAD_DIM": hd, "HALF_DIM": hd // 2, "HD4": hd // 4,
+                      "J_GROUPS": 256 // (hd // 4),
+                      "PP_COUNTER_BASE": 8 * 32 * (hd + 2),
+                      "OUT_Q": g.sc(l, "o_in")})(g.layers[l]["head_dim"]), 256)
+        for l in range(g.nL)]
+    for name, key, consts, threads in variants:
         if key in g.kernels:
             g._compile_one(translate(getattr(kernels_dsl, name),
                                      workgroup_size=(threads, 1, 1),
@@ -77,9 +86,9 @@ def main():
 
     same = base_out == dsl_out
     slow = dsl_tps < base_tps * 0.95
-    print(f"\nswapped {len(PORTED)} kernels + {len(SPECIALIZED)} specialized variants")
+    print(f"\nswapped {len(PORTED)} kernels + {len(variants)} specialized variants")
     print(f"  {', '.join(PORTED)}")
-    print(f"  specialized: {', '.join(k for _, k, _, _ in SPECIALIZED)}")
+    print(f"  specialized: {', '.join(sorted({k.rsplit('_', 1)[0] if k.startswith('attn') else k for _, k, _, _ in variants}))}")
     print(f"  stock : {len(base_out):3d} tokens, {base_tps:6.1f} tok/s")
     print(f"  DSL   : {len(dsl_out):3d} tokens, {dsl_tps:6.1f} tok/s")
     print(f"  tokens identical : {same}")

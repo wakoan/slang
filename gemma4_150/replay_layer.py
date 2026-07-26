@@ -27,12 +27,23 @@ from gemma4_150.metal_runner import G4, TOKJSON, Batch, _SHARED
 
 # kernel -> (runner key prefix, input buffers to capture, output buffers to diff)
 SPECS = {
+    "attn_101": {
+        "prefix": "attn_",
+        "inputs": [("outq", 4096, np.float32), ("partials512", 8 * 32 * 514 + 8, np.uint32)],
+        "outputs": [("attn", 4096, np.float32)],
+        "consts": lambda key, g=None: (lambda hd, l: {
+            "HEAD_DIM": hd, "HALF_DIM": hd // 2, "HD4": hd // 4,
+            "J_GROUPS": 256 // (hd // 4), "PP_COUNTER_BASE": 8 * 32 * (hd + 2),
+            "OUT_Q": g.sc(l, "o_in"),
+        })(*(int(x) for x in key.split("_")[1:3])),
+        "threads": 256,
+    },
     "qkv_70": {
         "prefix": "qkv_",
         "inputs": [("a", 1536, np.float32), ("suma", 1, np.float32)],
         "outputs": [("outq", 4096, np.float32), ("outk", 512, np.float32),
                     ("outv", 512, np.float32)],
-        "consts": lambda key: (lambda qd, hd: {
+        "consts": lambda key, g=None: (lambda qd, hd: {
             "Q_OUT": qd, "KV_OUT": hd, "Q_WGS": qd // 2, "KV_WGS": hd // 2,
             "TOTAL_WGS": qd // 2 + hd, "GRID_X": qd // 2 + hd,
         })(*(int(x) for x in key.split("_")[1:3])),
@@ -42,33 +53,33 @@ SPECS = {
         "prefix": "logits_33",
         "inputs": [("normed", 1536, np.float32)],
         "outputs": [("logits", 262144, np.float32)],
-        "consts": lambda key: None, "threads": 128,
+        "consts": lambda key, g=None: None, "threads": 128,
     },
     "down_96": {
         "prefix": "down_96",
         "inputs": [("geglu", 12288, np.float16), ("hidden", 1536, np.float32),
                    ("pp75", 1537, np.uint32)],
         "outputs": [("pp75", 1536, np.float32), ("hidden", 1536, np.float32)],
-        "consts": lambda key: None, "threads": 256,
+        "consts": lambda key, g=None: None, "threads": 256,
     },
     "gateup_74": {
         "prefix": "gateup_74",
         "inputs": [("y2", 1536, np.float16), ("sum2", 1, np.float32)],
         "outputs": [("geglu", 6144, np.float16)],
-        "consts": lambda key: None, "threads": 64,
+        "consts": lambda key, g=None: None, "threads": 64,
     },
     "gateup_95": {
         "prefix": "gateup_95",
         "inputs": [("y2", 1536, np.float16), ("sum2", 1, np.float32)],
         "outputs": [("geglu", 12288, np.float16)],
-        "consts": lambda key: None, "threads": 64,
+        "consts": lambda key, g=None: None, "threads": 64,
     },
     "down_75": {
         "prefix": "down_75",
         "inputs": [("geglu", 12288, np.float16), ("hidden", 1536, np.float32),
                    ("pp75", 1537, np.uint32)],
         "outputs": [("pp75", 1536, np.float32), ("hidden", 1536, np.float32)],
-        "consts": lambda key: None,
+        "consts": lambda key, g=None: None,
         "threads": 256,
     },
     "pleproj_77": {
@@ -77,7 +88,7 @@ SPECS = {
                    ("pp77", 1537, np.uint32)],
         "outputs": [("pp77", 1536, np.float32), ("hidden", 1536, np.float32),
                     ("y2n", 1536, np.float32), ("sum2n", 1, np.float32)],
-        "consts": lambda key: None,
+        "consts": lambda key, g=None: None,
         "threads": 256,
     },
     "oproj_73": {
@@ -86,7 +97,7 @@ SPECS = {
                    ("pp73", 1537, np.uint32)],
         "outputs": [("pp73", 1536, np.float32), ("hidden", 1536, np.float32),
                     ("y2", 1536, np.float16), ("sum2", 1, np.float32)],
-        "consts": lambda key: {"WPR": int(key.split("_")[1]) // 8},
+        "consts": lambda key, g=None: {"WPR": int(key.split("_")[1]) // 8},
         "threads": 256,
     },
 }
@@ -130,6 +141,7 @@ def capture(g, spec, ids):
 
 
 _RAW_DG = Batch.dg          # bound before any patching, so replay never recurses
+_RAW_DG2D = Batch.dg2d
 
 
 def replay(g, spec, shot):
@@ -138,7 +150,10 @@ def replay(g, spec, shot):
     for n, arr in inputs.items():
         _write(g, n, arr)
     b = Batch(g)
-    _RAW_DG(b, name, bufs, groups)
+    if isinstance(groups, tuple):          # 2-D dispatch (attention)
+        _RAW_DG2D(b, name, bufs, *groups)
+    else:
+        _RAW_DG(b, name, bufs, groups)
     b.commit_wait()
     return {n: _read(g, n, c, d) for n, c, d in spec["outputs"]}
 
@@ -157,15 +172,28 @@ def sweep(g, spec, which, ids, n_tokens):
     stock = {k: v for k, v in g.kernels.items() if k.startswith(spec["prefix"])}
     if len(stock) > 1:
         stock.pop(which, None)
+    # A prefix can also catch unrelated kernels compiled under their basename —
+    # "attn_" matches "attn_prefill", which is a different kernel entirely. Keep
+    # only the keys this spec can parse as a geometry, and say how many.
+    keep = {}
+    for k in stock:
+        try:
+            spec["consts"](k, g)
+        except Exception:
+            continue
+        keep[k] = stock[k]
+    stock = keep
+    print(f"  variants: {', '.join(sorted(stock))}")
     dsl = {}
     for key in stock:
         g._compile_one(translate(fn, workgroup_size=(spec["threads"], 1, 1),
-                                 target="msl", consts=spec["consts"](key)), which, key)
+                                 target="msl", consts=spec["consts"](key, g)), which, key)
         dsl[key] = g.kernels[key]
         g.kernels[key] = stock[key]
 
     state = {"tok": 0, "layer": 0, "bad": None, "checked": 0}
     orig = Batch.dg
+    orig2d_inner = Batch.dg2d
 
     def dg(self, name, bufs, groups):
         if name.startswith(spec["prefix"]) and state["bad"] is None:
@@ -186,9 +214,17 @@ def sweep(g, spec, which, ids, n_tokens):
                 _write(g, n, arr)
             self.cb = self.r.q.commandBuffer()
             state["layer"] += 1
-        orig(self, name, bufs, groups)
+        if isinstance(groups, tuple):
+            orig2d_inner(self, name, bufs, *groups)
+        else:
+            orig(self, name, bufs, groups)
+
+    def dg2d(self, name, bufs, width, height):
+        dg(self, name, bufs, (width, height))
 
     Batch.dg = dg
+    orig2d = Batch.dg2d
+    Batch.dg2d = dg2d
     try:
         pos = g.prefill(ids[:-1], 0)
         g.set_cur(ids[-1])
@@ -199,6 +235,7 @@ def sweep(g, spec, which, ids, n_tokens):
                 break
     finally:
         Batch.dg = orig
+        Batch.dg2d = orig2d
     return state
 
 

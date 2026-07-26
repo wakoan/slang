@@ -35,13 +35,18 @@ def _params(M, N, K, alpha):
     return np.array([M, N, K, np.float32(alpha).view(np.uint32)], dtype=np.uint32)
 
 
-def run_metal(a, b, alpha):
+def _strides(lda, ldb, ldc, tr):
+    return np.array([lda, ldb, ldc, tr], dtype=np.uint32)
+
+
+def run_metal(a, b, alpha, tr=True, lda=None, ldb=None, ldc=None, M=None, N=None, K=None):
     Metal = pytest.importorskip("Metal")
     dev = Metal.MTLCreateSystemDefaultDevice()
     if dev is None:
         pytest.skip("no Metal device")
-    M, K = a.shape
-    N = b.shape[0]
+    M = M or a.shape[0]
+    K = K or a.shape[1]
+    N = N or (b.shape[0] if tr else b.shape[1])
     src = translate(gemm_tiled, target="msl")
     lib, err = dev.newLibraryWithSource_options_error_(src, None, None)
     assert lib is not None, f"MSL compile failed: {err}"
@@ -54,11 +59,13 @@ def run_metal(a, b, alpha):
     bb = dev.newBufferWithBytes_length_options_(b.tobytes(), b.nbytes, opt)
     bc = dev.newBufferWithLength_options_(M * N * 2, opt)
     bp = dev.newBufferWithBytes_length_options_(_params(M, N, K, alpha).tobytes(), 16, opt)
+    bs = dev.newBufferWithBytes_length_options_(
+        _strides(lda or K, ldb or (K if tr else N), ldc or N, 1 if tr else 0).tobytes(), 16, opt)
 
     cb = dev.newCommandQueue().commandBuffer()
     enc = cb.computeCommandEncoder()
     enc.setComputePipelineState_(pso)
-    for i, buf in enumerate((ba, bb, bc, bp)):
+    for i, buf in enumerate((ba, bb, bc, bp, bs)):
         enc.setBuffer_offset_atIndex_(buf, 0, i)
     gx, gy = gemm_groups(M, N)
     enc.dispatchThreadgroups_threadsPerThreadgroup_(
@@ -69,10 +76,11 @@ def run_metal(a, b, alpha):
     return np.frombuffer(bc.contents().as_buffer(M * N * 2), dtype=np.float16).reshape(M, N)
 
 
-def run_wgpu(a, b, alpha):
+def run_wgpu(a, b, alpha, tr=True, lda=None, ldb=None, ldc=None, M=None, N=None, K=None):
     wgpu = pytest.importorskip("wgpu")
-    M, K = a.shape
-    N = b.shape[0]
+    M = M or a.shape[0]
+    K = K or a.shape[1]
+    N = N or (b.shape[0] if tr else b.shape[1])
     adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
     if "shader-f16" not in adapter.features:
         pytest.skip("adapter lacks shader-f16")
@@ -92,13 +100,15 @@ def run_wgpu(a, b, alpha):
         data=b.tobytes().ljust(pad4(b.nbytes), b"\0"), usage=U.STORAGE)
     bc = dev.create_buffer(size=pad4(M * N * 2), usage=U.STORAGE | U.COPY_SRC)
     bp = dev.create_buffer_with_data(data=_params(M, N, K, alpha).tobytes(), usage=U.UNIFORM)
+    bs = dev.create_buffer_with_data(data=_strides(
+        lda or K, ldb or (K if tr else N), ldc or N, 1 if tr else 0).tobytes(), usage=U.UNIFORM)
 
     pipe = dev.create_compute_pipeline(
         layout=wgpu.enums.AutoLayoutMode.auto,
         compute={"module": mod, "entry_point": "gemm_tiled"})
     bg = dev.create_bind_group(layout=pipe.get_bind_group_layout(0), entries=[
         {"binding": i, "resource": {"buffer": buf, "offset": 0, "size": buf.size}}
-        for i, buf in enumerate((ba, bb, bc, bp))])
+        for i, buf in enumerate((ba, bb, bc, bp, bs))])
     enc = dev.create_command_encoder()
     cp = enc.begin_compute_pass()
     cp.set_pipeline(pipe)
@@ -177,3 +187,53 @@ def test_matches_mps():
     denom = max(np.abs(ref_mps.astype(np.float64)).max(), 1e-6)
     rel = np.abs(got.astype(np.float64) - ref_mps.astype(np.float64)).max() / denom
     assert rel < 3e-3, f"DSL GEMM vs MPS: max rel err {rel:.2e}"
+
+
+def test_non_transposed():
+    """tr=0: attention's P @ V, where B is [K, N] rather than [N, K]."""
+    rng = np.random.default_rng(11)
+    M, N, K = 64, 128, 96
+    a = rng.standard_normal((M, K)).astype(np.float16)
+    bt = rng.standard_normal((K, N)).astype(np.float16)      # [K, N]
+    ref = a.astype(np.float64) @ bt.astype(np.float64)
+    for run in (run_metal, run_wgpu):
+        got = run(a, bt, 1.0, tr=False, M=M, N=N, K=K)
+        rel = np.abs(got.astype(np.float64) - ref).max() / max(np.abs(ref).max(), 1e-6)
+        assert rel < 3e-3, f"{run.__name__}: max rel err {rel:.2e}"
+
+
+def test_row_stride_windows_a_wider_buffer():
+    """ldc > N: write a tile into a wider buffer, as the padded score matrix does."""
+    rng = np.random.default_rng(12)
+    M, N, K, LDC = 32, 30, 32, 64
+    a = rng.standard_normal((M, K)).astype(np.float16)
+    b = rng.standard_normal((N, K)).astype(np.float16)
+    ref = a.astype(np.float64) @ b.astype(np.float64).T
+
+    Metal = pytest.importorskip("Metal")
+    dev = Metal.MTLCreateSystemDefaultDevice()
+    src = translate(gemm_tiled, target="msl")
+    lib, _ = dev.newLibraryWithSource_options_error_(src, None, None)
+    pso, _ = dev.newComputePipelineStateWithFunction_error_(
+        lib.newFunctionWithName_("gemm_tiled"), None)
+    opt = Metal.MTLResourceStorageModeShared
+    ba = dev.newBufferWithBytes_length_options_(a.tobytes(), a.nbytes, opt)
+    bb = dev.newBufferWithBytes_length_options_(b.tobytes(), b.nbytes, opt)
+    bc = dev.newBufferWithLength_options_(M * LDC * 2, opt)
+    bp = dev.newBufferWithBytes_length_options_(_params(M, N, K, 1.0).tobytes(), 16, opt)
+    bs = dev.newBufferWithBytes_length_options_(_strides(K, K, LDC, 1).tobytes(), 16, opt)
+    cb = dev.newCommandQueue().commandBuffer()
+    enc = cb.computeCommandEncoder()
+    enc.setComputePipelineState_(pso)
+    for i, buf in enumerate((ba, bb, bc, bp, bs)):
+        enc.setBuffer_offset_atIndex_(buf, 0, i)
+    gx, gy = gemm_groups(M, N)
+    enc.dispatchThreadgroups_threadsPerThreadgroup_(
+        Metal.MTLSizeMake(gx, gy, 1), Metal.MTLSizeMake(16, 16, 1))
+    enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+
+    full = np.frombuffer(bc.contents().as_buffer(M * LDC * 2), dtype=np.float16).reshape(M, LDC)
+    rel = np.abs(full[:, :N].astype(np.float64) - ref).max() / max(np.abs(ref).max(), 1e-6)
+    assert rel < 3e-3, f"strided result wrong: {rel:.2e}"
+    # the padding columns must be left alone, not scribbled on
+    assert np.count_nonzero(full[:, N:]) == 0, "wrote past N into the row padding"

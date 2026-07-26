@@ -134,10 +134,8 @@ class PrefillGPU:
         acols/ccols give A and C a row stride wider than the operation, which the
         attention GEMMs need: the score matrix is padded to a 16-byte-aligned row
         so MPS is happy, while the operation itself covers only the T real keys."""
-        # The DSL kernel has no row-stride parameter and no non-transposed form,
-        # so it takes the plain weight matmuls and MPS keeps the rest.
-        if self.GEMM == "dsl" and tr and acols is None and ccols is None:
-            return self._gemm_dsl(b, A, Wb, C, M, N, K, alpha)
+        if self.GEMM == "dsl":
+            return self._gemm_dsl(b, A, Wb, C, M, N, K, alpha, tr, acols, ccols)
         key = (M, N, K, alpha, tr)
         mm = self._mm.get(key)
         if mm is None:
@@ -148,17 +146,19 @@ class PrefillGPU:
         Bm = self._matrix(Wb, N, K) if tr else self._matrix(Wb, K, N)
         _mps_encode(b, mm, self._matrix(A, M, acols or K), Bm, self._matrix(C, M, ccols or N))
 
-    def _gemm_dsl(self, b, A, Wb, C, M, N, K, alpha=1.0):
+    def _gemm_dsl(self, b, A, Wb, C, M, N, K, alpha=1.0, tr=True,
+                  acols=None, ccols=None):
         """The portable GEMM: gemma4_150/kernels_dsl.py, emitted for this backend.
 
-        Transposed-right only (C = A @ W^T), which covers every weight matmul.
-        Attention's PV product is the one non-transposed GEMM and still needs a
-        variant, so it stays on MPS for now — see _attn_gemm."""
+        Covers everything MPS does here — both orientations and the row strides
+        the attention score matrix needs — so selecting "dsl" needs no fallback."""
         from gemma4_150.kernels_dsl import gemm_groups
         gx, gy = gemm_groups(M, N)
+        ldb = K if tr else N
         b.dg2d("gemm_tiled",
                [(A, 0), (Wb, 0), (C, 0),
-                self._uni(struct.pack("<3If", M, N, K, alpha))], gx, gy)
+                self._uni(struct.pack("<3If", M, N, K, alpha)),
+                self._u32(acols or K, ldb, ccols or N, 1 if tr else 0)], gx, gy)
 
     def _dq(self, b, bits, scale, scale_off, dst, n_in, n_out):
         """Dequantize [n_out][n_in] to f16, deriving the bit width from the packed

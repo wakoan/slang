@@ -32,26 +32,39 @@ WG_Y = 16
 
 @kernel(workgroup_size=(16, 16, 1))
 def gemm_tiled(
-    a: StorageBuffer[f16, "read"],       # [M, K]
-    b: StorageBuffer[f16, "read"],       # [N, K]  — transposed-right, as MPS is called
-    c: StorageBuffer[f16],               # [M, N]
+    a: StorageBuffer[f16, "read"],       # [M, K] with row stride lda
+    b: StorageBuffer[f16, "read"],       # [N, K] if tr else [K, N], row stride ldb
+    c: StorageBuffer[f16],               # [M, N] with row stride ldc
     p: Uniform[vec4[u32]],               # (M, N, K, bitcast(alpha))
+    s: Uniform[vec4[u32]],               # (lda, ldb, ldc, tr)
     As: WorkgroupArray[f16, 512],        # TILE_M x TILE_K
     Bs: WorkgroupArray[f16, 512],        # TILE_N x TILE_K
     lid: Builtin.local_invocation_id,
     wg: Builtin.workgroup_id,
 ):
-    """C[M,N] = alpha * A[M,K] @ B[N,K]^T, f16 in/out, f32 accumulation.
+    """C = alpha * A @ (B^T if tr else B), f16 in/out, f32 accumulation.
 
-    B is indexed [n][k] rather than [k][n] so both tile loads walk k contiguously
-    — the weight matrices are already stored row-per-output, which is why the
-    MPS call uses transposeRight as well. Accumulating in f32 matches what MPS
-    does internally; f16 accumulation over K=1536 loses far too much.
+    Accumulating in f32 matches what MPS does internally; f16 accumulation over
+    K=1536 loses far too much.
+
+    Both orientations live in one kernel because the transpose only changes how
+    the B TILE is staged — once in workgroup memory it is always [n][k], so the
+    inner product loop is untouched and the branch costs nothing per MAC. tr=1
+    (weights, stored row-per-output) is the MPS transposeRight form; tr=0 is
+    attention's P @ V.
+
+    Explicit row strides let a matrix be a window on a wider buffer, which the
+    score matrix needs: its rows are padded to keep them 16-byte aligned while
+    the operation covers only the real keys.
     """
     M: u32 = p.x
     N: u32 = p.y
     K: u32 = p.z
     alpha: f32 = bitcast_f32(p.w)
+    lda: u32 = s.x
+    ldb: u32 = s.y
+    ldc: u32 = s.z
+    tr: u32 = s.w
 
     m0: u32 = wg.y * u32(32)
     n0: u32 = wg.x * u32(32)
@@ -76,12 +89,15 @@ def gemm_tiled(
             va: f16 = f16(0.0)
             if m0 + r < M:
                 if gk < K:
-                    va = a[(m0 + r) * K + gk]
+                    va = a[(m0 + r) * lda + gk]
             As[idx] = va
             vb: f16 = f16(0.0)
             if n0 + r < N:
                 if gk < K:
-                    vb = b[(n0 + r) * K + gk]
+                    if tr == u32(1):
+                        vb = b[(n0 + r) * ldb + gk]        # B is [N, K]
+                    else:
+                        vb = b[gk * ldb + n0 + r]          # B is [K, N]
             Bs[idx] = vb
         barrier()
         for kk2 in range(16):
@@ -99,14 +115,14 @@ def gemm_tiled(
     nc: u32 = n0 + tx * u32(2)
     if mr < M:
         if nc < N:
-            c[mr * N + nc] = f16(alpha * acc00)
+            c[mr * ldc + nc] = f16(alpha * acc00)
         if nc + u32(1) < N:
-            c[mr * N + nc + u32(1)] = f16(alpha * acc01)
+            c[mr * ldc + nc + u32(1)] = f16(alpha * acc01)
     if mr + u32(1) < M:
         if nc < N:
-            c[(mr + u32(1)) * N + nc] = f16(alpha * acc10)
+            c[(mr + u32(1)) * ldc + nc] = f16(alpha * acc10)
         if nc + u32(1) < N:
-            c[(mr + u32(1)) * N + nc + u32(1)] = f16(alpha * acc11)
+            c[(mr + u32(1)) * ldc + nc + u32(1)] = f16(alpha * acc11)
 
 
 def gemm_groups(M: int, N: int) -> tuple[int, int]:

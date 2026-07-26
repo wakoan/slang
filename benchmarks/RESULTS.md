@@ -58,8 +58,8 @@ GEMM rather than the backend:
 
 | GEMM | prefill | vs MPS |
 |---|---:|---:|
-| MPS (Apple-only) | 1217 tok/s | 1.00× |
-| DSL `gemm_tiled` (portable) | 623 tok/s | 0.51× |
+| MPS (Apple-only) | 1216 tok/s | 1.00× |
+| DSL `gemm_tiled` (portable, **all** GEMMs) | 564 tok/s | 0.46× |
 | per-token (what wgpu/browser do today) | 158 tok/s | 0.13× |
 
 The two produce **bit-identical KV caches**, so this is purely a speed tradeoff.
@@ -72,8 +72,11 @@ Isolated GEMM throughput on the dominant prefill shape (12288×1536 f16):
 | 256 | 2.50 | 5.22 |
 | 1024 | **2.61** | **5.64** |
 
-So the portable path is ~half of MPS and ~4× what the non-Metal backends have
-today. `gemm_tiled` is a first tiled implementation (32×32×16 tiles, 2×2 per
+So the portable path is ~46% of MPS and ~3.6× what the non-Metal backends have
+today. The `"dsl"` setting needs no fallback: one kernel covers both
+orientations (weights are transposed-right, attention's P@V is not) and carries
+explicit row strides for the padded score matrix, so nothing silently reverts to
+MPS. `gemm_tiled` is a first tiled implementation (32×32×16 tiles, 2×2 per
 thread); the gap to MPS is tuning headroom, not a hard limit — though the
 earlier `simdgroup_matrix` prototype also landed at 2.59, which suggests ~2.6 is
 where straightforward Metal-level tiling sits on this machine.

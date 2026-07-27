@@ -102,6 +102,40 @@ lists — HD4/J_GROUPS/PP_COUNTER_BASE — the identical omission that broke the
 browser. Rust showed it first as "Please provide the correct correct answer" at
 full speed: the same correct-throughput/wrong-output signature.
 
+### OPEN: wgpu resident decode diverges from the captured kernels
+
+Measured with `generate_resident` (192 tokens, warm):
+
+| kernels | tok/s | tokens |
+|---|---:|---|
+| captured WGSL | 91.0 | reference, deterministic over 3 runs |
+| DSL | **110.0** | differ from the reference at index 2 |
+
+The DSL kernels are FASTER here, and the speed is now understood (see below),
+but the outputs do not match and that is unresolved.
+
+What is established: the captured resident path is deterministic (3 identical
+runs), so the difference is real. The earlier non-resident A/B matched over 16
+tokens — but `generate()` does its argmax on the CPU, so kernels 34/35 were
+never exercised by it, and `verify_backends` compares TEXT on a 24-token prompt,
+which is why this was invisible. Checked and ruled out: 34_main.wgsl and
+argmax1_34.metal agree on SLICE and on the tie rule, so the argmax port is not
+an obvious suspect.
+
+Next step: a replay-style comparison on the wgpu path — dump `normed`/`logits`
+per token under both sources and find the first buffer that differs, rather than
+guessing. That is the same tool that localised oproj_73 in one run.
+
+### FIXED: wgpu re-translated every kernel on every dispatch
+
+`_k()` called `translate()` per dispatch — ~269 times per token — where the
+captured path is `lru_cache`d. Resident decode ran at **1.2 tok/s against 91.4**:
+a 76x regression that was entirely host-side translation, no GPU involvement.
+Now memoized on (ref, dsl, threads, consts, patch, source).
+
+Worth noting how it hid: the cross-backend gate compares OUTPUT, not
+throughput, so a 76x slowdown passed it cleanly.
+
 ## The lesson this port paid for
 
 **Bit-exactness on synthetic inputs is necessary but NOT sufficient.** Kernels

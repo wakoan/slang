@@ -287,16 +287,36 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     # Python source the Metal runner uses); "ref" uses the captured webml WGSL.
     USE_DSL = os.environ.get("G4_KERNEL_SOURCE", "dsl") != "ref"
 
+    _kcache: dict = None
+
     def _k(self, ref, dsl, threads=None, consts=None, patch=None):
-        """WGSL for a kernel, from the DSL when ported, else the captured file."""
+        """WGSL for a kernel, from the DSL when ported, else the captured file.
+
+        MEMOIZED. Translating from the Python AST costs ~ms, and this is called
+        once per dispatch — ~269 times per token. Without the cache, resident
+        decode ran at 1.2 tok/s against 91.4 for the captured kernels: a 76x
+        regression that was pure host-side translation, not GPU work. The
+        captured path never showed it because _kernel() is lru_cached.
+        """
+        key = (ref, dsl, threads, tuple(sorted((consts or {}).items())),
+               tuple(sorted((patch or {}).items())), self.USE_DSL)
+        if self._kcache is None:
+            self._kcache = {}
+        hit = self._kcache.get(key)
+        if hit is not None:
+            return hit
         if self.USE_DSL:
             from gemma4_150 import kernels_dsl
             from py_shader_lang_wgpu import translate
             fn = getattr(kernels_dsl, dsl, None)
             if fn is not None:
-                return translate(fn, workgroup_size=threads, consts=consts)
+                out = translate(fn, workgroup_size=threads, consts=consts)
+                self._kcache[key] = out
+                return out
         code = _kernel(ref)
-        return self._patch(code, **patch) if patch else code
+        out = self._patch(code, **patch) if patch else code
+        self._kcache[key] = out
+        return out
 
     @lru_cache(maxsize=None)
     def _patch(self, code, **consts):

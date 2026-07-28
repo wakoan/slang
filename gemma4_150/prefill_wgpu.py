@@ -6,18 +6,27 @@ layer 0 diverges from the per-token path by ~1.1 relative. Layer 0 has no
 attention input, so the fault is in the prologue (embed / PLE / combine /
 rmssrq_69) or the qkv+kvnorm chain, NOT in attention or the MLP.
 
-Prime suspect, unverified: uniform lifetime. `G4Runner._uni` writes through
-`queue.write_buffer`, which is ordered against SUBMITS — but this module records
-all ~500 dispatches into one encoder and submits once at the end, so every
-uniform write lands before any dispatch runs. Any uniform name reused across two
-dispatches in a prefill therefore delivers its LAST value to both. The `_u`
-names are tagged per layer and per operation to avoid that, but a single
-collision would produce exactly this symptom. The cheap check is to give every
-dispatch a unique uniform and see if the divergence disappears.
+BISECTED so far — layer-0 k/v depends only on
+embed_00 -> rmssrq_69 -> srqh_b -> dq -> gemm_tiled -> kvnorm_b
+(NOT on the PLE prologue, which is consumed later in the layer):
 
-Second candidate: the prologue writes `hidden` via embed_00 and then reads it
-in the same encoder without a barrier — WebGPU orders dispatches within a pass,
-so this should be fine, but it has not been confirmed.
+  embed_00     BIT-EXACT vs the per-token path (3 tokens checked)
+  rmssrq_69    BIT-EXACT, both `a` and `suma` (2 tokens checked)
+
+  still to check: srqh_b, dq_f16 at these shapes, gemm_tiled at M=S,
+                  kvnorm_b (cache offsets / rope indexing)
+
+FALSIFIED: uniform lifetime. The first suspect was that queue.write_buffer is
+ordered against SUBMITS while this module records ~500 dispatches into one
+encoder, so a pooled uniform reused by two dispatches would deliver its last
+value to both. Allocating a fresh uniform per dispatch changed the error by
+exactly nothing (1.100e+00 before and after), so that is not it — though the
+per-dispatch allocation is kept, being structurally safer and free here.
+
+Next suspect worth checking first: kvnorm_b. It is the only stage in the
+remaining chain that writes the caches directly, and it is where the batched and
+per-token paths differ most — the per-token _KVNORM binds pre-offset rope tables
+for one position, while kvnorm_b indexes full tables by absolute position.
 
 Batched prefill for the wgpu runner — the portable counterpart of prefill_gpu.py.
 
@@ -59,6 +68,7 @@ class PrefillWGPU:
         self._S = 0
         self._src = {}
         self._svs = {}
+        self._live = []
 
     # ---- kernel text (memoized; translating per dispatch cost 76x once) ----
     def K(self, name, threads=(256, 1, 1), **consts):
@@ -81,8 +91,20 @@ class PrefillWGPU:
         return self.r._scratch(f"pf_{name}", nbytes)
 
     def _u(self, name, *words):
-        """Uniform of mixed float/uint words (floats are passed pre-bitcast)."""
-        return self.r._uni(f"pf_{name}", np.array(words, np.uint32))
+        """A FRESH uniform buffer per dispatch (floats passed pre-bitcast).
+
+        Deliberately not pooled by name. queue.write_buffer is ordered against
+        SUBMITS, and this module records ~500 dispatches into one encoder and
+        submits once — so with a pooled buffer every write would land before any
+        dispatch ran, and two dispatches sharing a name would both see the last
+        value written. Allocating per dispatch makes that impossible.
+        """
+        import wgpu
+        b = self.r.device.create_buffer_with_data(
+            data=np.array(words, np.uint32).tobytes(),
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.STORAGE)
+        self._live.append(b)
+        return b
 
     # ---- GEMM: C[M,N] = alpha * A @ (B^T if tr else B) --------------------
     def _gemm(self, A, Wb, C, M, N, K, alpha=1.0, tr=True, acols=None, ccols=None,
@@ -298,4 +320,5 @@ class PrefillWGPU:
             self._layer(L, S, startPos)
         r.queue.submit([r._enc.finish()])
         r._enc = enc
+        self._live.clear()
         return startPos + n

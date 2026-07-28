@@ -157,3 +157,28 @@ Falsified along the way: memory/GPU contention. Holding Ollama's 7.1 GB model
 resident at 100% GPU changed our decode by under 1% (167.4 / 153.2 / 149.2 vs
 167.4 / 153.1 / 148.1 clean), so the co-resident LiteRT process was not the
 cause.
+
+## The portable GEMM costs 3.7-4.5x under wgpu-native (2026-07-28)
+
+    python benchmarks/bench_gemm_portable.py [M N K]
+
+`kernels_dsl.gemm_tiled` is one Python source emitted as MSL and as WGSL. Same
+GPU, same shape, same algorithm:
+
+| Shape (M, N, K) | native Metal | wgpu-native | ratio |
+|---|---:|---:|---:|
+| 1024, 12288, 1536 (gate/up at prefill batch) | 2.40 TFLOP/s | 0.65 | **3.7x** |
+| 256, 1536, 1536 | 2.11 TFLOP/s | 0.47 | **4.5x** |
+
+This is the entire batched-prefill gap: 564 tok/s driving this kernel from
+Metal, 145 from wgpu, at 1024 tokens (`gemma4_150/prefill_wgpu.py`). It is a
+translation/runtime cost, not an algorithmic one.
+
+**Falsified as the cause: the f16 workgroup tiles.** An otherwise identical
+variant staging `As`/`Bs` as f32 measures 0.62 vs 0.63 TFLOP/s — no change. The
+untested suspect is naga's bounds-check clamps on the 64 workgroup-array reads
+per k-tile, which the MSL emitter does not insert.
+
+**Measure under Dawn before calling this "portable GEMM cost."** Dawn already
+beats wgpu-native by ~20% on decode with these same kernels, so the browser may
+not share the penalty.

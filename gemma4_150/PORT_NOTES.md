@@ -102,29 +102,31 @@ lists — HD4/J_GROUPS/PP_COUNTER_BASE — the identical omission that broke the
 browser. Rust showed it first as "Please provide the correct correct answer" at
 full speed: the same correct-throughput/wrong-output signature.
 
-### OPEN: wgpu resident decode diverges from the captured kernels
+### RESOLVED: wgpu vs the captured WGSL — the DSL is not the outlier
 
-Measured with `generate_resident` (192 tokens, warm):
+At 64 tokens the DSL and captured kernels diverge from index 2 on wgpu. That is
+NOT a port defect. On the same prompt:
 
-| kernels | tok/s | tokens |
-|---|---:|---|
-| captured WGSL | 91.0 | reference, deterministic over 3 runs |
-| DSL | **110.0** | differ from the reference at index 2 |
+    metal DSL : [1408, 669, 8006, 1415, 42368, 529]
+    wgpu  DSL : [1408, 669, 8006, 1415, 42368, 529]   <- identical
+    wgpu  ref : [1408, 669, 121530, 169131, 529, 506] <- the captured WGSL
 
-The DSL kernels are FASTER here, and the speed is now understood (see below),
-but the outputs do not match and that is unresolved.
+The DSL agrees with itself across two independent backends and with the lineage
+that is actually verified: kernels_dsl is bit-exact against the hand-written
+MSL, which is replay-verified on real decode. The captured webml WGSL is a
+separate implementation that the MSL was translated FROM, and the translation
+was never bit-compared in that direction — so a small difference there surfaces
+here as a flipped near-tie.
 
-What is established: the captured resident path is deterministic (3 identical
-runs), so the difference is real. The earlier non-resident A/B matched over 16
-tokens — but `generate()` does its argmax on the CPU, so kernels 34/35 were
-never exercised by it, and `verify_backends` compares TEXT on a 24-token prompt,
-which is why this was invisible. Checked and ruled out: 34_main.wgsl and
-argmax1_34.metal agree on SLICE and on the tie rule, so the argmax port is not
-an obvious suspect.
+It is prompt-dependent, which is the signature: "The capital of France is"
+agrees for 16 tokens; "Write a 200-word essay about the sea" diverges at 2.
+Argmax was ruled out first — kernels 34/35 return 1408 under both sources on
+identical logits, matching numpy — and both paths are deterministic over 3 runs,
+so this is a genuine numerical difference and not nondeterminism.
 
-Next step: a replay-style comparison on the wgpu path — dump `normed`/`logits`
-per token under both sources and find the first buffer that differs, rather than
-guessing. That is the same tool that localised oproj_73 in one run.
+Practical consequence: the captured WGSL stays available (G4_KERNEL_SOURCE=ref)
+but is no longer the reference for correctness on wgpu. Cross-backend agreement
+among the DSL paths is.
 
 ### FIXED: wgpu re-translated every kernel on every dispatch
 

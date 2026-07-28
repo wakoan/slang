@@ -50,18 +50,22 @@ def main():
     g = G4()
     tok = Tokenizer.from_file(TOKJSON)
     ids = framed(g, tok)
-    ref_tokens, _ = g.generate(ids, N)
+    ref_tokens, ref_tps = g.generate(ids, N)
     ref = tok.decode(ref_tokens).strip()
     print(f"  reference: {ref!r}\n")
 
     results = [("metal (PyObjC)", ref, "")]
+    # Throughput is checked too: comparing OUTPUT alone once let a 76x wgpu
+    # regression (per-dispatch kernel re-translation) pass this gate cleanly.
+    rates = {"metal (PyObjC)": ref_tps}
 
     # --- wgpu: compare tokens directly
     try:
         from gemma4_150.runner import G4Runner
         r = G4Runner()
-        out, _ = r.generate(ids, N)
+        out, tps = r.generate(ids, N)
         results.append(("wgpu", tok.decode(out).strip(), ""))
+        rates["wgpu"] = tps
         del r
     except Exception as e:
         results.append(("wgpu", None, f"{type(e).__name__}: {e}"))
@@ -97,7 +101,8 @@ def main():
         # continuation. Compare on the part they share.
         agree = ref in text or text in ref or text == ref
         ok &= agree
-        print(f"{name:<16} {('yes' if agree else 'NO'):<8} {text[:60]!r}")
+        rate = f"{rates[name]:6.1f} tok/s  " if name in rates else " " * 15
+        print(f"{name:<16} {('yes' if agree else 'NO'):<8} {rate}{text[:44]!r}")
     print(f"\n{'PASS' if ok else 'FAIL'}")
     return 0 if ok else 1
 

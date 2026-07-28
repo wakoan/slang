@@ -18,21 +18,25 @@ kernel void smax_b(
   uint r = wg.x;
   uint s = r / p[1];
   uint qPos = p[0] + s;
+  uint klo = p[5];
   uint maxKj = qPos + uint(1);
-  uint minKj = uint(0);
+  uint minKj = klo;
   if (p[2] > uint(0)) {
     if (qPos + uint(1) > p[2]) {
-      minKj = qPos + uint(1) - p[2];
+      if (qPos + uint(1) - p[2] > minKj) {
+        minKj = qPos + uint(1) - p[2];
+      }
     }
   }
   if (maxKj > p[3]) {
     maxKj = p[3];
   }
+  uint nK = p[3] - klo;
   uint base = r * p[4];
   float m = float(-3.4028234663852886e+38);
   uint j = minKj + tid;
   while (j < maxKj) {
-    m = max(m, float(sc[base + j]));
+    m = max(m, float(sc[base + j - klo]));
     j = j + uint(256);
   }
   red[tid] = m;
@@ -49,10 +53,10 @@ kernel void smax_b(
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float tot = float(0.0);
   uint j2 = tid;
-  while (j2 < p[3]) {
+  while (j2 < nK) {
     float e = float(0.0);
-    if (j2 >= minKj) {
-      if (j2 < maxKj) {
+    if (j2 + klo >= minKj) {
+      if (j2 + klo < maxKj) {
         e = exp(float(sc[base + j2]) - m);
         tot = tot + e;
       }

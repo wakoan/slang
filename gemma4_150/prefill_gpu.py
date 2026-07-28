@@ -50,6 +50,13 @@ class PrefillGPU:
     ATTN_GEMM = True     # False falls back to the fused attn_prefill kernel; see
                          # _attn_gemm() for why the GEMM form exists
     MAXSEQ = 2048
+    # Query-block width for banded attention. The dense score matrix computes
+    # the causal upper triangle (and, on sliding layers, everything outside the
+    # window) and throws it away — ~2x the necessary FLOPs. Banding restricts
+    # each block of BAND query rows to the keys it can actually attend to.
+    # Bit-identical by construction: the dropped keys are exactly the ones
+    # smax_b would have written 0 for. 0 disables it (dense).
+    BAND = 256
     # Which GEMM backs the weight matmuls:
     #   "mps" — MPSMatrixMultiplication, 5.64 TFLOP/s, Apple-only
     #   "dsl" — kernels_dsl.gemm_tiled, 2.61 TFLOP/s, runs anywhere the DSL does
@@ -131,24 +138,26 @@ class PrefillGPU:
             W[n] = self._new(sz * 2)
 
     # ---- MPS plumbing ------------------------------------------------------
-    def _matrix(self, buf, rows, cols):
-        key = (id(buf), rows, cols)
+    def _matrix(self, buf, rows, cols, offset=0):
+        key = (id(buf), rows, cols, offset)
         m = self._mat.get(key)
         if m is None:
             d = mps.MPSMatrixDescriptor.matrixDescriptorWithRows_columns_rowBytes_dataType_(
                 rows, cols, cols * 2, F16)
-            m = mps.MPSMatrix.alloc().initWithBuffer_descriptor_(buf, d)
+            m = mps.MPSMatrix.alloc().initWithBuffer_offset_descriptor_(buf, offset, d)
             self._mat[key] = m
         return m
 
-    def _gemm(self, b, A, Wb, C, M, N, K, alpha=1.0, tr=True, acols=None, ccols=None):
+    def _gemm(self, b, A, Wb, C, M, N, K, alpha=1.0, tr=True, acols=None,
+              ccols=None, aoff=0, boff=0, coff=0):
         """C[M,N] = alpha * A[M,K] @ (W[N,K]^T if tr else W[K,N]), all f16.
 
         acols/ccols give A and C a row stride wider than the operation, which the
         attention GEMMs need: the score matrix is padded to a 16-byte-aligned row
         so MPS is happy, while the operation itself covers only the T real keys."""
         if self.GEMM == "dsl":
-            return self._gemm_dsl(b, A, Wb, C, M, N, K, alpha, tr, acols, ccols)
+            return self._gemm_dsl(b, A, Wb, C, M, N, K, alpha, tr, acols, ccols,
+                                  aoff, boff, coff)
         key = (M, N, K, alpha, tr)
         mm = self._mm.get(key)
         if mm is None:
@@ -156,11 +165,12 @@ class PrefillGPU:
             mm = mm.initWithDevice_transposeLeft_transposeRight_resultRows_resultColumns_interiorColumns_alpha_beta_(
                 self.dev, False, tr, M, N, K, alpha, 0.0)
             self._mm[key] = mm
-        Bm = self._matrix(Wb, N, K) if tr else self._matrix(Wb, K, N)
-        _mps_encode(b, mm, self._matrix(A, M, acols or K), Bm, self._matrix(C, M, ccols or N))
+        Bm = (self._matrix(Wb, N, K, boff) if tr else self._matrix(Wb, K, N, boff))
+        _mps_encode(b, mm, self._matrix(A, M, acols or K, aoff), Bm,
+                    self._matrix(C, M, ccols or N, coff))
 
     def _gemm_dsl(self, b, A, Wb, C, M, N, K, alpha=1.0, tr=True,
-                  acols=None, ccols=None):
+                  acols=None, ccols=None, aoff=0, boff=0, coff=0):
         """The portable GEMM: gemma4_150/kernels_dsl.py, emitted for this backend.
 
         Covers everything MPS does here — both orientations and the row strides
@@ -169,7 +179,7 @@ class PrefillGPU:
         gx, gy = gemm_groups(M, N)
         ldb = K if tr else N
         b.dg2d("gemm_tiled",
-               [(A, 0), (Wb, 0), (C, 0),
+               [(A, aoff), (Wb, boff), (C, coff),
                 self._uni(struct.pack("<3If", M, N, K, alpha)),
                 self._u32(acols or K, ldb, ccols or N, 1 if tr else 0)], gx, gy)
 
@@ -273,19 +283,31 @@ class PrefillGPU:
 
         b.dg2d(f"qprep_{hd}", [(B["q"], 0), (lw("q_norm"), 0), (cb, 0), (sb, 0),
                                (B["qf16"], 0), (self._u32(startPos, nH, 0, 0))], nH, S)
-        # The caches are f32; MPS wants f16. Converted per layer rather than once
-        # per distinct cache: kf16/vf16 are single scratch buffers, so a shared
-        # cache's copy would have been overwritten by the intervening layers, and
-        # the conversion is ~3 MB of traffic against the GEMM's hundreds.
         for cache, dst in ((kc, "kf16"), (vc, "vf16")):
             b.dg("srqh_b", [(cache, 0), (B[dst], 0), self._mix(0.0, T * hd, 0, 0)],
                  (T * hd + 255) // 256)
+
+        band = self.BAND if self.BAND else S
         for _ in range(self.ATTN_REPEAT):
-            self._gemm(b, B["qf16"], B["kf16"], B["scores"], R, T, hd, ccols=Tp)
-            b.dg("smax_b", [(B["scores"], 0), (B["denom"], 0),
-                            self._u32(startPos, nH, win, T, Tp, 0, 0, 0)], R)
-            self._gemm(b, B["scores"], B["vf16"], B["attnraw"], R, hd, T,
-                       tr=False, acols=Tp)
+            for s0 in range(0, S, band):
+                bq = min(band, S - s0)
+                # keys this block can reach: causal end, window start
+                khi = startPos + s0 + bq
+                klo = 0
+                if win:
+                    lo = startPos + s0 + 1 - win
+                    klo = lo if lo > 0 else 0
+                nK = khi - klo
+                nKp = (nK + 7) // 8 * 8            # 16-byte-aligned row stride
+                rows = bq * nH
+                roff = s0 * nH                     # q rows are [s][h], so contiguous
+                self._gemm(b, B["qf16"], B["kf16"], B["scores"], rows, nK, hd,
+                           ccols=nKp, aoff=roff * hd * 2, boff=klo * hd * 2)
+                b.dg("smax_b", [(B["scores"], 0), (B["denom"], roff * 4),
+                                self._u32(startPos + s0, nH, win, khi, nKp, klo, 0, 0)], rows)
+                self._gemm(b, B["scores"], B["vf16"], B["attnraw"], rows, hd, nK,
+                           tr=False, acols=nKp, boff=klo * hd * 2,
+                           coff=roff * hd * 2)
         b.dg("attnout_b", [(B["attnraw"], 0), (B["denom"], 0), (B["attnh"], 0),
                            self._mix(g.sc(l, "o_in"), R * hd, hd, 0)],
              (R * hd + 255) // 256)

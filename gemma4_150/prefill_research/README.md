@@ -111,9 +111,19 @@ between them (`qprep_b` / `smax_b` / `attnout_b`). That took attention 276 → ~
 and prefill 1043 → 850 ms.
 
 It buys a ~3× throughput gain with a ~2× FLOP overhead: the dense score matrix
-computes the masked-out upper triangle (and everything outside the sliding window)
-and throws it away. Banding the GEMMs by query block would recover most of that
-and is the obvious next lever.
+computes the masked-out upper triangle (and everything outside the sliding
+window) and throws it away.
+
+**Banding the GEMMs by query block recovers that — and it is worth far less than
+it sounds: 1216 → 1245 tok/s, 1.02×** (`PrefillGPU.BAND`, 256 is the best of
+128/256/512; dense is `BAND=0`). Bit-identical to dense by construction, since
+the keys it drops are exactly the ones `smax_b` would have written 0 for.
+
+The small win is arithmetic, not a bug. An earlier note here estimated 10–15%
+of prefill by reusing the 25.8% figure for attention — but that was measured
+BEFORE attention became a GEMM. Attention is now ~76 ms of ~840, about 9%, and
+banding removes roughly a third of that. 2% was the ceiling all along; the
+estimate was stale, not the implementation.
 
 Two deferred normalisations keep the pass count down: `smax_b` writes unnormalised
 probabilities plus a per-row denominator, which `attnout_b` folds in alongside the

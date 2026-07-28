@@ -1870,7 +1870,11 @@ def smax_b(
     # PSM is EIGHT words (startPos, qHeads, window, T, stride, ...) bound as ONE
     # buffer, so this is a storage binding — two vec4 uniforms would claim two
     # binding slots and the host only fills one.
-    p: StorageBuffer[u32, "read"],       # (startPos, qHeads, window, T, stride)
+    # (qPosBase, qHeads, window, kHi, stride, kLo). The score matrix may be a
+    # BAND of keys [kLo, kHi) rather than all of them, so row index j is stored
+    # at j-kLo. Dense is just kLo=0. Banding is bit-identical: the keys it drops
+    # are exactly the ones this kernel would have written 0 for, and 0*V is 0.
+    p: StorageBuffer[u32, "read"],
     red: WorkgroupArray[f32, 256],
     tid: Builtin.local_invocation_index,
     wg: Builtin.workgroup_id,
@@ -1883,19 +1887,22 @@ def smax_b(
     r: u32 = wg.x
     s: u32 = r / p[1]
     qPos: u32 = p[0] + s
+    klo: u32 = p[5]
     maxKj: u32 = qPos + u32(1)
-    minKj: u32 = u32(0)
+    minKj: u32 = klo
     if p[2] > u32(0):
         if qPos + u32(1) > p[2]:
-            minKj = qPos + u32(1) - p[2]
+            if qPos + u32(1) - p[2] > minKj:
+                minKj = qPos + u32(1) - p[2]
     if maxKj > p[3]:
         maxKj = p[3]
+    nK: u32 = p[3] - klo
     base: u32 = r * p[4]
 
     m: f32 = f32(-3.4028234663852886e38)
     j: u32 = minKj + tid
     while j < maxKj:
-        m = max(m, f32(sc[base + j]))
+        m = max(m, f32(sc[base + j - klo]))
         j = j + u32(256)
     red[tid] = m
     barrier()
@@ -1910,10 +1917,10 @@ def smax_b(
 
     tot: f32 = f32(0.0)
     j2: u32 = tid
-    while j2 < p[3]:
+    while j2 < nK:
         e: f32 = f32(0.0)
-        if j2 >= minKj:
-            if j2 < maxKj:
+        if j2 + klo >= minKj:
+            if j2 + klo < maxKj:
                 e = exp(f32(sc[base + j2]) - m)
                 tot = tot + e
         sc[base + j2] = f16(e)

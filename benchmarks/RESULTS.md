@@ -34,13 +34,35 @@ Same Gemma 4 E2B base — the embedding length of 1536 pins it, and 8B/12B varia
 were checked and rejected (embedding 2560/3840). The parameter delta is the
 vision+audio towers, which text inference does not touch.
 
-**The 3.4× weight-size difference is the caveat that matters.** Decode is
-bandwidth-bound, so most of the 1.70× decode margin is quantization, not kernel
-quality. In fact the interesting reading runs the other way: we carry **3.4×
-fewer weight bytes but decode only 1.70× faster**, so Ollama extracts more
-throughput per byte moved than we do. That is consistent with this repo's own
-finding that effective bandwidth sits far below the hardware peak, and it is a
-lead worth pulling on rather than a result to celebrate.
+**The weight-size difference is a caveat, but the "per byte" reading of it was
+wrong and is retracted.** I previously wrote that we carry 3.4× fewer bytes and
+decode only 1.70× faster, so Ollama extracts more per byte. That compared FILE
+SIZES to speeds and was never physical: 7.2 GB × 87.2 tok/s is 626 GB/s, more
+than twice the M4 Pro's 273 GB/s. The 7.2 GB is the file — it includes vision
+and audio towers text decode never reads — not the per-token read volume, which
+is unknown for Ollama.
+
+What is measured, from the manifest rather than from a file size:
+
+| | |
+|---|---:|
+| weights on disk | 2.109 GB |
+| of which row-gathered (embed + PLE) | 1.313 GB |
+| **bytes actually read per token** | **0.797 GB** |
+
+which gives effective bandwidth, against a 273 GB/s peak:
+
+| backend | tok/s | GB/s | % of peak |
+|---|---:|---:|---:|
+| Rust / Metal | 178.4 | 142.1 | 52% |
+| Swift / Metal | 175.8 | 140.0 | 51% |
+| Python / Metal | 171.3 | 136.5 | 50% |
+| browser / Dawn | 160.0 | 127.5 | 47% |
+| wgpu resident | 110.0 | 87.6 | 32% |
+
+**So the real headroom is ~2×: the bandwidth-bound ceiling is 343 tok/s and the
+best backend sits at 52% of it.** That is the decode target, and it stands on
+its own without any cross-runtime byte comparison.
 
 Prefill is the sounder comparison: it is compute-bound at large M, so it is far
 less sensitive to the weight format, and it is where the batched-GEMM work

@@ -154,9 +154,15 @@ class G4Runner:
             self._bgcache = {}
         bg = self._bgcache.get(bgkey) if bgkey is not None else None
         if bg is None:
-            bg = self.device.create_bind_group(layout=layout, entries=[
-                {"binding": i, "resource": {"buffer": b, "offset": 0, "size": b.size}}
-                for i, b in enumerate(buffers)])
+            # A buffer may be given as `buf` or `(buf, byte_offset)`. Batched
+            # prefill needs offsets: its GEMMs address row-blocks inside one
+            # activation arena rather than a buffer per block.
+            ent = []
+            for i, b in enumerate(buffers):
+                buf, off = b if isinstance(b, tuple) else (b, 0)
+                ent.append({"binding": i, "resource": {
+                    "buffer": buf, "offset": off, "size": buf.size - off}})
+            bg = self.device.create_bind_group(layout=layout, entries=ent)
             if bgkey is not None:
                 self._bgcache[bgkey] = bg
         enc = self._enc or self.device.create_command_encoder()

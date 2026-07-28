@@ -69,6 +69,25 @@ The native-Metal runners share a **ring-of-32 per-step uniform buffers** so thei
 chunked GPU-resident decode can commit many forwards without the CPU racing the
 GPU on position params — the fix that keeps long outputs coherent.
 
+### Prefill (1024-token prompt)
+
+Prefill runs **layers-outer / tokens-inner**, so each weight is read once per
+prompt instead of once per token and every matmul becomes a GEMM at M=S.
+`G4_BATCHED_PREFILL=0` forces the per-token path on both Python runners.
+
+| Path | GEMM | tok/s |
+|---|---|---:|
+| Python + native Metal | MPS, banded | **1245** |
+| Google LiteRT-LM (reference) | — | 1132 |
+| Python + native Metal | `gemm_tiled` (portable DSL) | 564 |
+| Python + wgpu | `gemm_tiled` (portable DSL) | **145** |
+| any, per-token | — | 18–158 |
+
+The portable GEMM costs 2.2× against MPS on Metal, and then a further 4× under
+wgpu-native — the same kernel source, 2.61 vs 0.63 TFLOP/s. f16 workgroup tiles
+are **falsified** as the cause (an f32-tile variant measures the same); see the
+note on `gemm_tiled` in `gemma4_150/kernels_dsl.py`.
+
 ## Setup
 
 ```bash

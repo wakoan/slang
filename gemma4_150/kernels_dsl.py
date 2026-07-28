@@ -57,6 +57,16 @@ def gemm_tiled(
     Explicit row strides let a matrix be a window on a wider buffer, which the
     score matrix needs: its rows are padded to keep them 16-byte aligned while
     the operation covers only the real keys.
+
+    PORTABILITY NOTE, measured: this one source runs at 2.61 TFLOP/s on Metal
+    and 0.63 under wgpu-native (M=1024, N=12288, K=1536), and that 4x carries
+    straight through to batched prefill (564 vs 145 tok/s at 1024 tokens).
+    FALSIFIED as the cause: the f16 workgroup tiles — an identical variant
+    staging As/Bs as f32 measures 0.62, i.e. no change. The remaining suspect is
+    naga's bounds-check clamps on the 64 workgroup-array reads per k-tile, which
+    the MSL emitter does not insert; untested. Worth re-measuring in the browser
+    before treating it as portable-GEMM cost, since Dawn already beats
+    wgpu-native by ~20% on decode with the same kernels.
     """
     M: u32 = p.x
     N: u32 = p.y

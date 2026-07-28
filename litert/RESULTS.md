@@ -51,8 +51,16 @@ entries barely moved because those prompts happened to run to the token cap.
 | Prefill path | tok/s (256 / 1024) |
 |---|---|
 | Was: one **synchronous** forward per token | 122 / — |
-| **Now: pipelined** (chunked, no per-token sync) | **162 / 158** |
+| Pipelined per-token (chunked, no per-token sync) | 162 / 158 |
+| **Batched, banded MPS GEMMs** (native Metal) | — / **1245** |
+| **Batched, portable `gemm_tiled`** (wgpu) | — / **145** |
 | LiteRT GPU (**batched**) | 1132 |
+
+**Batched prefill now ships on both Python runners** (`prefill_gpu.py` on Metal,
+`prefill_wgpu.py` on wgpu; `G4_BATCHED_PREFILL=0` opts out), so the caveat below
+about it being "the one thing these runners don't do yet" is historical. Metal
+passes LiteRT at 1245. wgpu reaches 145 — 8.2× its own per-token path, but
+4× short of the same DSL kernel driven from Metal (see `kernels_dsl.gemm_tiled`).
 
 Pipelining prefill (commit a chunk of forwards without waiting, token ids read from
 a GPU buffer at an offset so the CPU never races the GPU) gives **~1.35×** and is
@@ -102,8 +110,9 @@ machine's measured 4.90 GEMM ceiling; we are at 0.63). See
 
 ## The honest caveats
 
-1. **Prefill: LiteRT still wins — 1132 vs 158 tok/s** (see above). Batched prefill
-   remains the open roadmap item; pipelining closed only the sync portion.
+1. ~~**Prefill: LiteRT still wins — 1132 vs 158 tok/s.** Batched prefill remains the
+   open roadmap item.~~ **Closed.** Batched prefill ships on both Python runners:
+   1245 tok/s on native Metal (past LiteRT's 1132) and 145 on wgpu.
 2. **Different quantization.** LiteRT's `.litertlm` is 2.4 GB, instruction-tuned +
    multimodal; this repo runs the QAT `g4_150` (2.1 GB, text). Not an identical weight
    format, so decode-bandwidth is not perfectly matched.
@@ -112,5 +121,6 @@ machine's measured 4.90 GEMM ceiling; we are at 0.63). See
 
 - **Decode** (short or matched 1024 context): this repo's native-Metal backends beat
   LiteRT's GPU backend (~1.3–1.8×), because LiteRT decodes through WebGPU/Dawn.
-- **Prefill / time-to-first-token:** LiteRT wins big via batched prefill — the one
-  thing these decode-focused runners don't do yet.
+- **Prefill / time-to-first-token:** native Metal now leads at 1245 vs 1132, via
+  dequant-to-f16 + banded MPS GEMMs at M=S. The wgpu backend is batched too but
+  reaches only 145, held back by the portable GEMM under wgpu-native.

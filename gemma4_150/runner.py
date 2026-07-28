@@ -97,6 +97,7 @@ class G4Runner:
     _pool: dict = None
     _unis: dict = None
     _bgcache: dict = None
+    _pf = None                  # lazily built PrefillWGPU (batched prefill)
 
     def _scratch(self, name, nbytes):
         if self._pool is None:
@@ -342,6 +343,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 
     def setup_caches(self, max_seq=2048):
         self.max_seq = max_seq
+        # Bind groups are cached by (kernel, layer, hidden, ple) and every layer's
+        # embeds kc/vc — which are about to be replaced. Without this, the second
+        # and later calls leave the forward path writing into the PREVIOUS
+        # generation's caches: silent, and it reads as a ~1e10 divergence.
+        self._bgcache = None
+        self._pf = None
         self.kc, self.vc = {}, {}
         for s in self.man["layers"]:
             if not s["shared"]:
@@ -502,6 +509,36 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         self._enc = None
         return logits
 
+    def prefill(self, toks, pos, hidden=None, cur=None):
+        """Run `toks` through the model from `pos`, filling the KV caches.
+
+        Batched prefill (layers-outer, gemm_tiled) reads each weight once per
+        PROMPT instead of once per token, which is worth ~5x once the prompt is
+        long enough to amortize its fixed weight-dequant cost. It is not
+        numerically identical to the per-token path — f16 GEMM replaces the
+        exact int-dot — so G4_BATCHED_PREFILL=0 opts out, matching the Metal
+        runner's flag of the same name.
+        """
+        if not toks:
+            return pos
+        if len(toks) >= 16 and os.environ.get("G4_BATCHED_PREFILL", "1") != "0":
+            try:
+                from gemma4_150.prefill_wgpu import PrefillWGPU
+                if self._pf is None:
+                    self._pf = PrefillWGPU(self)
+                return self._pf.prefill(toks, pos)
+            except Exception as e:
+                import sys
+                print(f"(batched prefill unavailable: {e}; using per-token)",
+                      file=sys.stderr)
+        hidden = hidden if hidden is not None else self._scratch("hidden", self.cfg["H"] * 4)
+        for t in toks:
+            if cur is not None:
+                self.queue.write_buffer(cur, 0, np.array([t], np.uint32).tobytes())
+            self.forward(int(t), pos, hidden, ids_buf=cur)
+            pos += 1
+        return pos
+
     def generate_resident(self, ids, n_new=40, eos=1, chunk=16):
         """GPU-resident greedy decode: the argmax token feeds back into cur_tok on
         the GPU, so no CPU sync per token — the GPU runs async while the CPU records
@@ -511,10 +548,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         hidden = self._scratch("hidden", self.cfg["H"] * 4)
         cur = self._scratch("cur_tok", 4)             # the on-GPU current token (fed back)
         gen = self._scratch("gen_ids", n_new * 4)
-        pos = 0
-        for t in ids[:-1]:                            # prefill (CPU-known tokens)
-            self.queue.write_buffer(cur, 0, np.array([t], np.uint32).tobytes())
-            self.forward(int(t), pos, hidden, ids_buf=cur); pos += 1
+        pos = self.prefill(ids[:-1], 0, hidden, cur)
         self.queue.write_buffer(cur, 0, np.array([ids[-1]], np.uint32).tobytes())
         out = []
         t0 = time.time()
@@ -543,9 +577,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         import time
         self.setup_caches()
         hidden = self._scratch("hidden", self.cfg["H"] * 4)
-        pos = 0
-        for t in ids[:-1]:                       # prefill all but last
-            self.forward(t, pos, hidden); pos += 1
+        pos = self.prefill(ids[:-1], 0, hidden)
         cur = ids[-1]
         out = []
         t0 = time.time()

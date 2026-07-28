@@ -1,34 +1,4 @@
-"""Batched prefill for the wgpu runner — INCOMPLETE, DOES NOT YET PRODUCE
-CORRECT OUTPUT. Nothing imports this; the wgpu runner still prefills per-token.
-
-Status: it runs end-to-end, dispatches every stage and fills the KV caches, but
-layer 0 diverges from the per-token path by ~1.1 relative. Layer 0 has no
-attention input, so the fault is in the prologue (embed / PLE / combine /
-rmssrq_69) or the qkv+kvnorm chain, NOT in attention or the MLP.
-
-BISECTED so far — layer-0 k/v depends only on
-embed_00 -> rmssrq_69 -> srqh_b -> dq -> gemm_tiled -> kvnorm_b
-(NOT on the PLE prologue, which is consumed later in the layer):
-
-  embed_00     BIT-EXACT vs the per-token path (3 tokens checked)
-  rmssrq_69    BIT-EXACT, both `a` and `suma` (2 tokens checked)
-
-  still to check: srqh_b, dq_f16 at these shapes, gemm_tiled at M=S,
-                  kvnorm_b (cache offsets / rope indexing)
-
-FALSIFIED: uniform lifetime. The first suspect was that queue.write_buffer is
-ordered against SUBMITS while this module records ~500 dispatches into one
-encoder, so a pooled uniform reused by two dispatches would deliver its last
-value to both. Allocating a fresh uniform per dispatch changed the error by
-exactly nothing (1.100e+00 before and after), so that is not it — though the
-per-dispatch allocation is kept, being structurally safer and free here.
-
-Next suspect worth checking first: kvnorm_b. It is the only stage in the
-remaining chain that writes the caches directly, and it is where the batched and
-per-token paths differ most — the per-token _KVNORM binds pre-offset rope tables
-for one position, while kvnorm_b indexes full tables by absolute position.
-
-Batched prefill for the wgpu runner — the portable counterpart of prefill_gpu.py.
+"""Batched prefill for the wgpu runner — the portable counterpart of prefill_gpu.py.
 
 Same idea and the same DSL kernels: hold all S token activations resident and
 iterate LAYERS OUTER, TOKENS INNER, so each weight is read once per prompt
@@ -43,6 +13,14 @@ separately rather than as a backend flag on the Metal one.
     from gemma4_150.prefill_wgpu import PrefillWGPU
     pf = PrefillWGPU(runner)        # runner is a runner.G4Runner
     pos = pf.prefill(token_ids, 0)
+
+Like the Metal one, this is NOT bit-identical to the per-token path: dequant +
+f16 GEMM replaces the exact int-dot arithmetic, and the difference compounds
+through the 15 cache-owning layers. Measured against the per-token caches at 18
+tokens it is 1.2e-2 relative at layer 0 rising to 9.1e-2 at layer 14 — the Metal
+path, which has been in use since it beat LiteRT, shows 1.0e-1 by the same
+measure. That equivalence is the gate (tests/test_prefill_wgpu.py); expecting
+bit-identity here would be expecting the wrong thing.
 """
 from __future__ import annotations
 
@@ -117,17 +95,24 @@ class PrefillWGPU:
              self._u(f"gs{tag}", acols or K, K if tr else N, ccols or N, 1 if tr else 0)],
             (gx, gy, 1))
 
-    def _dq(self, bits, scale, dst, n_in, n_out, tag):
+    def _dq(self, bits, scale, dst, n_in, n_out, tag, soff=0):
         """Dequantize [n_out][n_in] to f16, width derived from the buffer size.
 
         Do NOT hardcode the width: layers 0-14 pack gate/up/down at 4 bits and
         layers 15-34 at 2, and getting it wrong is silent.
+
+        `soff` is a BYTE offset into the row-scale buffer, and it is not
+        optional decoration: on the layers that own a KV cache, q/k/v share one
+        concatenated `qkv_scales`, so k starts at q_dim and v at q_dim+head_dim.
+        Omitting it dequantizes k and v with q's scales, which is exactly wrong
+        enough to look like a rope or cache-offset bug three stages later.
         """
         nbits = bits.size * 8 // (n_in * n_out)
         assert nbits in (2, 4, 8), f"odd width {nbits} for [{n_out}x{n_in}]"
         nwords = n_out * (n_in // (32 // nbits))
         self.r.dispatch(f"dq{nbits}", self.K("dq_f16", BITS=nbits),
-                        [bits, scale, dst, self._u(f"dq{tag}", n_in, n_out, 0, 0)],
+                        [bits, (scale, soff), dst,
+                         self._u(f"dq{tag}", n_in, n_out, 0, 0)],
                         ((nwords + 255) // 256, 1, 1))
 
     # ---- buffers -----------------------------------------------------------
@@ -199,9 +184,11 @@ class PrefillWGPU:
                    [B("qraw"), B("q"), self._u(f"s1{L}", _f32u(sc["q_out"]), S*qd, 0, 0)],
                    ((S*qd + 255)//256, 1, 1))
         if not shared:
-            self._dq(W("k_bits"), W("qkv_scales"), B("wk"), H, hd, f"k{L}")
+            self._dq(W("k_bits"), W("qkv_scales"), B("wk"), H, hd, f"k{L}",
+                     soff=qd * 4)
             self._gemm(B("ah"), B("wk"), B("kraw"), S, hd, H, tag=f"k{L}")
-            self._dq(W("v_bits"), W("qkv_scales"), B("wv"), H, hd, f"v{L}")
+            self._dq(W("v_bits"), W("qkv_scales"), B("wv"), H, hd, f"v{L}",
+                     soff=(qd + hd) * 4)
             self._gemm(B("ah"), B("wv"), B("vraw"), S, hd, H, tag=f"v{L}")
             r.dispatch(f"kvnormb_{hd}", self.K("kvnorm_b", (hd, 1, 1), HD=hd, HALF=hd//2),
                        [B("kraw"), B("vraw"), W("k_norm"), cb, sb, kc, vc,
@@ -320,5 +307,10 @@ class PrefillWGPU:
             self._layer(L, S, startPos)
         r.queue.submit([r._enc.finish()])
         r._enc = enc
+        # Drain before returning, as the Metal path's commit_wait() does. This
+        # is not just tidiness: prefill is one submit of ~500 dispatches, so
+        # without it the caller starts its decode timer while seconds of prefill
+        # are still queued, and decode "measures" 12 tok/s instead of 87.
+        r.read(B("suma"), 4)
         self._live.clear()
         return startPos + n
